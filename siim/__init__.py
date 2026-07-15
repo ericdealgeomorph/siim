@@ -34,7 +34,7 @@ import os as _os
 # within process noise on siim's non-nested prange kernels.
 _os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
 
-__version__ = "0.5.0"
+__version__ = "0.9.0"
 
 
 _LAZY = ("analytical_steady_state_solution", "GeneralProfile",
