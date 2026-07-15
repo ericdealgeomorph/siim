@@ -1,0 +1,51 @@
+# Conda env for siim development + the siim-based papers: the shared `glacial`
+# env. Canonical copy: ~/conda-envs/glacial.yml.
+#
+# *** Pinned to numpy<2 on purpose *** — fastscape's framework xarray-simlab
+# 0.5.0 (unmaintained) calls np.in1d, which NumPy 2 removed (xr_accessor.py ->
+# AttributeError on multi-clock runs). numpy 1.26 is also the version siim's test
+# suite is validated against. This env is the numpy-1 quarantine; every other env
+# here runs numpy 2.
+#
+# Setup:
+#   conda env create -f environment.yml          # or: conda env update -n glacial -f ...
+#   conda activate glacial
+#   pip install -e . --no-deps                    # siim, editable
+#   pip install -e /Users/ericdeal/.dealfigstyle --no-deps   # dealfig (papers)
+#
+# Test:  python -m pytest siim/tests -q
+# Docs:  pip install -r docs/requirements.txt   then
+#        python -m sphinx -W -E -b html docs docs/_build/html
+name: glacial
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - "numpy<2"
+  - scipy
+  - matplotlib
+  - seaborn
+  - pandas
+  - numba
+  - fastscape
+  - fastscapelib-f2py
+  - xarray-simlab
+  # xarray frozen below the removal of Dataset.drop (xsimlab 0.5.0 calls it
+  # every run; currently a FutureWarning, an AttributeError crash once xarray
+  # deletes the method — same quarantine class as numpy<2). 2026.4 verified.
+  - "xarray<2026.5"
+  - "zarr<3"
+  - lmfit
+  - mpmath
+  - moviepy
+  - cmcrameri
+  - colorcet
+  - openpyxl
+  - jinja2
+  - tqdm
+  - pytest
+  - ipykernel
+  - ipywidgets
+  - ipympl
+  - jupytext

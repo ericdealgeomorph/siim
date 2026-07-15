@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siim"
+version = "0.9.0"
+description = "Sliding Ice Incision Model (siim): coupled glacial-fluvial landscape evolution."
+requires-python = ">=3.12"  # code uses 3.12 f-string syntax (quote reuse, PEP 701)
+dependencies = [
+    # The LIGHTWEIGHT CORE only: `import siim`, the 1D model (siim.siim1d),
+    # siim.analytical and the plotting layer. The 2D stack (siim.siim2d /
+    # siim.fastscape) additionally needs xsimlab + fastscape +
+    # fastscapelib-fortran, which are CONDA-ONLY (fastscapelib-fortran has no
+    # PyPI distribution; PyPI's `fastscape` is a stale 0.1.0) and therefore
+    # deliberately NOT declared here — environment.yml is the 2D dependency
+    # contract, including its numpy<2 / zarr<3 / xarray freeze quarantine
+    # around the unmaintained xsimlab. Inside that managed env, install siim
+    # with `pip install -e . --no-deps` (a pure link; never lets pip touch
+    # the quarantined packages).
+    "numpy",
+    "scipy",
+    "numba",
+    "matplotlib",
+    "tqdm",
+]
+
+[tool.setuptools]
+packages = ["siim", "siim.analytical", "siim._core", "siim.plotting", "siim.fastscape"]
+
+[tool.pytest.ini_options]
+testpaths = ["siim/tests"]
+filterwarnings = [
+    # Third-party (xsimlab) deprecation noise — not siim's to fix. No category
+    # qualifier: xarray escalated it DeprecationWarning -> FutureWarning on its
+    # removal ladder (a category-pinned filter silently stopped matching).
+    "ignore:dropping variables using",
+]
