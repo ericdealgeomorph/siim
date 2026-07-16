@@ -79,3 +79,7 @@ notebooks/model_outputs/
 
 # coverage artifacts
 .coverage
+
+# Locally-frozen S0 reference battery (platform-bound bit-for-bit refs; the
+# committed battery in siim/tests/data/reference/ is the CI/linux one)
+siim/tests/data/reference_local/

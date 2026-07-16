@@ -11,7 +11,15 @@ value enters a closure.
 import numpy as np
 import pytest
 
-from siim.fastscape.processes import _fabricate_trunk_surface
+from siim._core.step import _fabricate_trunk_surface
+
+
+@pytest.fixture(autouse=True)
+def _run_under_both_drivers(both_drivers):
+    """S3 (Map 4 §1 PARAM): every test in this file runs under BOTH drivers --
+    the conftest ``both_drivers`` fixture patches ``constants.DRIVER_DEFAULT``,
+    so the existing assertions gate the in-house driver too."""
+
 
 
 # ---------------------------------------------------------------------------

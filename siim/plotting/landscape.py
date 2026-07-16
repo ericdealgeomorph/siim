@@ -521,7 +521,14 @@ class LandscapeMixin:
             if ax_cs is not None:
                 dy_sub = m.Ly / (ny_sub - 1)
                 j_cs = max(0, min(ny_sub - 1, int(round(y_km * 1e3 / dy_sub))))
-                cs_profile = z_smooth[j_cs, :]
+                # The section reads the PRE-smoothing composite, never z_smooth:
+                # the map's Gaussian (sigma_cells) bridges bed slots narrower
+                # than its kernel, and painting the bridge-to-bed gap as ice
+                # fabricates phantom glaciers in relict carved notches (H = 0).
+                # Unsmoothed, the profile collapses onto the bed wherever no
+                # ice is drawn, so the ice band below is exactly the drawn ice
+                # column and nothing else.
+                cs_profile = z_composite[j_cs, :]
                 cs_x = np.linspace(0, m.Lx / 1e3, nx_sub)
                 n_z = 200
                 z_grid = np.linspace(z_min, z_max, n_z).reshape(-1, 1)

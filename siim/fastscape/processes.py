@@ -25,33 +25,34 @@ The numba flow-accumulation + D-infinity routing primitives live in
 """
 
 import numpy as np
-import xsimlab as xs
-from fastscape.processes import (
-    BlockUplift,
-    FlowAccumulator, FlowRouter, RasterGrid2D, SurfaceToErode,
-    SurfaceAfterTectonics, SurfaceTopography, BorderBoundary, Flexure,
-    TectonicForcing,
-)
 
-from ..constants import GRAVITY, RHO_ICE
+try:
+    import xsimlab as xs
+    from fastscape.processes import (
+        BlockUplift,
+        FlowAccumulator, FlowRouter, RasterGrid2D, SurfaceToErode,
+        SurfaceAfterTectonics, SurfaceTopography, BorderBoundary, Flexure,
+        TectonicForcing,
+    )
+except ImportError as e:
+    raise ImportError(
+        "siim.fastscape is the OPTIONAL fastscape/xsimlab adapter — the "
+        "standalone 2D model (siim.siim2d) needs none of it. To use the "
+        "adapter: `pip install siim[fastscape]` provides fastscape + xsimlab "
+        "from PyPI, but fastscapelib-fortran (the fortran backend fastscape's "
+        "stock processes call at run time) has no PyPI wheel — use the conda "
+        "env instead: `conda env create -f environment.yml`."
+    ) from e
+
 from .. import constants as _constants
-from .._core.routing import (
-    _flow_accumulate_sd, _flow_accumulate_sd_2,
-    _flow_accumulate_dinf, _flow_accumulate_dinf_2,
-    _priority_flood_eps, _dinf_route, _dinf_topo_stack, _dinf_pack,
-    _DINF_E1_DJ, _DINF_E1_DI, _DINF_E2_DJ, _DINF_E2_DI,
-)
-from .._core.skeleton import (
-    _glac_fast_solve_modeA_sfr, _glac_fast_solve_modeA_dinf,
-    _glac_fast_solve_modeB_sfr, _glac_fast_solve_modeB_dinf,
-)
-from .._core.params import GlacialParams
-from .._core.solvers import (
-    LAW_EFFEXP, LAW_POWER, LAW_COULOMB,
-    _modeb_closure,
-)
-from .._core.carve import (
-    _power_dt_2d, _power_dt_2d_periodic, _carve_offsets, _carve_subgrid_width,
+from .._core.flexure import flexure as _inhouse_flexure
+from .._core.hillslope import diffuse as _inhouse_diffuse
+from .._core.step import (
+    build_glacial_params, initial_topography, uplift_mask, block_uplift,
+    ema_thickness, routing_surface, _fabricate_trunk_surface,
+    accumulate_glacial_flow, run_modeA_step, _solve_border_H_modeA,
+    run_modeB_kernel, carve_bed, route_dinf, route_d8, accumulate_sediment,
+    glacial_flexure_step,
 )
 
 
@@ -84,22 +85,9 @@ class InitialTopography:
     border_status = xs.foreign(BorderBoundary, 'border_status')
 
     def initialize(self):
-        if self.seed is not None:
-            seed = None if np.isnan(float(self.seed)) else int(self.seed)
-        else:
-            seed = None
-        rs = np.random.RandomState(seed=seed)
-        if self.noise_amplitude is None:
-            noise_scale = 0.1 * np.max(self.elevation_init)
-        else:
-            noise_scale = float(self.noise_amplitude)
-        noise = noise_scale * rs.rand(*self.shape)
-        bs = list(self.border_status)
-        if bs[0] == "fixed_value": noise[:,  0] = 0.0
-        if bs[1] == "fixed_value": noise[:, -1] = 0.0
-        if bs[2] == "fixed_value": noise[0,  :] = 0.0
-        if bs[3] == "fixed_value": noise[-1, :] = 0.0
-        self.elevation = self.elevation_init + noise
+        self.elevation = initial_topography(
+            self.elevation_init, self.shape, self.border_status,
+            self.seed, self.noise_amplitude)
 
 
 @xs.process
@@ -112,13 +100,12 @@ class GlacialBlockUplift(BlockUplift):
     ``np.broadcast_to((1, ny, nx), (ny, nx))`` raises. Drop that leading dim
     before broadcasting; scalar / ``(y, x)`` rates are unaffected."""
 
+    def initialize(self):
+        self._mask = uplift_mask(self.status, self.shape)
+
     @xs.runtime(args="step_delta")
     def run_step(self, dt):
-        rate = np.asarray(self.rate)
-        if rate.ndim == 3:
-            rate = rate[0]
-        rate = np.broadcast_to(rate, self.shape) * self._mask
-        self.uplift = rate * dt
+        self.uplift = block_uplift(self.rate, dt, self._mask, self.shape)
 
 
 @xs.process
@@ -168,74 +155,10 @@ class GlacialLaw:
                     "— the frozen per-run scalars the law_code skeletons consume.")
 
     def initialize(self):
-        # Validate the sliding law on the standalone fastscape surface (siim1d
-        # already raises; an unrecognized string silently fell through to
-        # eff-exp here — audit m14).
-        if self.sliding_law not in ('eff-exp', 'power', 'coulomb'):
-            raise ValueError(
-                f"Unknown sliding_law: '{self.sliding_law}'. "
-                f"Options: 'eff-exp', 'power', 'coulomb'")
-        self._lambda_p = float(self.lambda_p)
-        self._lambda_c = float(self.lambda_c) if self.lambda_c is not None else _constants.LAMBDA_C
-        self._tau_c    = float(self.tau_c)
-        self._coulomb_clamp = float(self.coulomb_clamp)
-        self._rho_g = RHO_ICE
-        self._g     = GRAVITY
-        self._rho_g_g = self._rho_g * self._g
-        # cg via the single-source rheology helper (kt absorbed; audit m36).
-        self._cg = _constants.cg_prefactor(float(self.alpha_g), float(self.Ac),
-                                           self._rho_g, self._g)
-        # mu: the siim2d wrapper always passes a per-law derived value; standalone
-        # use falls back to the SAME per-law relations via constants.derive_*
-        # (single-sourced; audit m35). Co (eff-exp solver) via Co_power with the
-        # effective mu — an explicit override wins, and Co tracks it (B5).
-        if self.mu is not None:
-            self._mu = float(self.mu)
-        elif self.sliding_law == 'coulomb':
-            self._mu = _constants.derive_coulomb(
-                float(self.ce), float(self.alpha_g), self._tau_c,
-                self._rho_g, self._g, nu=float(self.nu)).mu
-        else:  # power, eff-exp
-            self._mu = _constants.derive_power(
-                float(self.ce), self._cg, self._lambda_p,
-                float(self.alpha_g), nu=float(self.nu)).mu
-        self._Co = _constants.Co_power(float(self.ce), self._cg,
-                                       self._lambda_p, float(self.alpha_g),
-                                       self._mu)
-        self._D_H = (0.0 if self.H_diffusivity is None
-                     else float(self.H_diffusivity))
-        # Centerline-to-mean depth ratio: surfaces built from (zb, H) state are
-        # zs = zb + hc_over_H * H.
-        self._hc_over_H = float(self.hc_over_H)
-        if not self._hc_over_H > 0.0:
-            raise ValueError(
-                f"hc_over_H must be > 0, got {self.hc_over_H!r}")
-        self.params = self._glacial_params_and_code()
-
-    def _glacial_params_and_code(self):
-        """(law_code, GlacialParams) for the current sliding law. Mirrors the
-        old per-law wrapper arg lists: each law fills its own constants and 0.0
-        for the others (the inactive fields reach only the unused skeleton
-        dispatch branch). hc_over_H/D_H are always real (mode A ignores them)."""
-        Ko, n, nu = float(self.Ko), float(self.n), float(self.nu)
-        m = float(self.m) if self.m is not None else n / 2.0   # default n/2 (matches siim1d/2d)
-        cg, alpha_g = self._cg, float(self.alpha_g)
-        hc_over_H, D_H = self._hc_over_H, self._D_H
-        if self.sliding_law == 'power':
-            return LAW_POWER, GlacialParams(
-                Ko=Ko, ce=float(self.ce), n=n, nu=nu, m=m, cg=cg,
-                alpha_g=alpha_g, lambda_p=self._lambda_p,
-                hc_over_H=hc_over_H, D_H=D_H)
-        elif self.sliding_law == 'coulomb':
-            return LAW_COULOMB, GlacialParams(
-                Ko=Ko, ce=float(self.ce), n=n, nu=nu, m=m, cg=cg,
-                alpha_g=alpha_g, lambda_c=self._lambda_c, tau_c=self._tau_c,
-                coulomb_clamp=self._coulomb_clamp, rho_g_g=self._rho_g_g,
-                hc_over_H=hc_over_H, D_H=D_H)
-        return LAW_EFFEXP, GlacialParams(
-            Ko=Ko, Co=self._Co, n=n, nu=nu, m=m, mu=self._mu, cg=cg,
-            alpha_g=alpha_g, lambda_p=self._lambda_p,
-            hc_over_H=hc_over_H, D_H=D_H)
+        self.params = build_glacial_params(
+            self.sliding_law, self.Ko, self.ce, self.n, self.nu, self.m,
+            self.mu, self.Ac, self.alpha_g, self.lambda_p, self.lambda_c,
+            self.tau_c, self.coulomb_clamp, self.hc_over_H, self.H_diffusivity)
 
 
 @xs.process
@@ -293,88 +216,14 @@ class GlacialFlowAccumulator(FlowAccumulator):
     _lengths_foreign = xs.foreign(FlowRouter, 'lengths')
 
     def run_step(self):
-        zELA  = np.broadcast_to(self.zELA, self.shape)
-        field = np.broadcast_to(self.runoff * self.cell_area, self.shape)
-        # Climate (pre-uplift) surface: the ice surface at step start, before
-        # this step's tectonic increment. The ELA-relative mass balance b(z) is
-        # evaluated here (not on the post-uplift `surface`) so it carries no
-        # O(U*dt) climate-after-uplift bias. At U=0 (or on fixed-value borders)
-        # surface_upward == 0 -> z_clim == surface, bit-for-bit identical.
-        z_clim = self.surface - np.broadcast_to(self.surface_upward, self.shape)
-
-        # D-inf outputs are 2D — receivers, lengths, weights are all
-        # (n_nodes, nb_rec_max). SFR outputs are 1D. Dispatch on ndim.
-        is_dinf = self.receivers.ndim == 2
-        if is_dinf:
-            nb_rec = np.asarray(self.nb_receivers, dtype=np.int64)
-            recs   = np.asarray(self.receivers,   dtype=np.int64)
-            wts    = np.asarray(self.weights,     dtype=np.float64)
-
-        # 1. Drainage area — accumulated once and reused for both glacier_width
-        #    and self.area output.
-        field_area = np.broadcast_to(self.cell_area, self.shape).flatten().copy()
-        if is_dinf:
-            _flow_accumulate_dinf(field_area, self.stack, nb_rec, recs, wts)
-        else:
-            _flow_accumulate_sd(field_area, self.stack, self.receivers)
-
-        # 2. Sub-grid glacier plan-view area for the width-aware ablation.
-        #    For D-inf, per-cell "length" is the weighted-mean across receivers
-        #    (Σ_k w_k · L_k; weights sum to 1).
-        if is_dinf:
-            lengths_2d = (self._lengths_foreign * self.weights).sum(axis=1).reshape(self.shape)
-        else:
-            lengths_2d = self._lengths_foreign.reshape(self.shape)
-        glacier_width = float(self.width_hack_k) * field_area.reshape(self.shape) ** float(self.width_hack_p)
-        glacier_area  = glacier_width * lengths_2d
-        wide_area     = np.maximum(glacier_area, self.cell_area)
-        # Above ELA, snow falls on the cell, not the glacier's footprint.
-        # (ELA test on the climate surface — see z_clim above.)
-        accum_area = np.where(z_clim < zELA, wide_area, self.cell_area)
-
-        # 3. Source field for ice accumulation, capped at the cell's total
-        #    precipitation flux (no-op on the negative/melt branch). b(z) is the
-        #    ELA-relative balance on the pre-uplift climate surface z_clim.
-        field_ice = self.beta * (z_clim - zELA) * accum_area
-        field_ice = np.where(field_ice > field, field, field_ice)
-
-        field     = field.flatten()
-        field_ice = field_ice.flatten()
-
-        # 4. Accumulate water + ice through the flow graph.
-        if is_dinf:
-            _flow_accumulate_dinf_2(field, field_ice, self.stack, nb_rec, recs, wts)
-        else:
-            _flow_accumulate_sd_2(field, field_ice, self.stack, self.receivers)
-
-        # Clamp ice flux (nodes below ELA with no upstream contribution can go negative).
-        np.maximum(field_ice, 0.0, out=field_ice)
-
-        self.ice_flux = field_ice.reshape(self.shape)
-        # Water flux = total precip flux minus ice flux
-        self.water_flux = field.reshape(self.shape) - self.ice_flux
-        # flowacc is what fastscape's parent class expects (used by other processes)
+        (self.ice_flux, self.water_flux, self.area, self.basin_ids,
+         self.receivers_2d, self.stack_2d) = accumulate_glacial_flow(
+            self.surface, self.surface_upward, self.zELA, self.beta,
+            self.runoff, self.cell_area, self.width_hack_k, self.width_hack_p,
+            self.shape, self.stack, self.receivers, self.nb_receivers,
+            self.weights, self._lengths_foreign, self._basin_foreign)
+        # flowacc is what fastscape's parent class expects (used by other processes).
         self.flowacc = self.water_flux
-        self.area = field_area.reshape(self.shape)
-        self.basin_ids = self._basin_foreign.astype(np.int32, copy=False)
-        # For D-inf, output the "primary" receiver per cell (the largest-weight one)
-        # so downstream code (extract_channel etc.) keeps a single-receiver view.
-        # Cells with no active receivers (boundary / pits — padded as -1 with all-
-        # zero weights) get receiver = self, matching the SFR self-receiving
-        # convention used by donor-tree builders.
-        if is_dinf:
-            recs_2d = np.asarray(self.receivers)
-            wts_2d  = np.asarray(self.weights)
-            n_nodes = recs_2d.shape[0]
-            primary_k = np.argmax(wts_2d, axis=1)
-            primary_rec = recs_2d[np.arange(n_nodes), primary_k].astype(np.int32)
-            self_idx = np.arange(n_nodes, dtype=np.int32)
-            no_flow = (wts_2d.sum(axis=1) <= 0.0) | (primary_rec < 0)
-            primary_rec = np.where(no_flow, self_idx, primary_rec)
-            self.receivers_2d = primary_rec.reshape(self.shape)
-        else:
-            self.receivers_2d = self.receivers.reshape(self.shape).astype(np.int32, copy=False)
-        self.stack_2d = self.stack.reshape(self.shape).astype(np.int32, copy=False)
 
 
 @xs.process
@@ -486,86 +335,27 @@ class GlacialSPLModeA(GlacialSPLBase):
     bedrock_surface = xs.variable(dims=('y', 'x'), intent='out',
         description='Bedrock (channel-floor) elevation = ice surface - hc_over_H * H')
 
-    def _run_modeA_kernel(self, z_flat, H_flat, dt):
-        """Dispatch to the right mode-A skeleton based on routing (law via
-        law_code). Modifies z_flat (eroded ice surface) and H_flat (new ice
-        thickness) in place. Note: mode A's H solver reads the local slope of
-        z_flat *before* erosion, so the H written is consistent with the
-        pre-erosion geometry."""
-        law_code, p = self._law_code, self._gp
-        if self.receivers.ndim == 2:   # D-inf
-            nb_rec = np.asarray(self.nb_receivers, dtype=np.int64)
-            recs   = np.asarray(self.receivers,   dtype=np.int64)
-            wts    = np.asarray(self.weights,     dtype=np.float64)
-            lens   = np.asarray(self.lengths,     dtype=np.float64)
-            _glac_fast_solve_modeA_dinf(
-                z_flat, self.ice_flux.ravel(), self.water_flux.ravel(), H_flat,
-                law_code, p, dt, self.stack, nb_rec, recs, wts, lens)
-        else:                          # SFR
-            _glac_fast_solve_modeA_sfr(
-                z_flat, self.ice_flux.ravel(), self.water_flux.ravel(), H_flat,
-                law_code, p, dt, self.lengths, self.stack, self.receivers)
-
-    def _H_from_QS(self, Qg, S):
-        """Per-law point closure H(Qg, S): the from_slope branch of the shared
-        :func:`_modeb_closure` (single-sourced; audit m34). Constants come from
-        the GlacialLaw record (``self._gp``); dispatch on ``self._law_code``."""
-        p = self._gp
-        return float(_modeb_closure(
-            self._law_code, True, S, Qg, 0.0, 1.0,
-            p.cg, p.lambda_p, p.lambda_c, p.tau_c, p.rho_g_g, p.coulomb_clamp))
-
     def _solve_border_H_modeA(self, z_flat, H_flat):
-        """Mode A: the surface is the anchored BC (z pinned at base level by
-        the boundary conditions), so a self-receiving border node with
-        through-flowing ice gets its thickness from the per-law H(Q, S)
-        closure with S the steepest upwind (donor-side) surface slope —
-        matching siim1d's outlet treatment. This feeds bedrock_surface and
-        border diagnostics; the surface dynamics are unchanged (z is the
-        state and the erosion kernels skip self-receiving nodes)."""
-        nn = z_flat.shape[0]
-        idx = np.arange(nn)
-        ice = self.ice_flux.ravel()
-        s_up = np.zeros(nn)
-        if self.receivers.ndim == 2:  # D-inf
-            rec = np.asarray(self.receivers, dtype=np.int64)
-            lens = np.asarray(self.lengths, dtype=np.float64)
-            nb = np.asarray(self.nb_receivers, dtype=np.int64)
-            self_rec = (nb == 1) & (rec[:, 0] == idx)
-            for k in range(rec.shape[1]):
-                m = (~self_rec) & (lens[:, k] > 0.0) & (rec[:, k] != idx)
-                if k == 1:
-                    m &= nb == 2
-                np.maximum.at(s_up, rec[m, k],
-                              (z_flat[m] - z_flat[rec[m, k]]) / lens[m, k])
-        else:  # SFR
-            rec = np.asarray(self.receivers, dtype=np.int64)
-            lens = np.asarray(self.lengths, dtype=np.float64)
-            self_rec = rec == idx
-            m = (~self_rec) & (lens > 0.0)
-            np.maximum.at(s_up, rec[m], (z_flat[m] - z_flat[rec[m]]) / lens[m])
-        for b in np.where(self_rec & (ice > 0.0) & (s_up > 0.0))[0]:
-            H_flat[b] = self._H_from_QS(float(ice[b]), float(s_up[b]))
-
-    def _commit_modeA(self, z_flat, H_flat, dt):
-        self.ice_thickness = H_flat.reshape(self.shape)
-        self.bedrock_surface = (z_flat.reshape(self.shape)
-                                - self._hc_over_H * self.ice_thickness)
-        self.erosion = self.surface - z_flat.reshape(self.shape)
-        self.erosion_rate = self.erosion / dt
-        # Mode A erodes the ice surface as its single, hc-invariant state, so the
-        # surface lowering IS the denudation (the derived bed change
-        # delta-zs - hc*delta-H is hc-dependent and would break that invariance).
-        self.denudation = self.erosion
+        """Mode A border-H closure — thin delegator to the framework-free
+        :func:`siim._core.step._solve_border_H_modeA`. Kept as a method for the
+        direct-instance test (``test_solver_bcs.py``); the run_step path solves
+        the border inside :func:`run_modeA_step`. Mutates ``H_flat`` in place;
+        ``nb_receivers`` is read only on the D-inf branch (absent under SFR)."""
+        _solve_border_H_modeA(
+            z_flat, H_flat, self.ice_flux, self.receivers,
+            getattr(self, 'nb_receivers', None), self.lengths,
+            self._law_code, self._gp)
 
     @xs.runtime(args=("step_delta",))
     def run_step(self, dt):
         dt = _scalar_dt(dt)                      # numpy-2-safe (audit m1)
-        z_flat = self.surface.flatten()          # flatten() already returns a fresh copy
-        H_flat = self.ice_thickness.flatten()    # ditto
-        self._run_modeA_kernel(z_flat, H_flat, dt)
-        self._solve_border_H_modeA(z_flat, H_flat)
-        self._commit_modeA(z_flat, H_flat, dt)
+        (_z_eroded, self.ice_thickness, self.bedrock_surface,
+         self.erosion, self.denudation) = run_modeA_step(
+            self.surface, self.ice_thickness, self.ice_flux, self.water_flux,
+            self._law_code, self._gp, dt, self.stack, self.receivers,
+            self.nb_receivers, self.weights, self.lengths, self._hc_over_H,
+            self.shape)
+        self.erosion_rate = self.erosion / dt
 
 
 @xs.process
@@ -596,47 +386,19 @@ class GlacialSPLModeB(GlacialSPLBase):
     bed_state = xs.foreign(SurfaceTopography, 'elevation', intent='in')
 
     def _run_modeB_kernel_nocarve(self, zb_flat, H_flat, dt):
-        """No-carve mode-B kernel dispatch (SFR or D-inf). Modifies zb_flat and
-        H_flat in place; returns the kernel's surface_out (= zb + hc*H). Mode B
-        discards surface_out (its erosion height is denudation, not a
+        """No-carve mode-B kernel dispatch — thin wrapper over the framework-free
+        :func:`siim._core.step.run_modeB_kernel`. Mutates ``zb_flat`` and
+        ``H_flat`` in place; returns the kernel's ``surface_out`` (= zb + hc*H).
+        Mode B discards ``surface_out`` (its erosion height is denudation, not a
         surface-replace); the carving :class:`GlacialSPLModeC` reuses this
         dispatch and then carves the returned bed."""
-        ny, nx = int(self.shape[0]), int(self.shape[1])
-        dx_cell = float(self._dx_cell)
-        dy_cell = float(self._dy_cell)
-        surface_out = np.empty_like(zb_flat)
-        # Drop the leading size-1 tstep dim left by xsimlab on a (nt, y, x) slice
-        # (xarray no longer squeezes groupby) before broadcasting.
-        bbu = np.asarray(self.border_bed_uplift, dtype=np.float64)
-        if bbu.ndim == 3:
-            bbu = bbu[0]
-        bbu_flat = np.broadcast_to(bbu, (ny, nx)).ravel()
-        # Per-step water-line datum (the clock strips the 'tstep' dim, so self.bl
-        # is a scalar each step) + the global flotation gate and its ramp width.
-        bl = float(np.asarray(self.bl).ravel()[-1])
-        gate = bool(self.flotation_gate)
-        ramp = float(self.flotation_ramp)
-        par = bool(self.parallel_erode)
-        law_code, p = self._law_code, self._gp
-        if self.receivers.ndim == 2:   # D-inf
-            nb_rec = np.asarray(self.nb_receivers, dtype=np.int64)
-            recs = np.asarray(self.receivers, dtype=np.int64)
-            wts = np.asarray(self.weights, dtype=np.float64)
-            lens = np.asarray(self.lengths, dtype=np.float64)
-            _glac_fast_solve_modeB_dinf(
-                zb_flat, self.ice_flux.ravel(), self.water_flux.ravel(),
-                H_flat, surface_out, law_code, p,
-                dt, self.stack, nb_rec, recs, wts, lens,
-                ny, nx, dx_cell, dy_cell, bbu_flat, self._wrap_y, self._wrap_x,
-                bl, gate, ramp, par)
-        else:
-            _glac_fast_solve_modeB_sfr(
-                zb_flat, self.ice_flux.ravel(), self.water_flux.ravel(),
-                H_flat, surface_out, law_code, p,
-                dt, self.lengths, self.stack, self.receivers,
-                ny, nx, dx_cell, dy_cell, bbu_flat, bl, gate, ramp,
-                self._wrap_y, self._wrap_x, par)
-        return surface_out
+        return run_modeB_kernel(
+            zb_flat, H_flat, self.ice_flux, self.water_flux,
+            self._law_code, self._gp, dt, self.stack, self.receivers,
+            self.nb_receivers, self.weights, self.lengths, self.shape,
+            self._dx_cell, self._dy_cell, self.border_bed_uplift,
+            self.bl, self.flotation_gate, self.flotation_ramp,
+            self.parallel_erode, self._wrap_y, self._wrap_x)
 
     @xs.runtime(args=("step_delta",))
     def run_step(self, dt):
@@ -692,43 +454,21 @@ class GlacialSPLModeC(GlacialSPLModeB):
             self._c_SRC = np.empty((ny, nx), dtype=np.int64)
 
     def _carve_bed(self, zb_flat, H_flat, surface_out, zb_pre):
-        """Apply the sub-grid width carve (see :mod:`siim._core.carve`) to the
-        post-kernel bed ``zb_flat`` IN PLACE. ``zb_pre`` is the pre-kernel bed
-        (the denudation datum + the descent-cap origin, so kernel erosion and
-        the carve arbitrate — never add); ``surface_out`` is the kernel's
-        reconstructed ice surface (updated for carved cells, discarded by the
-        citizen). Routing-agnostic: receivers enter only through the border
-        marker ``rec[i] == i`` (self-receiving = base-level border), handed to
-        the carve as a 1-D marker array under D-inf. Every icy interior cell
-        seeds a disc (all-ones seed mask)."""
+        """Apply the sub-grid width carve to the post-kernel bed ``zb_flat`` IN
+        PLACE — thin wrapper over the framework-free
+        :func:`siim._core.step.carve_bed`, passing the persistent per-step scratch
+        buffers. ``zb_pre`` is the pre-kernel bed (the denudation datum + the
+        descent-cap origin, so kernel erosion and the carve arbitrate — never
+        add); ``surface_out`` the kernel's reconstructed ice surface (updated for
+        carved cells, discarded by the citizen)."""
         ny, nx = int(self.shape[0]), int(self.shape[1])
-        dx_cell = float(self._dx_cell)
-        dy_cell = float(self._dy_cell)
         self._ensure_carve_buffers(ny, nx)
-        if self.receivers.ndim == 2:            # D-inf: 1-D self-at-border marker
-            nn = ny * nx
-            idx = np.arange(nn, dtype=np.int64)
-            recs = np.asarray(self.receivers, dtype=np.int64)
-            rec_marker = np.where(recs[:, 0] == idx, idx, -1)
-        else:
-            rec_marker = self.receivers
-        seed_mask = np.ones(ny * nx, dtype=np.int8)   # seed every icy interior cell
-        n_seed = _carve_offsets(H_flat, rec_marker, float(self._gp.alpha_g),
-                                self._c_offsets.ravel(), seed_mask)
-        if n_seed == 0:
-            return
-        if self._wrap_x or self._wrap_y:
-            _power_dt_2d_periodic(self._c_offsets, dy_cell, dx_cell,
-                                  self._c_D, self._c_SRC,
-                                  self._wrap_y, self._wrap_x)
-        else:
-            _power_dt_2d(self._c_offsets, dy_cell, dx_cell,
-                         self._c_D, self._c_SRC)
-        np.copyto(self._c_zb_kern, zb_flat)     # post-kernel bed (source anchors)
-        _carve_subgrid_width(zb_flat, self._c_zb_kern, zb_pre, H_flat,
-                             surface_out, rec_marker, self._c_D, self._c_SRC,
-                             self._c_offsets, self._widening_factor,
-                             self._hc_over_H)
+        carve_bed(
+            zb_flat, H_flat, surface_out, zb_pre, self.receivers,
+            self._gp.alpha_g, self._hc_over_H, self._widening_factor,
+            self.shape, self._dx_cell, self._dy_cell,
+            self._wrap_y, self._wrap_x,
+            self._c_offsets, self._c_D, self._c_SRC, self._c_zb_kern)
 
     @xs.runtime(args=("step_delta",))
     def run_step(self, dt):
@@ -807,90 +547,17 @@ class GlacialSurfaceToErode(SurfaceAfterTectonics):
         # (TrunkSurfaceToErode) reuses self._H_eff — the SAME single update.
         self._H_eff = None
 
-    def _routing_thickness(self):
-        """The (optionally EMA-relaxed) lagged thickness for this step's routing
-        + mass-balance surface. ONE update per model step; the result is cached
-        on ``self._H_eff`` (both the EMA carry to next step AND the value a
-        subclass reuses). r = 0 returns the raw ``ice_thickness`` unchanged
-        (bit-for-bit)."""
-        r = float(self.routing_relax)
-        if r == 0.0:
-            H_eff = self.ice_thickness           # raw lagged H (bit-for-bit)
-        else:
-            H_lag = np.asarray(self.ice_thickness, dtype=np.float64)
-            prev = self._H_eff
-            H_eff = H_lag if prev is None else r * prev + (1.0 - r) * H_lag
-        self._H_eff = H_eff
-        return H_eff
-
     def run_step(self):
         # SurfaceAfterTectonics.run_step sets elevation = topo + forced_motion
         # (= post-uplift bed). Add the reconstructed ice column hc_over_H*H_eff
         # (H_eff = the relaxed lagged H; raw H when routing_relax == 0).
         super().run_step()
-        self.elevation = (self.elevation
-                          + float(self.hc_over_H) * self._routing_thickness())
-
-
-def _fabricate_trunk_surface(zs_dyn, zb, H_lag, border, alpha_g, dx, dy,
-                             k_dip, floor, offsets, D, SRC, wrap_y, wrap_x):
-    """Build the fabricated trunk routing surface (design record
-    ``docs/dev/trunk_surface_routing.md``). Pure function (no process state) so
-    the process and the channel-persistence test share one implementation.
-
-    ``zs_dyn`` (ny, nx) is the dynamic ice surface ``zb + hc*H_lag``; ``zb`` the
-    matching bed; ``H_lag`` the lagged thickness; ``border`` (ny, nx bool) the
-    base-level edges (excluded as seeds + never fabricated). ``offsets/D/SRC``
-    are (ny, nx) scratch buffers. Returns a fresh (ny, nx) elevation: the
-    V-dipped trunk surface at footprint cells (``max(zs_geo, zb)``), ``zs_dyn``
-    elsewhere.
-    """
-    ny, nx = zs_dyn.shape
-    nn = ny * nx
-    cell_scale = min(dx, dy)
-    zs_flat = zs_dyn.ravel()
-    zb_flat = zb.ravel()
-    border_flat = border.ravel()
-    idx = np.arange(nn)
-
-    # Attribution on lagged H (thickest disc wins): seeds = icy ∧ non-border.
-    rec_marker = np.where(border_flat, idx, -1)
-    seed_mask = (~border_flat).astype(np.int8)
-    n_seed = _carve_offsets(H_lag.ravel(), rec_marker, float(alpha_g),
-                            offsets.ravel(), seed_mask)
-    if n_seed == 0:
-        return zs_dyn.copy()
-    if wrap_x or wrap_y:
-        _power_dt_2d_periodic(offsets, dy, dx, D, SRC, wrap_y, wrap_x)
-    else:
-        _power_dt_2d(offsets, dy, dx, D, SRC)
-    Df = D.ravel()
-    SRCf = SRC.ravel()
-
-    # Cross-slope per source: S_c = k_dip * max(|grad zs_dyn|, floor). |grad| at a
-    # trunk-bottom source ~= the down-valley slope (cross-valley ~0 there);
-    # over-estimating S_c only aids convergence, so grad magnitude is the safe
-    # estimator.
-    gy, gx = np.gradient(zs_dyn, dy, dx)
-    S_c = float(k_dip) * np.maximum(np.hypot(gy, gx).ravel(), float(floor))
-
-    member = (Df < 0.0) & (~border_flat)
-    mem_idx = np.nonzero(member)[0]
-    elev = zs_flat.copy()
-    if mem_idx.size == 0:
-        return elev.reshape(ny, nx)
-    s = SRCf[mem_idx]
-    R2s = -offsets.ravel()[s]                     # R_s^2 at the source
-    Rs = np.sqrt(R2s)
-    gate = (s >= 0) & (Rs > cell_scale)           # sub-cell sources: no trunk
-    mem_idx = mem_idx[gate]
-    if mem_idx.size == 0:
-        return elev.reshape(ny, nx)
-    s = s[gate]
-    d = np.sqrt(np.maximum(Df[mem_idx] + R2s[gate], 0.0))
-    zs_geo = zs_flat[s] + S_c[s] * (d - Rs[gate])
-    elev[mem_idx] = np.maximum(zs_geo, zb_flat[mem_idx])
-    return elev.reshape(ny, nx)
+        # ONE routing_relax EMA update per model step; cache on self._H_eff (the
+        # cross-step carry AND the value the trunk subclass reuses within-step).
+        self._H_eff = ema_thickness(self.ice_thickness, self._H_eff,
+                                    float(self.routing_relax))
+        self.elevation = routing_surface(self.elevation, self.hc_over_H,
+                                         self._H_eff)
 
 
 @xs.process
@@ -1031,18 +698,9 @@ class SedimentTracker:
         self._cum = np.zeros(self.shape, dtype=np.float64)
 
     def run_step(self):
-        # Per-cell eroded volume (m^3), routed down the flow graph. Clamp to >= 0
-        # so deposition / boundary noise can't subtract from the sediment budget.
-        field = np.maximum(self.denudation, 0.0).astype(np.float64).flatten() * float(self.cell_area)
-        if self.receivers.ndim == 2:   # D-inf
-            nb_rec = np.asarray(self.nb_receivers, dtype=np.int64)
-            recs   = np.asarray(self.receivers,   dtype=np.int64)
-            wts    = np.asarray(self.weights,     dtype=np.float64)
-            _flow_accumulate_dinf(field, self.stack, nb_rec, recs, wts)
-        else:                          # SFR
-            _flow_accumulate_sd(field, self.stack, self.receivers)
-
-        self.flux = field.reshape(self.shape)
+        self.flux = accumulate_sediment(
+            self.denudation, self.cell_area, self.stack, self.receivers,
+            self.nb_receivers, self.weights, self.shape)
         # New array each step (not in-place) so prior snapshots stay valid.
         self._cum = self._cum + self.flux
         self.cumulative = self._cum
@@ -1094,62 +752,136 @@ class GlacialFlexure(Flexure):
         "load (true glacial isostatic adjustment). False = erosional/tectonic unloading "
         "only (the pre-GIA behaviour; isolate the ice contribution or reproduce runs "
         "saved before the ice load).")
+    numerics_backend = xs.variable(
+        default=_constants.NUMERICS_BACKEND,
+        description="Plate-solve backend: 'inhouse' (siim scipy.fft native-grid "
+        "solve, fixes the fortran pihy anisotropy bug) — the only accepted "
+        "value since the 0.9.1 standalone flip. See constants.NUMERICS_BACKEND.")
 
     def initialize(self):
         self._col_prev = np.zeros(self.shape)
 
-    def _ice_column(self):
-        # Mass-conserving glacial ice load: the channel cross-section alpha_g*H**2
-        # (= Qg/V, hc-free) carried over a cell-sized length L -> areal column
-        # alpha_g*H**2 / L, with L = sqrt(cell_area). Width-aware (∝ H**2).
-        L = float(self.cell_area) ** 0.5
-        col = float(self.alpha_g) * self.ice_thickness ** 2 / L
-        return col
+    def _flexure_solve(self):
+        """Return the biharmonic plate solve callable, validating the backend
+        value (a typo like 'fortan' must raise the same ValueError the siim2d /
+        glacial_processes entry points give, not silently run in-house). The
+        in-house solve keeps step.py framework-free; the retired 'fortran'
+        fs.flexure arm was deleted at the 0.9.1 standalone flip."""
+        if self.numerics_backend != 'inhouse':
+            raise ValueError("numerics_backend must be 'inhouse' (the retired "
+                             "'fortran' backend was removed at the 0.9.1 "
+                             f"standalone flip), got {self.numerics_backend!r}")
+        return _inhouse_flexure
 
     def run_step(self):
-        import fastscapelib_fortran as fs   # lazy: fortran lib is not mocked in the docs build
-        ny, nx = self.shape
-        yl, xl = self.length
-
-        lithos_density = np.broadcast_to(self.lithos_density, self.shape).flatten()
-        elevation_eq = self.elevation.flatten()
-        diff = (self.surface_upward - self.erosion).ravel()
-        col = self._ice_column()
-        if self.ice_load:
-            # Incremental rock-equivalent ice load: rho_ice*g*d(col) == rho_lithos*g*
-            # ((rho_ice/lithos_density)*d(col)); g cancels (density-ratio identity),
-            # lithos_density is per-cell so divide element-wise. col is the channel
-            # cross-section alpha_g*H**2/L (mass-conserving; see _ice_column).
-            dcol = (col - self._col_prev).ravel()
-            diff = diff + (RHO_ICE / lithos_density) * dcol
-
-        elevation_pre = elevation_eq + diff
-        elevation_post = elevation_pre.copy()
-        fs.flexure(
-            elevation_post,
-            elevation_eq,
-            nx,
-            ny,
-            xl,
-            yl,
-            lithos_density,
-            self.asthen_density,
-            self.e_thickness,
-            self.ibc,
-        )
-        self.rebound = (elevation_post - elevation_pre).reshape(self.shape)
-        self._col_prev = col.copy()
+        # The biharmonic plate solve is the injected seam (fortran fs.flexure or
+        # the in-house scipy.fft solve); everything else is framework-free.
+        self.rebound, self._col_prev = glacial_flexure_step(
+            self.elevation, self.erosion, self.surface_upward,
+            self.ice_thickness, self.alpha_g, self.cell_area,
+            self.lithos_density, self.asthen_density, self.e_thickness,
+            self.ibc, self.shape, self.length, self._col_prev, self.ice_load,
+            self._flexure_solve())
 
 
 @xs.process
-class DinfFlowRouter(FlowRouter):
+class HillslopeDiffusion:
+    """In-house linear hillslope diffusion (ADI), the standalone replacement for
+    fastscape's stock ``LinearDiffusion`` (fortran ``fs.diffusion``).
+
+    Same input/output contract as ``LinearDiffusion`` — reads
+    ``SurfaceToErode.elevation`` + the ``diffusivity`` input, writes the per-step
+    ``erosion`` into the ``"erosion"`` group — so it drops into the ``'diffusion'``
+    model slot when ``numerics_backend='inhouse'``. The unconditionally-stable ADI
+    solve (:func:`siim._core.hillslope.diffuse`) is bit-for-bit with the fortran
+    for the uniform ``kd`` siim uses. Boundary handling keys off the same ``ibc``
+    code (BorderBoundary), read directly rather than via the fortran context.
+    """
+
+    diffusivity = xs.variable(
+        dims=[(), ('y', 'x')], description="diffusivity (transport coefficient)")
+    erosion = xs.variable(dims=('y', 'x'), intent='out', groups='erosion')
+
+    shape = xs.foreign(RasterGrid2D, 'shape')
+    length = xs.foreign(RasterGrid2D, 'length')
+    ibc = xs.foreign(BorderBoundary, 'ibc')
+    elevation = xs.foreign(SurfaceToErode, 'elevation')
+
+    @xs.runtime(args='step_delta')
+    def run_step(self, dt):
+        ny, nx = self.shape
+        yl, xl = self.length
+        diffused = _inhouse_diffuse(
+            self.elevation, self.diffusivity, _scalar_dt(dt), nx, ny, xl, yl, self.ibc)
+        self.erosion = self.elevation.reshape(self.shape) - diffused
+
+
+@xs.process
+class _InhouseRouterShell(FlowRouter):
+    """Shared shell for the two fortran-free in-house routers (:class:`D8FlowRouter`,
+    :class:`DinfFlowRouter`): the ``@xs.process`` adapter over a framework-free
+    ``_core.step`` producer. Sets the shared fortran-context surface (as the base
+    ``FlowRouter`` does, for the co-resident stock diffusion/flexure) but SKIPS
+    the fortran routing call — the interior mask (from ``border_status``), the
+    directions, and ``basin`` are all in-house (S4, Map 3 §3-§4). Donors are
+    declared by the base ``FlowRouter`` but unconsumed by siim (grep-verified),
+    so they are zeroed to keep the (unused) foreign targets well-formed. Basin is
+    overridden as an on_demand returning the in-house outlet labeling."""
+
+    dx = xs.foreign(RasterGrid2D, 'dx')
+    dy = xs.foreign(RasterGrid2D, 'dy')
+    border_status = xs.foreign(BorderBoundary, 'border_status')
+
+    # Override the base FlowRouter's fortran-catch on_demand with the in-house
+    # (deterministic, outlet-index) basin labeling produced by the router.
+    basin = xs.on_demand(dims=('y', 'x'), description='river catchments')
+
+    def _route(self):
+        """Return ``(receivers, weights, lengths, nb_receivers, stack, basin)``.
+        Implemented by the concrete SFR / D-inf subclass."""
+        raise NotImplementedError
+
+    def run_step(self):
+        # Keep the shared fortran-context surface in sync (the base FlowRouter
+        # sets it too), but do NOT run the fortran router.
+        self.fs_context['h'] = self.elevation.ravel()
+        (self.receivers, self.weights, self.lengths,
+         self.nb_receivers, self.stack, self._basin_ids) = self._route()
+        nn = self.shape[0] * self.shape[1]
+        self.nb_donors = np.zeros(nn, dtype=int)
+        self.donors = np.full((nn, 1), -1, dtype=int)
+
+    @basin.compute
+    def _basin(self):
+        return self._basin_ids
+
+
+@xs.process
+class D8FlowRouter(_InhouseRouterShell):
+    """In-house D8 single-flow router (S4) — the framework-free replacement for
+    fastscape's fortran ``SingleFlowRouter`` (``fs.flowroutingsingleflowdirection``).
+    Fills the ``flow`` slot when ``routing='single'`` and
+    ``router_backend='inhouse_d8'``. Produces the SFR bundle (1D receivers /
+    lengths, all-ones weights / nb_receivers, outlet-first stack) via
+    :func:`siim._core.step.route_d8` on the eps-filled surface; basin labeled by
+    outlet index. The routing delta vs the fortran SFR is confined to
+    depression/tie cells (behavioral/attractor gate); ``docs/dev/router_contract.md``."""
+
+    def _route(self):
+        return route_d8(self.elevation, self.shape, self.dx, self.dy,
+                        self.border_status)
+
+
+@xs.process
+class DinfFlowRouter(_InhouseRouterShell):
     """D-infinity flow router :cite:p:`tarbotonNewMethodDetermination1997`.
 
-    Subclasses fastscape's ``FlowRouter``. Calls the fortran routing first for
-    boundary handling, donor lists, and basin IDs, then overrides receivers,
-    weights, lengths and stack with the D-infinity computation. Outputs use the
-    (n_nodes, 2) receiver/weight shape consumed by GlacialFlowAccumulator and the
-    mode-B / mode-A D-inf kernels.
+    Subclasses the in-house router shell — fully fortran-free (S4): the
+    interior/boundary mask comes from ``border_status`` (Map 3 §4, provably
+    identical to the old fortran ``sfr_rec != i`` mask) and ``basin`` from the
+    in-house outlet labeling, so the last ``fs.flowrouting()`` call is gone.
+    Outputs use the (n_nodes, 2) receiver/weight shape consumed by
+    GlacialFlowAccumulator and the mode-B / mode-A D-inf kernels.
 
     Continuous facet-direction weights replace the discrete neighbor weighting
     jumps of Quinn-style multi-flow routing, removing per-step receiver-flip
@@ -1166,76 +898,6 @@ class DinfFlowRouter(FlowRouter):
     reference is docs/dev/dinf_routing.md.
     """
 
-    dx = xs.foreign(RasterGrid2D, 'dx')
-    dy = xs.foreign(RasterGrid2D, 'dy')
-    border_status = xs.foreign(BorderBoundary, 'border_status')
-
-    def route_flow(self):
-        # Run fastscapelib_fortran's flowrouting to populate fs_context with
-        # baseline SFR info (used for boundary detection + donors + basin).
-        import fastscapelib_fortran as fs
-        fs.flowrouting()
-
-    def run_step(self):
-        # Base class sets fs_context['h'], calls route_flow(), populates donors.
-        super().run_step()
-
-        ny, nx = int(self.shape[0]), int(self.shape[1])
-        nn = ny * nx
-
-        # Boundary detection: SFR rec[i]==i marks boundary/sink cells.
-        sfr_rec = (np.asarray(self.fs_context['rec']).astype(np.int64) - 1)
-        interior = (sfr_rec != np.arange(nn)).astype(np.int8)
-
-        # D-inf routing on the eps-filled surface: every interior cell —
-        # including closed-basin floors — gets a strictly downhill facet,
-        # so flux crosses depressions toward their spills and the
-        # topological sort is valid by construction. The kernels/physics
-        # keep consuming the true elevation.
-        bs = list(np.broadcast_to(self.border_status, 4))
-        wrap_x = bs[0] == 'looped'
-        wrap_y = bs[2] == 'looped'
-        z_flat = np.ascontiguousarray(self.elevation.ravel().astype(np.float64))
-        z_route = np.empty(nn, dtype=np.float64)
-        _priority_flood_eps(z_flat, ny, nx, interior, 1e-6,
-                            wrap_y, wrap_x, z_route)
-        rec1 = np.zeros(nn, dtype=np.int64)
-        rec2 = np.zeros(nn, dtype=np.int64)
-        w1 = np.zeros(nn, dtype=np.float64)
-        w2 = np.zeros(nn, dtype=np.float64)
-        len1 = np.zeros(nn, dtype=np.float64)
-        len2 = np.zeros(nn, dtype=np.float64)
-        # slope_out = the steepest-facet slope on the FILLED surface; the router
-        # itself does not consume it (audit N14), but it is a cheap routing
-        # diagnostic exercised by the D-inf slope-correctness tests — kept, not
-        # a live input to anything downstream.
-        slope_out = np.zeros(nn, dtype=np.float64)
-        _dinf_route(z_route, ny, nx, float(self.dx), float(self.dy), interior,
-                    rec1, rec2, w1, w2, len1, len2, slope_out,
-                    _DINF_E1_DJ, _DINF_E1_DI, _DINF_E2_DJ, _DINF_E2_DI,
-                    wrap_y, wrap_x)
-
-        # Pack into (n, 2) receiver/weight arrays
-        receivers = np.zeros((nn, 2), dtype=np.int64)
-        weights = np.zeros((nn, 2), dtype=np.float64)
-        lengths = np.zeros((nn, 2), dtype=np.float64)
-        nb_receivers = np.zeros(nn, dtype=np.int64)
-        _dinf_pack(rec1, rec2, w1, w2, len1, len2, nn,
-                   receivers, weights, lengths, nb_receivers)
-
-        # Topological sort (receivers-first), then reverse for fastscape's
-        # donor-first convention (_flow_accumulate_dinf / _flow_accumulate_dinf_2
-        # iterate `for inode in stack`, walking from upstream down). Rebuilt each
-        # step: the topology changes every step during transient evolution, so
-        # the old topology cache never hit (measured 0/80 steps) and the rebuild
-        # it would save is ~1% of the D-inf step — removed (audit N32).
-        stack_rec_first = np.zeros(nn, dtype=np.int64)
-        _dinf_topo_stack(rec1, rec2, w1, w2, nn, stack_rec_first)
-        stack = stack_rec_first[::-1].copy()
-
-        # Set xs.variable outputs
-        self.stack = stack
-        self.nb_receivers = nb_receivers
-        self.receivers = receivers
-        self.weights = weights
-        self.lengths = lengths
+    def _route(self):
+        return route_dinf(self.elevation, self.shape, self.dx, self.dy,
+                          self.border_status)

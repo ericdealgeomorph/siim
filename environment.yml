@@ -1,19 +1,25 @@
-# Conda env for siim development + the siim-based papers: the shared `glacial`
-# env. Canonical copy: ~/conda-envs/glacial.yml.
+# The FASTSCAPE-ADAPTER / LEGACY env (the shared `glacial` dev env).
+# Canonical copy: ~/conda-envs/glacial.yml.
+#
+# Since the 0.9.1 standalone flip this env is needed ONLY for the optional
+# fastscape/xsimlab adapter (siim.fastscape, driver='xsimlab') and the
+# adapter-marked test slice — the standalone 2D model is plain
+# `pip install siim` (numpy 2, current xarray, no conda). It remains the
+# full dev env (papers + the adapter CI job).
 #
 # *** Pinned to numpy<2 on purpose *** — fastscape's framework xarray-simlab
 # 0.5.0 (unmaintained) calls np.in1d, which NumPy 2 removed (xr_accessor.py ->
-# AttributeError on multi-clock runs). numpy 1.26 is also the version siim's test
-# suite is validated against. This env is the numpy-1 quarantine; every other env
-# here runs numpy 2.
+# AttributeError on multi-clock runs). The numpy<2 / xarray<2026.5 / zarr<3
+# quarantine now constrains ONLY this adapter env, not a default install.
 #
 # Setup:
 #   conda env create -f environment.yml          # or: conda env update -n glacial -f ...
 #   conda activate glacial
-#   pip install -e . --no-deps                    # siim, editable
+#   pip install -e . --no-deps                    # siim, editable (never let pip
+#                                                 # touch the quarantined pins)
 #   pip install -e /Users/ericdeal/.dealfigstyle --no-deps   # dealfig (papers)
 #
-# Test:  python -m pytest siim/tests -q
+# Test:  python -m pytest siim/tests -q           # full suite incl. -m adapter
 # Docs:  pip install -r docs/requirements.txt   then
 #        python -m sphinx -W -E -b html docs docs/_build/html
 name: glacial

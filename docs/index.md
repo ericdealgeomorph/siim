@@ -9,19 +9,23 @@ Three front ends share one set of physics and constants (`siim.constants`):
 
 - **1D profile model** (`siim.siim1d`) — a single glacial–fluvial long
   profile; fast, numpy/scipy/numba only.
-- **2D landscape model** (`siim.siim2d`) — a fastscape/xsimlab raster model
-  (single-flow or D-infinity routing, sub-grid glacier-width carving), with a
-  rifted-margin escarpment variant in `siim.escarpment`. Its default *mode-C
-  standard* combines bed memory, width carving, and trunk-surface routing.
+- **2D landscape model** (`siim.siim2d`) — a raster model (single-flow or
+  D-infinity routing, sub-grid glacier-width carving), with a rifted-margin
+  escarpment variant in `siim.escarpment`. Its default *mode-C standard*
+  combines bed memory, width carving, and trunk-surface routing. Since 0.9.1
+  it runs standalone on a plain pip install (in-house time loop, routing,
+  flexure, and diffusion).
 - **Analytical steady state** (`siim.analytical`) — one closure engine behind
   three front ends (`GeneralProfile`, `MarginalCoulombProfile`,
   `SteadyStateProfile`), plus a nondimensional regime map
   (`siim.analytical.regime`) for the bistability boundary. Both numerical
   models embed it as their reference. numpy/scipy only.
 
-siim's glacial physics is also available as composable fastscape processes
-(`siim.fastscape`), for use in your own fastscape model without the siim
-wrapper — see {doc}`guides/fastscape_processes`.
+siim's glacial physics is also available as an **optional** fastscape adapter
+(`siim.fastscape`), for composing the physics into your own fastscape/xsimlab
+model — see {doc}`guides/fastscape_processes`. It needs the fastscape stack
+(`pip install siim[fastscape]`, conda for the Fortran backend); the standalone
+2D model above does not.
 
 Theory follows the model-paper and theory-paper drafts; where a docstring
 cites the papers it refers to equations by LaTeX `\label`, not number.

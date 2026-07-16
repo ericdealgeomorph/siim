@@ -128,7 +128,11 @@ def test_forebulge_renucleates_second_glacier():
     Qg_old, Qg_new = _ref_old_new(_X, z, **_PARS, nx=_NX)
 
     # model matches the reflection oracle bit-for-bit
-    np.testing.assert_array_equal(Qg, Qg_new)
+    # njit-vs-python-oracle: 1-ulp libm/CPU-dispatch differences across CI
+    # runner hardware are irreducible (survive NUMBA_CPU_NAME=generic — plan,
+    # sanctioned regeneration #2 fallback). rtol=1e-14 = 100x the observed ulp;
+    # atol=0 keeps the below-terminus zeros exact.
+    np.testing.assert_allclose(Qg, Qg_new, rtol=1e-14, atol=0)
 
     runs_new = _icy_runs(Qg > 0)
     runs_old = _icy_runs(Qg_old > 0)
@@ -156,7 +160,9 @@ def test_monotone_tongue_bit_for_bit():
                                _PARS['xo'], 0.0, _NX - 1, _NX, _NX, np.inf)
     Qg_old, Qg_new = _ref_old_new(_X, z, **_PARS, nx=_NX)
     assert len(_icy_runs(Qg > 0)) == 1
-    np.testing.assert_array_equal(Qg, Qg_old)   # == the pre-m2 pointwise clip
+    # == the pre-m2 pointwise clip; njit-vs-python at rtol=1e-14 (cross-
+    # implementation libm dispatch, see above), python-vs-python stays bitwise.
+    np.testing.assert_allclose(Qg, Qg_old, rtol=1e-14, atol=0)
     np.testing.assert_array_equal(Qg_old, Qg_new)
 
 

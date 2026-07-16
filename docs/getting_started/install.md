@@ -1,38 +1,39 @@
 # Installation
 
-siim is a research package, installed from a clone. Its dependencies split by
-component, which decides how you install it:
+siim is a research package, installed from a clone. Since 0.9.1 the whole
+model — 1D, **2D included**, analytical, plotting — is **pip-installable**: it
+runs on numpy (2.x supported), scipy, numba, matplotlib, tqdm, and xarray,
+with the time loop, flow routing, flexure, and hillslope diffusion all
+implemented in-house. No conda, no Fortran.
 
-- **Lightweight core** — `import siim`, the 1D model (`siim.siim1d`), and the
-  analytical package (`siim.analytical`) need only numpy, scipy, numba, and
-  matplotlib (`siim.analytical`: numpy/scipy alone). These install cleanly with
-  pip.
-- **2D stack** — the 2D model (`siim.siim2d`) and the fastscape process layer
-  (`siim.fastscape`) additionally need xsimlab, fastscape, and
-  **fastscapelib-fortran**. The last compiles from Fortran and is most easily
-  obtained from conda-forge, so a conda environment is the path of least
-  resistance for anything 2D.
-
-The heavy 2D dependencies load lazily — only when you import `siim.siim2d` or
-`siim.fastscape` — so the lightweight components run without them.
-
-## From a clone
-
-**Lightweight core (1D model + analytical), any environment:**
+## Standard install (everything, incl. the 2D model)
 
 ```bash
 git clone <repository> siim
 cd siim
 pip install -e .          # editable; pulls the core deps (numpy, scipy, numba,
-                          # matplotlib, tqdm) if they are not already present
+                          # matplotlib, tqdm, xarray) if not already present
 ```
 
-**Full install including the 2D model — use the conda environment.** The 2D
-stack (xsimlab, fastscape, fastscapelib-fortran) is conda-only:
-`fastscapelib-fortran` compiles from Fortran and has no PyPI distribution, and
-the environment carries deliberate pins (`numpy<2`, `zarr<3`, an xarray freeze)
-that quarantine the unmaintained xsimlab framework. `environment.yml` is the
-canonical 2D dependency contract:
+That is the whole install:
+
+```python
+from siim.siim2d import siim as siim2d   # no fastscape/xsimlab needed
+```
+
+## Optional: the fastscape adapter (conda)
+
+`siim.fastscape` exposes siim's glacial physics as composable
+fastscape/xsimlab `@xs.process` classes, and `run(driver='xsimlab')` drives
+the 2D model through xsimlab orchestration. This is **optional** — the
+standalone 2D model needs none of it — and it is the one component that still
+wants conda: `pip install -e .[fastscape]` can deliver `fastscape` and
+`xarray-simlab` from PyPI (note PyPI's fastscape is a stale 0.1.0), but
+**fastscapelib-fortran** — the Fortran backend fastscape's stock processes
+call at run time — has no PyPI wheel. The validated adapter environment is
+`environment.yml` (the fastscape-adapter / legacy env, which carries the
+`numpy<2` / `xarray<2026.5` / `zarr<3` quarantine pins around the
+unmaintained xsimlab):
 
 ```bash
 conda env create -f environment.yml
@@ -41,4 +42,6 @@ pip install -e . --no-deps    # pure link — never lets pip touch the pinned en
 ```
 
 Inside the managed conda environment, always install with `--no-deps` so pip
-cannot upgrade the quarantined packages.
+cannot upgrade the quarantined packages. Without the stack installed,
+`import siim.fastscape` raises a directed `ImportError` explaining exactly
+this.

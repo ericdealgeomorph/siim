@@ -10,9 +10,20 @@ processes:
   - :class:`PlateauSurface` — an arctan-smoothed plateau initial topography
     (a drop-in replacement for an initial-elevation process).
 """
-import numpy as np
-import xsimlab as xs
-from fastscape.processes import RasterGrid2D, SurfaceTopography, BorderBoundary
+try:
+    import xsimlab as xs
+    from fastscape.processes import RasterGrid2D, SurfaceTopography, BorderBoundary
+except ImportError as e:
+    raise ImportError(
+        "siim.fastscape is the OPTIONAL fastscape/xsimlab adapter — the "
+        "standalone 2D model (siim.siim2d) needs none of it. To use the "
+        "adapter: `pip install siim[fastscape]` provides fastscape + xsimlab "
+        "from PyPI, but fastscapelib-fortran (the fortran backend fastscape's "
+        "stock processes call at run time) has no PyPI wheel — use the conda "
+        "env instead: `conda env create -f environment.yml`."
+    ) from e
+
+from .._core.step import uplift_mask, wave_uplift, plateau_surface
 
 
 @xs.process
@@ -47,29 +58,17 @@ class WaveUplift:
         # zero uplift on 'fixed_value' borders, mirroring fastscape's
         # BlockUplift — SPL never erodes self-receiving base-level nodes, so
         # uplifting them would let the boundary drift upward over the run.
-        self._mask = np.ones(self.shape)
-        _all = slice(None)
-        slices = [(_all, 0), (_all, -1), (0, _all), (-1, _all)]
-        for st, border in zip(self.status, slices):
-            if st == 'fixed_value':
-                self._mask[border] = 0.0
+        self._mask = uplift_mask(self.status, self.shape)
 
     @xs.runtime(args=['step_delta', 'step_start'])
     def run_step(self, dt, t):
-        # Midpoint evaluation: rate is applied over [t, t+dt], so sampling the
-        # wave at t + dt/2 integrates the Gaussian passage to second order and
-        # leaves no systematic one-step position bias (the old t + dt sampling
-        # shifted the wave forward by one step).
-        time = t + 0.5 * dt
-        wave_center = float(self.x[0]) + self.x_escarpment + time * self.wave_velocity
-        X, _ = np.meshgrid(self.x, self.y)
-        # U0 = delta_h * v / (w * sqrt(pi)) deposits exactly delta_h at every
-        # point the full wave passes: integral of exp(-(x - v t')^2/w^2) dt'
-        # over the passage is w*sqrt(pi)/v.
-        U0 = (self.wave_calibration * self.delta_h * self.wave_velocity
-              / (self.wave_width * np.sqrt(np.pi)))
-        rate = self.U_inf + U0 * np.exp(-(X - wave_center) ** 2 / self.wave_width ** 2)
-        self.uplift = rate * self._mask * dt
+        # Midpoint-sampled moving-Gaussian wave — body extracted framework-free
+        # (siim._core.step.wave_uplift) so the shell and the in-house driver
+        # share one implementation.
+        self.uplift = wave_uplift(
+            self.x, self.y, self.shape, self._mask, dt, t, self.delta_h,
+            self.wave_width, self.wave_velocity, self.x_escarpment,
+            self.wave_calibration, self.U_inf)
 
 
 @xs.process
@@ -102,27 +101,9 @@ class PlateauSurface:
     border_status = xs.foreign(BorderBoundary, 'border_status')
 
     def initialize(self):
-        X, Y = np.meshgrid(self.x, self.y)
-        Lx = float(self.x[-1] - self.x[0])
-        x_esc = (1 - self.plateau_frac) * Lx
-        x_or = X - float(self.x[0])
-        ramp = (1 + 2 / np.pi * np.arctan((x_or - x_esc) / self.plateau_w)) / 2
-        slope = self.plateau_dz * np.clip(x_or - x_esc, 0.0, None) / max(Lx - x_esc, 1e-9)
-        topo = ramp * (self.plateau_zo - slope)
-
-        if self.seed is not None and not (isinstance(self.seed, float) and np.isnan(self.seed)):
-            seed = int(self.seed)
-        else:
-            seed = None
-        rs = np.random.RandomState(seed=seed)
-        if self.noise_amplitude is None:
-            noise_scale = 0.1 * np.max(topo)
-        else:
-            noise_scale = float(self.noise_amplitude)
-        noise = noise_scale * rs.rand(*self.shape)
-        bs = list(self.border_status)
-        if bs[0] == "fixed_value": noise[:,  0] = 0.0
-        if bs[1] == "fixed_value": noise[:, -1] = 0.0
-        if bs[2] == "fixed_value": noise[0,  :] = 0.0
-        if bs[3] == "fixed_value": noise[-1, :] = 0.0
-        self.elevation = topo + noise
+        # Body extracted framework-free (siim._core.step.plateau_surface) so the
+        # shell and the in-house driver share one implementation.
+        self.elevation = plateau_surface(
+            self.x, self.y, self.shape, self.border_status, self.seed,
+            self.noise_amplitude, self.plateau_zo, self.plateau_dz,
+            self.plateau_frac, self.plateau_w)

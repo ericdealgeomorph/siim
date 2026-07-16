@@ -24,13 +24,21 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from siim.siim2d import siim as siim2d                       # noqa: E402
-from siim.fastscape import GlacialFlexure                    # noqa: E402
+from siim.siim2d import siim as siim2d                                  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _run_under_both_drivers(both_drivers):
+    """S3 (Map 4 §1 PARAM): every test in this file runs under BOTH drivers --
+    the conftest ``both_drivers`` fixture patches ``constants.DRIVER_DEFAULT``,
+    so the existing assertions gate the in-house driver too."""
+
 
 
 def _glac(**ov):
@@ -108,8 +116,17 @@ def test_modeB_citizen_surface_change_diverges_from_bed():
 
 def test_sediment_carve_adds_to_yield():
     """Sub-grid carve removes extra rock; that volume must enter the sediment
-    budget. With carve ON, both the denudation source and the routed sediment
-    throughput exceed the carve-OFF twin."""
+    budget. With carve ON, both the denudation source and the OUTLET-DELIVERED
+    sediment (flux integrated over the fixed borders) exceed the carve-OFF
+    twin.
+
+    The routed quantity is border-integrated, not domain-summed (S5, plan
+    decision note 20): the domain+time sum is path-length weighted (each
+    eroded volume counted once per traversed cell), so it can flip when the
+    twins self-organise different-but-equivalent networks (routing
+    multistability) — measured under inhouse_d8: source ratio 1.0306 ==
+    border-flux ratio 1.0306 (conservation exact) while the domain-summed
+    proxy read 0.99."""
     # Isolate the carve: pin the mode-C standard flags off so the carve-on /
     # carve-off twins differ ONLY in carve_width.
     base = _glac(mode='B', track_sediment=True, trunk_surface=False,
@@ -125,24 +142,108 @@ def test_sediment_carve_adds_to_yield():
     den_off = np.maximum(off.denudation_out, 0.0).sum()
     assert den_on > den_off, (den_on, den_off)
 
-    # Routed: the tracker carries that extra rock through the network.
+    # Routed: the tracker delivers that extra rock to the outlets (all four
+    # borders are fixed_value in _glac, so this is the total leaving the
+    # domain).
+    def border_flux(m):
+        s = m.sediment_flux_out
+        return (s[:, 0, :].sum() + s[:, -1, :].sum()
+                + s[:, 1:-1, 0].sum() + s[:, 1:-1, -1].sum())
     assert np.isfinite(on.sediment_flux_out).all()
-    assert on.sediment_flux_out.sum() > off.sediment_flux_out.sum()
+    assert border_flux(on) > border_flux(off), (border_flux(on), border_flux(off))
 
 
-def test_flexure_uses_glacial_flexure_and_acts():
-    """flexure=True wires in GlacialFlexure (load from denudation) and still
-    measurably reshapes the steady landscape. Pinned to erosion-only
-    (ice_load=False) so it stays a pure erosional-flexure regression."""
+# (The fortran flexure/diffusion arms died at the 0.9.1 standalone flip — the
+# in-house solve is the only backend; the S2 Kelvin twin remains its oracle.)
+
+def test_flexure_acts_on_topography():
+    """flexure=True still measurably reshapes the steady landscape. Pinned to
+    erosion-only (ice_load=False) so it stays a pure erosional-flexure
+    regression."""
     p = _glac(U=2e-3)
     off = siim2d(p)
     off.run()
     on = siim2d({**p, 'flexure': True, 'e_thickness': 20e3, 'ice_load': False})
     on.run()
-    assert on._process_overrides()['flexure'] is GlacialFlexure
     assert np.all(np.isfinite(on.z_out[-1])), "non-finite elevation with flexure on"
     assert np.abs(on.z_out[-1] - off.z_out[-1]).max() > 1.0, \
         "flexure=True produced no change — not coupling into the topography"
+
+
+@pytest.mark.adapter
+def test_flexure_slot_is_glacial_flexure():
+    """flexure=True wires GlacialFlexure (load from denudation) into the
+    adapter's flexure slot (the Map-4 class-identity assert; conda)."""
+    from siim.fastscape import GlacialFlexure
+    on = siim2d({**_glac(U=2e-3), 'flexure': True, 'e_thickness': 20e3,
+                 'ice_load': False})
+    assert on._process_overrides()['flexure'] is GlacialFlexure
+
+
+@pytest.mark.adapter
+def test_facade_flexure_backend_chain_inhouse():
+    """The facade's flexure chain resolves in-house end to end: the installed
+    class, the variable DEFAULT an un-set input var resolves to, and the
+    plate-solve callable that default resolves to. (The fortran arm of this
+    chain died at the 0.9.1 standalone flip.)"""
+    import attr
+    from types import SimpleNamespace
+    from siim import constants as _constants
+    from siim._core.flexure import flexure as inhouse_flexure
+    from siim.fastscape import GlacialFlexure, glacial_processes
+
+    assert glacial_processes(
+        flexure=True, numerics_backend='inhouse')['flexure'] is GlacialFlexure
+    assert attr.fields_dict(
+        GlacialFlexure)['numerics_backend'].default == _constants.NUMERICS_BACKEND
+    assert GlacialFlexure._flexure_solve(
+        SimpleNamespace(numerics_backend='inhouse')) is inhouse_flexure
+
+
+@pytest.mark.parametrize('bad', ['fortan', 'fortran'])
+def test_flexure_backend_invalid_raises(bad):
+    """An invalid numerics_backend raises the clear ValueError at the siim2d
+    entry point — both the typo ('fortan', the historical regression) and the
+    RETIRED 'fortran' option (deleted at the 0.9.1 standalone flip; its
+    rejection is the deletion's regression pin)."""
+    with pytest.raises(ValueError, match="numerics_backend"):
+        siim2d(_glac(numerics_backend=bad))
+
+
+@pytest.mark.adapter
+@pytest.mark.parametrize('bad', ['fortan', 'fortran'])
+def test_flexure_backend_invalid_raises_facade(bad):
+    """The same rejection at the adapter facade and the GlacialFlexure solve
+    resolution (a typo must not silently run in-house)."""
+    from types import SimpleNamespace
+    from siim.fastscape import GlacialFlexure, glacial_processes
+
+    with pytest.raises(ValueError, match="numerics_backend"):
+        GlacialFlexure._flexure_solve(SimpleNamespace(numerics_backend=bad))
+    with pytest.raises(ValueError, match="numerics_backend"):
+        glacial_processes(numerics_backend=bad)
+
+
+@pytest.mark.parametrize('bad', ['fortan', 'fortran'])
+def test_router_backend_invalid_raises(bad):
+    """An invalid router_backend raises the clear ValueError at the siim2d entry
+    point — both a typo and the RETIRED 'fortran' option (deleted at the 0.9.1
+    standalone flip). The twin of ``test_flexure_backend_invalid_raises``; the
+    deletion's regression pin for the router arm (S5 review, note 21)."""
+    with pytest.raises(ValueError, match="router_backend"):
+        siim2d(_glac(router_backend=bad))
+
+
+@pytest.mark.adapter
+@pytest.mark.parametrize('bad', ['fortan', 'fortran'])
+def test_router_backend_invalid_raises_facade(bad):
+    """The same router_backend rejection at the adapter facade
+    (``glacial_processes``) — a retired/typo backend must not silently wire the
+    fortran slot that no longer exists."""
+    from siim.fastscape import glacial_processes
+
+    with pytest.raises(ValueError, match="router_backend"):
+        glacial_processes(router_backend=bad)
 
 
 # ---------------------------------------------------------------------------

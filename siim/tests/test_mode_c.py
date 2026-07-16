@@ -20,7 +20,14 @@ import numpy as np
 import pytest
 
 from siim.siim2d import siim as siim2d
-from siim.fastscape import GlacialSPLModeC, GlacialSurfaceToErode
+
+
+@pytest.fixture(autouse=True)
+def _run_under_both_drivers(both_drivers):
+    """S3 (Map 4 §1 PARAM): every test in this file runs under BOTH drivers --
+    the conftest ``both_drivers`` fixture patches ``constants.DRIVER_DEFAULT``,
+    so the existing assertions gate the in-house driver too."""
+
 
 
 class _ForceModeC(siim2d):
@@ -30,6 +37,11 @@ class _ForceModeC(siim2d):
     Keeps the citizen ``surf2erode`` (both mode-B citizens route on zb + hc*H)."""
 
     def _process_overrides(self):
+        # Adapter-only seam (xsimlab driver); lazy import keeps this file
+        # PIP-collectable. Under the in-house driver the override is inert
+        # (the driver reads cfg.carve), so gate A's forced-ModeC arm is
+        # exercised on the xsimlab (adapter) driver arm.
+        from siim.fastscape import GlacialSPLModeC, GlacialSurfaceToErode
         ov = super()._process_overrides()
         ov['glacial_spl'] = GlacialSPLModeC
         ov.setdefault('surf2erode', GlacialSurfaceToErode)

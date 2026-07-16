@@ -1,18 +1,20 @@
 import numpy as np
 import pickle
 import warnings
-import xsimlab as xs
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from fastscape.models import basic_model
 from . import constants as _constants
-from .fastscape import glacial_processes
 from .constants import (GRAVITY, KT, RHO_ICE, derive_coulomb,
                         derive_power)
 from .analytical import analytical_steady_state_solution
 from ._output import output_path
 from .plotting import siim_plotter
+from ._core import driver as _driver
+from ._core import outputs as _outputs
+from ._core.flexure import flexure as _inhouse_flexure
+from ._core.step import (build_glacial_params, initial_topography,
+                         uplift_mask, block_uplift)
 
 try:  # numpy >= 1.25
     from numpy.exceptions import RankWarning as _RankWarning
@@ -87,6 +89,17 @@ def _load_initial_topography(src):
         raise ValueError("initial_topography contains NaN — grid has gaps")
 
     return arr, dict(nx=nx, ny=ny, Lx=(nx - 1) * dx, Ly=(ny - 1) * dy)
+
+
+def _ibc_from_border_status(border_status):
+    """fastscapelib-fortran boundary code from a border_status list, matching
+    fastscape's ``BorderBoundary.initialize`` (boundary.py:95-98): ``ibc =
+    left*1 + right*100 + top*1000 + bottom*10`` with a digit 1 per 'fixed_value'
+    edge. The single source both the fortran router and the in-house
+    flexure/diffusion decode."""
+    bs = list(np.broadcast_to(border_status, 4))   # [left, right, top, bottom]
+    arr_bc = np.array([1 if s == 'fixed_value' else 0 for s in bs])
+    return int(sum(arr_bc * np.array([1, 100, 1000, 10])))
 
 
 def load(filename):
@@ -238,7 +251,7 @@ class siim:
             "width_hack_k": _constants.WIDTH_HACK_K,
             "width_hack_p": _constants.WIDTH_HACK_P,
 
-            # Flow routing: 'single' (D8 SingleFlowRouter, default) or
+            # Flow routing: 'single' (D8 single-flow, default) or
             # 'dinf' (Tarboton 1997 D-infinity). Both produce stable SS with the
             # area-based width-amplified mass balance.
             # - 'single' (D8): each cell drains to one steepest neighbor. Cheapest,
@@ -250,6 +263,22 @@ class siim:
             #   pattern visualizations). All three sliding laws (eff-exp, power,
             #   coulomb) work under either routing.
             "flow_routing": "single",
+
+            # Single-flow routing backend (see constants.ROUTER_DEFAULT).
+            # 'inhouse_d8' = siim's numba D8 fill-then-route
+            # (_core.step.route_d8) — the only accepted value since the 0.9.1
+            # standalone flip; the param is the router-contract plug point
+            # (docs/dev/router_contract.md) for future backends. Only affects
+            # flow_routing='single' (the D-inf directions + mask + basin are
+            # in-house on the same contract).
+            "router_backend": _constants.ROUTER_DEFAULT,
+
+            # Numerics backend for flexure + hillslope diffusion (see
+            # constants.NUMERICS_BACKEND). 'inhouse' = siim's own scipy.fft
+            # plate solve + numba ADI diffuser — the only accepted value since
+            # the 0.9.1 standalone flip. Does not affect routing (a separate
+            # axis).
+            "numerics_backend": _constants.NUMERICS_BACKEND,
 
             # Surface-evolution mode (works under both routings).
             #   'A' — track the ice surface as state; H is solved from the local
@@ -326,9 +355,17 @@ class siim:
 
             # hillslope diffusivity
             "D": 1e-3,
-            # boundary conditions: [left, right, bottom, top]
-            # each is 'fixed_value', 'core', or 'looped'
-            "boundary_status": ['fixed_value', 'fixed_value', 'core', 'core'],
+            # boundary conditions: [left, right, top, bottom]
+            # each is 'fixed_value', 'core', or 'looped'.
+            # Default = left/right fixed base level, top/bottom periodic. OQ-1(b)
+            # (2026-07-13, ratified): the shipped default is the EXPLICIT looped
+            # list — SFR and D-inf now agree on it, and 'core' means plain
+            # non-periodic interior for every router (was: 'core' made the fortran
+            # SFR silently Y-cyclic while siim's D-inf did not — a split brain).
+            # Only two edge populations shift: explicit-'core' SFR users (now
+            # non-periodic) and D-inf-on-default users (now periodic in y, to
+            # match SFR). CHANGELOG-documented at S5.
+            "boundary_status": ['fixed_value', 'fixed_value', 'looped', 'looped'],
             # initial topography: if `initial_topography` is None, build a
             # tent that ramps from 0 at fixed_value edges up to
             # initial_max_elevation at the farthest interior point.
@@ -404,6 +441,16 @@ class siim:
         self.T = params.T
         self.nt = params.nt
         self.nt_out = params.nt_out
+        # nt_out > nt is a degenerate output cadence: out_idx would carry
+        # duplicate master steps, which xsimlab silently left as NaN frames
+        # (and the in-house driver would fill with duplicated data) — reject it
+        # loudly instead of replicating either pathology. nt_out = 1 is legal:
+        # a single frame-0 snapshot, identical under both drivers.
+        if not (1 <= self.nt_out <= self.nt):
+            raise ValueError(
+                f"nt_out must satisfy 1 <= nt_out <= nt; got nt_out="
+                f"{self.nt_out} with nt={self.nt} (more output frames than "
+                f"master steps duplicates output indices).")
         self.t = np.linspace(self.to, self.T, self.nt)
         self.dt = np.mean(np.diff(self.t))
         out_idx = np.round(np.linspace(0, self.nt - 1, self.nt_out)).astype(int)
@@ -543,6 +590,20 @@ class siim:
                 f"got {params.flow_routing!r}"
             )
         self.flow_routing = params.flow_routing
+        if params.router_backend != 'inhouse_d8':
+            raise ValueError(
+                f"router_backend must be 'inhouse_d8' (the retired 'fortran' "
+                f"SFR was removed at the 0.9.1 standalone flip), "
+                f"got {params.router_backend!r}"
+            )
+        self.router_backend = params.router_backend
+        if params.numerics_backend != 'inhouse':
+            raise ValueError(
+                f"numerics_backend must be 'inhouse' (the retired 'fortran' "
+                f"flexure/diffusion was removed at the 0.9.1 standalone flip), "
+                f"got {params.numerics_backend!r}"
+            )
+        self.numerics_backend = params.numerics_backend
         self.k = params.k                          # accumulation shape exponent (analytical only)
 
         # Mode A / B (both routings).
@@ -790,15 +851,21 @@ class siim:
         never diverge. Subclasses extend the returned dict to swap in alternative
         forcing processes (e.g. siim_escarpment replaces 'uplift' and
         'init_topography')."""
+        # Adapter-only seam: lazy import so `import siim.siim2d` stays
+        # stack-free (the guarded siim.fastscape raises a directed ImportError
+        # in a fastscape-less env).
+        from .fastscape import glacial_processes
         # mode A -> GlacialSPLModeA; mode B + carve -> GlacialSPLModeC citizen;
         # mode B + no-carve -> GlacialSPLModeB citizen (both add GlacialSurfaceToErode).
         return glacial_processes(
             mode=self.mode,
             carve=self.carve_width,
             routing=self.flow_routing,
+            router_backend=self.router_backend,
             flexure=self.flexure,
             sediment=self.track_sediment,
             trunk_surface=self.trunk_surface,
+            numerics_backend=self.numerics_backend,
         )
 
     def _forcing_input_vars(self):
@@ -813,12 +880,35 @@ class siim:
             forcing['init_topography__seed'] = self.seed
         return forcing
 
-    def run(self, hooks=None):
+    def run(self, hooks=None, driver=None):
+        """Run the model and unpack outputs. ``driver`` selects the time-loop
+        backend: ``'xsimlab'`` (the fastscape/xsimlab adapter orchestration) or
+        ``'inhouse'`` (siim's own framework-free loop, :mod:`siim._core.driver`);
+        default ``constants.DRIVER_DEFAULT``. Both produce the identical
+        ``ds_out`` (bit-for-bit on the same backend). ``hooks`` (an xsimlab
+        ``RuntimeHook``) is honored ONLY by the xsimlab driver — the standalone
+        driver drops it (OQ-2)."""
         # Invalidate the profile-channel cache the plotting layer actually reads
         # (plotting/profiles.py::_get_channel), so a re-run re-extracts instead
         # of re-plotting the previous run's channel.
         self._profile_channel = None
         self._profile_channel_key = None
+        driver = driver if driver is not None else _constants.DRIVER_DEFAULT
+        if driver == 'inhouse':
+            self._run_inhouse(hooks)
+        elif driver == 'xsimlab':
+            self._run_xsimlab(hooks)
+        else:
+            raise ValueError(f"driver must be 'inhouse' or 'xsimlab', got {driver!r}")
+        self._unpack_outputs()
+
+    def _run_xsimlab(self, hooks):
+        """The fastscape/xsimlab adapter time loop: assemble the xsimlab model
+        from :func:`glacial_processes`, run it, and store ``self.ds_out``.
+        Adapter-env only (conda; ``environment.yml``) — the stack imports are
+        lazy so the standalone default path never touches them."""
+        import xsimlab as xs
+        from fastscape.models import basic_model
         # Drop the stock spl/drainage slots; the renamed glacial_spl / glacial_flow
         # slots (+ law) are added by _process_overrides via update_processes.
         model = (basic_model
@@ -888,6 +978,7 @@ class siim:
                 'flexure__asthen_density': self.asthen_density,
                 'flexure__e_thickness': self.e_thickness,
                 'flexure__ice_load': self.ice_load,
+                'flexure__numerics_backend': self.numerics_backend,
             })
 
         with warnings.catch_warnings():
@@ -941,7 +1032,111 @@ class siim:
                 with model:
                     self.ds_out = ds_in.xsimlab.run(hooks=hooks, encoding=encoding)
 
-        self._unpack_outputs()
+    def _run_inhouse(self, hooks):
+        """siim's own framework-free time loop (:func:`siim._core.driver.run_loop`)
+        calling the SAME step functions the adapter shells call — the standalone
+        default path (in-house routing, flexure and diffusion; no stack import).
+        Packs the identical ``ds_out`` via :mod:`siim._core.outputs`. ``hooks``
+        is dropped here (OQ-2): a RuntimeHook has no meaning off the xsimlab
+        orchestrator."""
+        if hooks is not None:
+            raise ValueError(
+                "hooks= is only supported by driver='xsimlab'; the standalone "
+                "in-house driver drops the xsimlab RuntimeHooks kwarg (OQ-2).")
+        cfg = self._build_driver_config()
+        # Fully framework-free numba D8 / D-inf producer (S4).
+        from ._core.router import InhouseRouter
+        router = InhouseRouter([self.grid_ny, self.grid_nx],
+                               self.boundary_status, self.flow_routing,
+                               cfg.dx, cfg.dy)
+        with router as route:
+            cfg.route = route
+            buffers = _driver.run_loop(cfg)
+        self.ds_out = _outputs.build_dataset(buffers, cfg.t_out, cfg.x, cfg.y,
+                                             self.t)
+
+    def _driver_initial_surface(self):
+        """The initial topography array for the in-house driver (mode-B bed /
+        mode-A surface). Base = :func:`initial_topography` on
+        ``_make_initial_topo()``; subclasses (escarpment) override for
+        alternative initial-condition processes (PlateauSurface)."""
+        shape = (self.grid_ny, self.grid_nx)
+        return initial_topography(
+            self._make_initial_topo(), shape, self.boundary_status,
+            self.seed, self.noise_amplitude)
+
+    def _driver_uplift_fn(self):
+        """A per-step ``uplift_fn(k, dt) -> (ny, nx)`` for the in-house driver.
+        Base = block uplift (``block_uplift`` on the resolved rate field, sliced
+        directly by step); subclasses (escarpment) override for WaveUplift."""
+        shape = (self.grid_ny, self.grid_nx)
+        mask = uplift_mask(self.boundary_status, shape)
+        spec = self._make_uplift_field()
+        if isinstance(spec, tuple):                # clock-threaded series
+            rate_arr = np.asarray(spec[1], dtype=float)
+            return lambda k, dt: block_uplift(rate_arr[k], dt, mask, shape)
+        return lambda k, dt: block_uplift(spec, dt, mask, shape)
+
+    def _build_driver_config(self):
+        """Assemble the resolved-parameter bundle the in-house driver reads
+        (:func:`siim._core.driver.run_loop`). Every value flows from the
+        already-validated ``self.*`` attributes (single-sourced; no re-literalled
+        default) plus the injected flexure-solve callable + forcing seams."""
+        ny, nx = self.grid_ny, self.grid_nx
+        dx = self.Lx / (nx - 1)
+        dy = self.Ly / (ny - 1)
+        ibc = _ibc_from_border_status(self.boundary_status)
+        bs = list(np.broadcast_to(self.boundary_status, 4))
+        out_idx = np.round(np.linspace(0, self.nt - 1, self.nt_out)).astype(int)
+        law_code, gp = build_glacial_params(
+            self.sliding_law, self.Ko, self.ce, self.n, self.nu, self.m, self.mu,
+            self.Ac, self.alpha_g, self.lambda_p, self.lambda_c, self.tau_c,
+            self.coulomb_clamp, self.hc_over_H, self.H_diffusivity)
+        # border_bed_uplift: static (scalar/(ny,nx)) or a clock series (nt,ny,nx).
+        bbu_spec = self._make_border_bed_uplift()
+        if isinstance(bbu_spec, tuple):
+            bbu_static, bbu_series = None, np.asarray(bbu_spec[1], dtype=float)
+        else:
+            bbu_static, bbu_series = bbu_spec, None
+        # Flexure plate solve: the in-house scipy.fft solve (the injected seam).
+        flexure_solve = _inhouse_flexure if self.flexure else None
+        return SimpleNamespace(
+            # grid
+            ny=ny, nx=nx, dx=dx, dy=dy, cell_area=dx * dy,
+            x=np.linspace(0, self.Lx, nx), y=np.linspace(0, self.Ly, ny),
+            xl=self.Lx, yl=self.Ly, ibc=ibc, border_status=bs,
+            wrap_x=(bs[0] == 'looped'), wrap_y=(bs[2] == 'looped'),
+            # time / cadence
+            nt=self.nt, nt_out=self.nt_out, t=self.t, out_idx=out_idx,
+            t_out=self.t[out_idx], progress_bar=self.progress_bar,
+            # mode / flags
+            mode=self.mode, carve=self.carve_width,
+            trunk_surface=self.trunk_surface, flexure=self.flexure,
+            sediment=self.track_sediment,
+            # law record
+            law_code=law_code, gp=gp, hc_over_H=float(gp.hc_over_H),
+            alpha_g=float(gp.alpha_g), widening_factor=self.widening_factor,
+            # physics knobs
+            beta=self.beta, width_hack_k=self.width_hack_k,
+            width_hack_p=self.width_hack_p, D=self.D,
+            flotation_gate=self.flotation_gate, flotation_ramp=self.flotation_ramp,
+            parallel_erode=self.parallel_erode, routing_relax=self.routing_relax,
+            trunk_dip_k=self.trunk_dip_k,
+            trunk_dip_floor=_constants.TRUNK_DIP_FLOOR,
+            # flexure params
+            lithos_density=self.lithos_density, asthen_density=self.asthen_density,
+            e_thickness=self.e_thickness, ice_load=self.ice_load,
+            flexure_solve=flexure_solve,
+            # forcing series / scalars
+            zELA_series=self._zELA_series, zELA=self.zELA,
+            runoff_series=self._P_series, P=self.P,
+            bl_series=self._bl_series, bl=self.bl,
+            bbu_static=bbu_static, bbu_series=bbu_series,
+            # injected seams
+            uplift_fn=self._driver_uplift_fn(),
+            initial_surface=self._driver_initial_surface(),
+            route=None,   # set inside the InhouseRouter context in _run_inhouse
+        )
 
     def _unpack_outputs(self):
         """Populate the familiar (z_out, H_out, …) attributes from self.ds_out.

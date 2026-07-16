@@ -9,7 +9,14 @@ import pytest
 from siim.constants import normalize_mode, DEFAULT_MODE, DEFAULT_MODE_2D
 from siim.siim1d import siim as siim1d
 from siim.siim2d import siim as siim2d
-from siim.fastscape import glacial_processes, GlacialSPLModeC
+
+
+@pytest.fixture(autouse=True)
+def _run_under_both_drivers(both_drivers):
+    """S3 (Map 4 §1 PARAM): every test in this file runs under BOTH drivers --
+    the conftest ``both_drivers`` fixture patches ``constants.DRIVER_DEFAULT``,
+    so the existing assertions gate the in-house driver too."""
+
 
 
 # --- normalize_mode (the single source) ------------------------------------
@@ -110,6 +117,12 @@ def test_siim2d_mode_C_resolves_to_B_with_carve_on():
     m = siim2d({**_SMALL_2D, 'mode': 'C'})
     assert m.mode == 'B'                    # not a new dynamical mode
     assert m.carve_width is True
+
+
+@pytest.mark.adapter
+def test_siim2d_mode_C_wires_modeC_slot():
+    from siim.fastscape import GlacialSPLModeC
+    m = siim2d({**_SMALL_2D, 'mode': 'C'})
     assert m._process_overrides()['glacial_spl'] is GlacialSPLModeC
 
 
@@ -172,11 +185,15 @@ def test_mode_A_rejects_explicit_standard_flags():
 
 # --- glacial_processes front door (fastscape citizens) ----------------------
 
+@pytest.mark.adapter
 def test_glacial_processes_mode_C_wires_modeC():
+    from siim.fastscape import glacial_processes, GlacialSPLModeC
     assert glacial_processes(mode='C')['glacial_spl'] is GlacialSPLModeC
     assert glacial_processes(mode='c')['glacial_spl'] is GlacialSPLModeC  # case-insensitive
 
 
+@pytest.mark.adapter
 def test_glacial_processes_mode_C_rejects_explicit_carve_false():
+    from siim.fastscape import glacial_processes
     with pytest.raises(ValueError):
         glacial_processes(mode='C', carve=False)

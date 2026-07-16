@@ -6,29 +6,25 @@ shape mountain topography over geologic time. It ships three coordinated front
 ends over one physical core:
 
 - **`siim.siim1d`** — fast 1D longitudinal-profile model
-- **`siim.siim2d`** — full 2D landscape-evolution model, built on the
-  [fastscape](https://fastscape.org) / xsimlab framework
+- **`siim.siim2d`** — full 2D landscape-evolution model (in-house driver, D8/D-inf
+  routing, FFT flexure, ADI hillslope diffusion)
 - **`siim.analytical`** — closed-form steady-state profiles and regime diagrams
   from the underlying theory
 
-## Install
+Pure Python/NumPy/Numba — no Fortran, no framework lock-in.
 
-The 1D model, the analytical solutions, and the plotting layer install from PyPI:
+## Install
 
 ```bash
 pip install siim
 ```
 
-The full **2D** model builds on fastscape/xsimlab and its Fortran backend
-(`fastscapelib-fortran`), which are distributed via conda. Create the pinned
-environment from the repo and install `siim` into it:
+`siim` runs the full 1D and 2D models standalone on NumPy 2. An optional adapter
+lets you drive the 2D model through [fastscape](https://fastscape.org)/xsimlab
+instead of the built-in driver; that stack is conda-only:
 
 ```bash
-git clone https://github.com/ericdealgeomorph/siim.git
-cd siim
-conda env create -f environment.yml   # creates the 'glacial' env (pinned to numpy<2)
-conda activate glacial
-pip install -e . --no-deps
+conda env create -f environment.yml   # optional fastscape adapter
 ```
 
 Requires Python ≥ 3.12.
@@ -53,11 +49,10 @@ model.run()
 model.plot.landscape(i=-1)             # final topography
 ```
 
-(The 2D model above runs in the conda environment.) The 1D model
-(`from siim.siim1d import siim`) and the analytical solutions
-(`from siim.analytical import GeneralProfile`) run from the pip install alone and
-follow the same shape. See the [documentation](https://siim.readthedocs.io) for
-the full parameter reference, guides, and the theory background.
+The 1D model (`from siim.siim1d import siim`) and the analytical solutions
+(`from siim.analytical import GeneralProfile`) follow the same shape. See the
+[documentation](https://siim.readthedocs.io) for the full parameter reference,
+guides, and the theory background.
 
 ## Citing
 

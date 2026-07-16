@@ -20,6 +20,15 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from siim.siim2d import siim as siim2d  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _run_under_both_drivers(both_drivers):
+    """S3 (Map 4 §1 PARAM): every test in this file runs under BOTH drivers --
+    the conftest ``both_drivers`` fixture patches ``constants.DRIVER_DEFAULT``,
+    so the existing assertions gate the in-house driver too."""
+
 
 
 def test_landscape_ice_cmap_ice_free_frame():
@@ -41,6 +50,44 @@ def test_landscape_ice_cmap_ice_free_frame():
 
     # Must not raise on the empty ice mask.
     m.plot.landscape(field='bedrock+ice', ice_cmap='Blues', i=-1, colorbar=True)
+    plt.close('all')
+
+
+def test_cross_section_paints_no_phantom_ice():
+    """The smooth-style cross-section must not paint ice in ice-free bed
+    notches (the phantom-ice bug, 2026-07-16). The section previously filled
+    everything between the UNsmoothed bed and the Gaussian-SMOOTHED display
+    terrain as ice, so a relict 1-cell-wide carved slot rendered as a
+    permanently ice-filled valley (~60% of notch depth painted, H = 0
+    beneath). The section now reads the pre-smoothing composite: an ice-free
+    frame must paint exactly zero ice pixels, notches included."""
+    ny, nx = 31, 31
+    zb0 = np.full((ny, nx), 500.0)
+    zb0[5:26, 15] = 200.0            # 1-cell-wide, 300 m-deep relict slot
+    cfg = dict(
+        U=1e-3, zELA=1e5, T=1e3, nt=2, nt_out=2,
+        Lx=3e4, Ly=3e4, nx=nx, ny=ny, seed=7,
+        initial_topography=zb0, noise_amplitude=0,
+        boundary_status=['fixed_value'] * 4, progress_bar=False,
+    )
+    m = siim2d(cfg)
+    m.run()
+    # Preconditions: truly ice-free, and the slot survived the (1-step) run —
+    # otherwise the assertion below could pass vacuously.
+    assert float(np.max([h.max() for h in m.H_out])) == 0.0
+    assert float(m.zb_out[-1][:, 15].min()) < 350.0
+
+    fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, cross_section=15,
+                              H_threshold=0)
+    # The section's ice layer is the only zorder-2 image (bed image is 1,
+    # lakes 2.5, the map is a single composite imshow).
+    ice_imgs = [im for a in fig.axes for im in a.get_images()
+                if im.get_zorder() == 2]
+    assert ice_imgs, "cross-section ice layer not found"
+    painted = sum(float(np.asarray(im.get_array())[..., 3].sum())
+                  for im in ice_imgs)
+    assert painted == 0.0, \
+        f"phantom ice painted in an ice-free section (alpha sum {painted})"
     plt.close('all')
 
 

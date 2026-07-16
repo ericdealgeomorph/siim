@@ -98,6 +98,31 @@ S_FLOOR_BC = 1e-3
 PARALLEL_ERODE = True
 COULOMB_CLAMP = 1e-12          # regularized-Coulomb H-solver: min relative gap from the pole
 DEFAULT_SLIDING_LAW = 'power'  # 'eff-exp', 'power', or 'coulomb' (every front-end default)
+# Numerics backend for the flexure + hillslope-diffusion operators (2D):
+# 'inhouse' = siim's scipy.fft plate solve (_core.flexure) + numba ADI diffuser
+# (_core.hillslope) — the ONLY accepted value since the S5 standalone flip
+# (the fortran arms are deleted; the param survives as the numerics plug
+# point). The ADI is bit-for-bit with the retired fs.diffusion for uniform kd;
+# the FFT flexure is native-grid (fixes the fortran pihy anisotropy bug) and
+# validated against the closed-form Kelvin point-load solution.
+NUMERICS_BACKEND = 'inhouse'
+# 2D time-loop driver. 'inhouse' (default since the S5 standalone flip) =
+# siim's own framework-free time loop (_core.driver); 'xsimlab' = the OPTIONAL
+# fastscape/xsimlab adapter orchestration (conda env only — the guarded
+# siim.fastscape shells calling the SAME step functions, packing the identical
+# ds_out). The two are bit-for-bit on the same backend, gated by
+# test_driver_vs_xsimlab (adapter CI job).
+DRIVER_DEFAULT = 'inhouse'
+# 2D flow-routing backend: 'inhouse_d8' = siim's numba D8 fill-then-route
+# producer (_core.step.route_d8 / _core.routing._d8_*) — the ONLY accepted
+# value since the S5 standalone flip (the fortran SFR arm is deleted). The
+# param survives as the ROUTER-CONTRACT plug point (docs/dev/
+# router_contract.md): a future backend (e.g. fastscapelib) re-widens the
+# accepted set. The S4 router swap was the one NON-bit-for-bit numeric change
+# of the standalone migration (tie-break/basin-carve paths differ from the
+# retired fortran SFR; gated behaviorally by test_d8_receiver_parity vs the
+# frozen raw fortran refs + the router contract battery).
+ROUTER_DEFAULT = 'inhouse_d8'
 
 
 def cg_prefactor(alpha_g=ALPHA_G, Ac=AC, rho_ice=RHO_ICE, g=GRAVITY):

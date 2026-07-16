@@ -25,6 +25,14 @@ from siim.siim1d import siim as siim1d  # noqa: E402
 from siim.escarpment import siim_escarpment  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _run_under_both_drivers(both_drivers):
+    """S3 (Map 4 §1 PARAM): every test in this file runs under BOTH drivers --
+    the conftest ``both_drivers`` fixture patches ``constants.DRIVER_DEFAULT``,
+    so the existing assertions gate the in-house driver too."""
+
+
+
 # Shared physics — mirrors Eric's canonical good-params at smaller cost.
 SHARED = dict(
     U=1e-3, P=2, beta=1e-3,
@@ -225,11 +233,13 @@ def test_rms_vs_analytical_perfect_model_is_zero():
     assert bed_rms < 1e-9, bed_rms
 
 
+@pytest.mark.adapter
 def test_mu_override_recomputes_Co_across_front_ends():
     """An explicit mu override recomputes the eff-exp erosion prefactor Co with
     the effective mu on all three front ends (audit B5): 1D, analytical, and
     2D/GlacialLaw must agree. Pre-fix, 1D/analytical froze Co at the derived
     mu (=4*nu/15) while 2D used the user mu -> ~5% prefactor divergence."""
+    pytest.importorskip('fastscape')
     from siim.analytical.steady_state import analytical_steady_state_solution
     from siim.fastscape.processes import GlacialLaw
     from siim import constants as C
@@ -249,7 +259,7 @@ def test_mu_override_recomputes_Co_across_front_ends():
     Co_expected = C.Co_power(1e-4, C.cg_prefactor(10.0, 2.5e-24), 300.0, 10.0, 0.5)
     np.testing.assert_allclose(m1.Co, Co_expected, rtol=1e-12)
     np.testing.assert_allclose(a.Co, Co_expected, rtol=1e-12)
-    np.testing.assert_allclose(gl._Co, Co_expected, rtol=1e-12)
+    np.testing.assert_allclose(gl.params[1].Co, Co_expected, rtol=1e-12)
     # and the stale (derived-mu) Co the fix retired is measurably different
     Co_stale = C.Co_power(1e-4, C.cg_prefactor(10.0, 2.5e-24), 300.0, 10.0,
                           4.0 * 2 / 15.0)
@@ -308,12 +318,17 @@ def test_escarpment_param_validation(bad, match):
 #    it actually feeds back into the steady landscape.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.adapter
 def test_flexure_off_by_default():
+    # _process_overrides() builds the xsimlab slot dict (adapter assembly); the
+    # standalone physics of flexure=False/True is covered by
+    # test_denudation.test_flexure_acts_on_topography + test_standalone_no_fastscape.
     m = siim2d(_small_2d())
     assert m.flexure is False
     assert 'flexure' not in m._process_overrides()
 
 
+@pytest.mark.adapter
 def test_flexure_on_runs_and_acts():
     p = _small_2d(U=2e-3)
     off = siim2d(p);                                      off.run()

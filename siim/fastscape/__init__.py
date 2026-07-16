@@ -28,11 +28,21 @@ settled: the sub-grid width-carving path (``carve=True`` → :class:`GlacialSPLM
 is a mode-B citizen too (bed + ice thickness + carve), and is siim's flagship
 carved mode.
 """
-from fastscape.models import basic_model
-from fastscape.processes import SingleFlowRouter
+try:
+    from fastscape.models import basic_model
+except ImportError as e:
+    raise ImportError(
+        "siim.fastscape is the OPTIONAL fastscape/xsimlab adapter — the "
+        "standalone 2D model (siim.siim2d) needs none of it. To use the "
+        "adapter: `pip install siim[fastscape]` provides fastscape + xsimlab "
+        "from PyPI, but fastscapelib-fortran (the fortran backend fastscape's "
+        "stock processes call at run time) has no PyPI wheel — use the conda "
+        "env instead: `conda env create -f environment.yml`."
+    ) from e
 
 from .. import constants as _constants
 from .processes import (
+    D8FlowRouter,           # in-house numba D8 single-flow router (S4)
     DinfFlowRouter,
     GlacialBlockUplift,
     GlacialFlexure,
@@ -42,6 +52,7 @@ from .processes import (
     GlacialSPLModeB,
     GlacialSPLModeC,        # mode B + sub-grid carve, citizen semantics
     GlacialSurfaceToErode,
+    HillslopeDiffusion,     # in-house ADI hillslope diffuser (numerics_backend='inhouse')
     InitialTopography,      # siim-specific forcing — internal, not exported
     SedimentTracker,
     TrunkSurfaceToErode,    # fabricated trunk-surface routing (opt-in)
@@ -122,7 +133,9 @@ _silence_xsimlab_drop_futurewarning()
 
 
 def glacial_processes(*, mode='B', carve=None, routing='single',
-                      flexure=False, sediment=False, trunk_surface=False):
+                      router_backend=None,
+                      flexure=False, sediment=False, trunk_surface=False,
+                      numerics_backend=_constants.NUMERICS_BACKEND):
     """Build the slot→process-class override dict for fastscape's ``basic_model``.
 
     Apply the returned dict after dropping the stock fluvial slots::
@@ -162,8 +175,22 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
         on as part of the mode-C standard. Ignored for ``mode='A'``.
     routing : {'single', 'dinf'}, optional
         D8 single-flow (``'single'``, default) or D-infinity (``'dinf'``).
+    router_backend : {'inhouse_d8'}, optional
+        Single-flow routing backend (``constants.ROUTER_DEFAULT``).
+        ``'inhouse_d8'`` — siim's numba :class:`D8FlowRouter` — is the only
+        accepted value since the 0.9.1 standalone flip (the fortran
+        ``SingleFlowRouter`` wiring was retired); the parameter is the
+        router-contract plug point (``docs/dev/router_contract.md``) for
+        future backends. Only affects ``routing='single'`` — the D-inf
+        directions + mask + basin ride the same in-house contract.
     flexure, sediment : bool, optional
         Opt in to glacial-isostatic flexure / sediment tracking.
+    numerics_backend : {'inhouse'}, optional
+        Flexure + hillslope-diffusion backend (``constants.NUMERICS_BACKEND``).
+        ``'inhouse'`` — :class:`HillslopeDiffusion` (siim's numba ADI) in the
+        stock ``LinearDiffusion`` slot and :class:`GlacialFlexure` on siim's
+        scipy.fft plate solve — is the only accepted value since the 0.9.1
+        standalone flip. Does not affect routing.
 
     Returns
     -------
@@ -180,15 +207,30 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
         mode, carve = 'B', True
     if routing not in ('single', 'dinf'):
         raise ValueError(f"routing must be 'single' or 'dinf', got {routing!r}")
+    if numerics_backend != 'inhouse':
+        raise ValueError("numerics_backend must be 'inhouse' (the retired "
+                         "'fortran' backend was removed at the 0.9.1 "
+                         f"standalone flip), got {numerics_backend!r}")
+    if router_backend is None:
+        router_backend = _constants.ROUTER_DEFAULT
+    if router_backend != 'inhouse_d8':
+        raise ValueError("router_backend must be 'inhouse_d8' (the retired "
+                         "'fortran' SFR was removed at the 0.9.1 standalone "
+                         f"flip), got {router_backend!r}")
 
+    # Flow slot: both routings are in-house producers on the router contract.
+    flow_cls = DinfFlowRouter if routing == 'dinf' else D8FlowRouter
     overrides = {
         'glacial_flow': GlacialFlowAccumulator,
         'law': GlacialLaw,
-        'flow': DinfFlowRouter if routing == 'dinf' else SingleFlowRouter,
+        'flow': flow_cls,
         'init_topography': InitialTopography,
         # Squeeze-tolerant BlockUplift so a documented (nt, ny, nx) uplift rate
         # doesn't crash on the pinned xarray/xsimlab stack (audit B6).
         'uplift': GlacialBlockUplift,
+        # In-house hillslope diffusion (numba ADI) replaces the stock fortran
+        # LinearDiffusion slot.
+        'diffusion': HillslopeDiffusion,
     }
     if mode == 'A':
         overrides['glacial_spl'] = GlacialSPLModeA           # stock surf2erode
@@ -208,8 +250,9 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
     return overrides
 
 
-def glacial_model(*, mode='B', carve=None, routing='single',
-                  flexure=False, sediment=False, trunk_surface=False):
+def glacial_model(*, mode='B', carve=None, routing='single', router_backend=None,
+                  flexure=False, sediment=False, trunk_surface=False,
+                  numerics_backend=_constants.NUMERICS_BACKEND):
     """Return a ready-to-run xsimlab ``Model``: fastscape's ``basic_model`` with
     its ``'spl'``/``'drainage'`` slots replaced by siim's glacial processes.
 
@@ -221,5 +264,7 @@ def glacial_model(*, mode='B', carve=None, routing='single',
             .drop_processes(['spl', 'drainage'])
             .update_processes(glacial_processes(
                 mode=mode, carve=carve, routing=routing,
+                router_backend=router_backend,
                 flexure=flexure, sediment=sediment,
-                trunk_surface=trunk_surface)))
+                trunk_surface=trunk_surface,
+                numerics_backend=numerics_backend)))

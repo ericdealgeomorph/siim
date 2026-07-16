@@ -1,9 +1,10 @@
 # Your first 2D run
 
-The 2D model (`siim.siim2d`) is a fastscape/xsimlab raster landscape model. It
-needs the 2D stack (xsimlab, fastscape, fastscapelib-fortran), so — unlike the
-1D walkthrough — these snippets are **not executed** when the docs are built;
-run them in an environment with the 2D stack installed (see {doc}`install`).
+The 2D model (`siim.siim2d`) is a raster landscape model — since 0.9.1 it runs
+standalone on a plain pip install (in-house time loop, flow routing, flexure,
+and diffusion; see {doc}`install`). These snippets are **not executed** at
+docs-build time only to keep the build fast; they run anywhere siim is
+installed.
 
 ```python
 from siim.siim2d import siim as siim2d

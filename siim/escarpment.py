@@ -33,7 +33,7 @@ import numpy as np
 from types import SimpleNamespace
 
 from .siim2d import siim
-from .fastscape import PlateauSurface, WaveUplift
+from ._core.step import plateau_surface, uplift_mask, wave_uplift
 
 
 class siim_escarpment(siim):
@@ -124,6 +124,10 @@ class siim_escarpment(siim):
             self.plateau_w = float(params.plateau_w)
 
     def _process_overrides(self):
+        # Adapter-only seam (xsimlab driver); lazy import keeps
+        # `import siim.escarpment` stack-free (the in-house driver reaches the
+        # same extracted step fns through the seams below instead).
+        from .fastscape import PlateauSurface, WaveUplift
         overrides = super()._process_overrides()
         if self.init_type == "plateau":
             overrides["init_topography"] = PlateauSurface
@@ -161,3 +165,34 @@ class siim_escarpment(siim):
             forcing["uplift__rate"] = self._make_uplift_field()
 
         return forcing
+
+    # --- in-house driver seams (mirror _process_overrides/_forcing_input_vars:
+    #     the same extracted step fns the WaveUplift/PlateauSurface shells call) ---
+
+    def _driver_initial_surface(self):
+        if self.init_type != "plateau":
+            return super()._driver_initial_surface()
+        shape = (self.grid_ny, self.grid_nx)
+        x = np.linspace(0, self.Lx, self.grid_nx)
+        y = np.linspace(0, self.Ly, self.grid_ny)
+        return plateau_surface(
+            x, y, shape, self.boundary_status, self.seed, self.noise_amplitude,
+            self.plateau_zo, self.plateau_dz, self.plateau_frac, self.plateau_w)
+
+    def _driver_uplift_fn(self):
+        if self.uplift_type != "wave":
+            return super()._driver_uplift_fn()
+        shape = (self.grid_ny, self.grid_nx)
+        x = np.linspace(0, self.Lx, self.grid_nx)
+        y = np.linspace(0, self.Ly, self.grid_ny)
+        mask = uplift_mask(self.boundary_status, shape)
+        t = self.t
+
+        def fn(k, dt):
+            # step_start = t[k] (the xsimlab runtime arg the shell receives);
+            # wave_uplift midpoint-samples at t[k] + dt/2 internally.
+            return wave_uplift(x, y, shape, mask, dt, t[k], self.delta_h,
+                               self.wave_width, self.wave_velocity,
+                               self.x_escarpment, self.wave_calibration,
+                               self.U_inf)
+        return fn

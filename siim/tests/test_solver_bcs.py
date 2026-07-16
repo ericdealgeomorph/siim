@@ -83,10 +83,11 @@ def test_one_sided_head_cap_honors_B_cap():
     dsig = d * sigma
     B_partial = beta * (z_first - zELA) + 0.5 * beta * S * xo   # midway across head
     _, Qg_p, _ = _solve_ice_flux(*args, B_partial)
+    from scipy.integrate import trapezoid   # np.trapz removed in numpy 2.0
     u = np.linspace(0.0, xo ** dsig, 1_000_001)
     xp = u ** (1.0 / dsig)
     b = np.minimum(beta * (z_first + S * (xo - xp) - zELA), B_partial)
-    I_head = np.trapz(b, u) / dsig
+    I_head = trapezoid(b, u) / dsig
     Qg_ref = (k_h * sigma * d / xo ** (d * (sigma - 1.0))) * I_head
     np.testing.assert_allclose(Qg_p[didx_l], Qg_ref, rtol=1e-6)
     assert Qg_cap[didx_l] < Qg_p[didx_l] < Qg_inf[didx_l]
@@ -532,9 +533,11 @@ def test_mode_a_outlet_surface_anchored_1d():
     assert np.isfinite(m.tau[0]) and m.tau[0] > 0.0
 
 
+@pytest.mark.adapter
 def test_mode_a_border_surface_anchored_2d():
     """2D parity with the 1D outlet treatment: a self-receiving border node
     with ice flux gets H(Q, S_upwind) from the per-law closure."""
+    pytest.importorskip('fastscape')
     from siim.fastscape.processes import GlacialSPLModeA
     from siim._core.params import GlacialParams
     from siim._core.solvers import LAW_EFFEXP
@@ -645,11 +648,13 @@ def test_h_diffusion_anisotropic():
 # WaveUplift: exact passage integral, midpoint sampling
 # ---------------------------------------------------------------------------
 
+@pytest.mark.adapter
 def test_wave_uplift_integrates_to_delta_h():
     """The Gaussian wave deposits exactly delta_h at every interior point the
     full wave passes (calibration 1.0; old default 1.2 overshot by 20%), and
     the wave center is sampled at the step midpoint (no one-step position
     bias)."""
+    pytest.importorskip('fastscape')
     from siim.fastscape import WaveUplift
     w = object.__new__(WaveUplift)
     nx_, ny_ = 41, 3
@@ -743,8 +748,10 @@ def test_erosion_monotonic_in_dt():
 # Glacial erosion / flow-accumulator processes read the post-tectonics surface
 # ---------------------------------------------------------------------------
 
+@pytest.mark.adapter
 def test_processes_read_post_tectonic_surface():
     import attr
+    pytest.importorskip('fastscape')
     from fastscape.processes import SurfaceToErode
     from siim.fastscape.processes import (
         GlacialSPLModeA, GlacialSPLModeB, GlacialSPLModeC, GlacialFlowAccumulator)

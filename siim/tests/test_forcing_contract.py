@@ -31,6 +31,14 @@ from siim.siim1d import siim as siim1d                 # noqa: E402
 from siim.siim2d import siim as siim2d                 # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _run_under_both_drivers(both_drivers):
+    """S3 (Map 4 §1 PARAM): every test in this file runs under BOTH drivers --
+    the conftest ``both_drivers`` fixture patches ``constants.DRIVER_DEFAULT``,
+    so the existing assertions gate the in-house driver too."""
+
+
+
 def _s1d(**ov):
     """Tiny 1D run; nx (=21) != nt (=41) so U orientations are distinguishable."""
     p = dict(U=1e-3, P=1.0, beta=1e-2, Ko=1e-6, n=1, ce=1e-4, nu=2,

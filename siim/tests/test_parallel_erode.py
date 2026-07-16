@@ -14,6 +14,14 @@ import pytest
 from siim.siim2d import siim as siim2d
 
 
+@pytest.fixture(autouse=True)
+def _run_under_both_drivers(both_drivers):
+    """S3 (Map 4 §1 PARAM): every test in this file runs under BOTH drivers --
+    the conftest ``both_drivers`` fixture patches ``constants.DRIVER_DEFAULT``,
+    so the existing assertions gate the in-house driver too."""
+
+
+
 def _cfg(**ov):
     """Glaciating mode-C config (mirrors test_mode_c / test_dinf_routing)."""
     base = dict(

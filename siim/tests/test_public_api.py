@@ -6,9 +6,14 @@ drifting from siim2d — NOT against deliberate evolution. When you intentionall
 change the surface, update ``ADVERTISED`` below.
 """
 import pytest
-from fastscape.models import basic_model
 
-import siim.fastscape as F
+pytest.importorskip('fastscape')
+pytest.importorskip('xsimlab')
+pytestmark = pytest.mark.adapter
+
+from fastscape.models import basic_model      # noqa: E402
+
+import siim.fastscape as F                    # noqa: E402
 
 # The process classes promoted as the intended-stable public surface (modes A
 # and B + auxiliaries). Subset check: adding names is fine, dropping one breaks.

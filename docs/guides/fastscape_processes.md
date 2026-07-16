@@ -2,8 +2,16 @@
 
 siim's glacial-erosion physics is packaged as a set of composable xsimlab
 processes under `siim.fastscape`, so you can drop them into your own fastscape
-model without siim's `siim2d` wrapper. (These snippets need the 2D stack and are
-not executed at build time.)
+model without siim's `siim2d` wrapper.
+
+This is the **optional adapter** — the standalone 2D model (`siim.siim2d`)
+runs its own in-house time loop and needs none of it (see {doc}`../getting_started/install`).
+These snippets require the fastscape stack: `pip install siim[fastscape]`
+gives you `fastscape` + `xsimlab`, but the Fortran backend
+(`fastscapelib-fortran`) that fastscape's stock processes call at run time is
+conda-only (`conda env create -f environment.yml`). Without it,
+`import siim.fastscape` raises a directed `ImportError`. The snippets are not
+executed at build time.
 
 ## The quickest path
 

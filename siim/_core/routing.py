@@ -398,6 +398,176 @@ def _dinf_pack(rec1, rec2, w1, w2, len1, len2, n,
 
 
 # =============================================================================
+# In-house D8 single-flow router (fill-then-route) — the framework-free
+# replacement for fastscape's fortran ``SingleFlowRouter``
+# (``fs.flowroutingsingleflowdirection``). Same fill-then-route strategy as the
+# D-inf primitives above: spill-fill the depressions with _priority_flood_eps,
+# then a steepest-descent receiver scan on the FILLED surface that replicates
+# fortran ``find_receiver`` exactly (Map 3 §3 of the standalone-migration maps;
+# ``docs/dev/router_contract.md``). The routing delta vs fortran is confined to
+# tie/flat/sill cells (in-house routes them down the eps-fill gradient, fortran
+# via MST sill-carving); on non-degenerate cells the receiver + length are
+# byte-identical, so this is a behavioral/attractor swap, not bit-for-bit.
+# =============================================================================
+
+# fortran ``find_receiver`` inits its steepest-slope accumulator to tiny(0.d0)
+# (FlowRouting.f90:332) and keeps a neighbour on STRICT slope > smax; replicate
+# that init so the tie-break (first-in-scan-order wins) matches fortran exactly.
+_D8_TINY = np.finfo(np.float64).tiny
+
+
+@numba.njit(cache=True)
+def _d8_receivers(z_flat, ny, nx, dx, dy, interior_flat, rec, lengths,
+                  wrap_y, wrap_x):
+    """Steepest-descent D8 receiver, replicating fortran ``find_receiver``
+    (``FlowRouting.f90:302-362``) on the (eps-filled) surface: outer
+    ``jj in {-1,0,1}`` x inner ``ii in {-1,0,1}`` scan (skipping ``(0,0)``),
+    ``l = sqrt((dx*ii)**2 + (dy*jj)**2)``, keep on STRICT ``slope > smax`` with
+    ``smax`` initialised to ``tiny`` — so steepest descent wins and, on a tie,
+    the first neighbour in scan order does (byte-identical to fortran on
+    tie-free surfaces). Non-interior cells self-receive (``rec[i]=i,
+    lengths[i]=0``, the ``bounds_bc`` border contract). On the eps-filled
+    surface every interior cell has a strictly-lower 8-neighbour, so it always
+    finds one (no interior self-receivers => acyclic graph). Looped axes wrap.
+
+    Serial: each cell writes only its own ``rec``/``lengths`` and reads only
+    ``z_flat``, so the result is independent of iteration order (a prange over
+    the outer loop would be bit-for-bit identical; kept serial per Map 4 §4)."""
+    for idx in range(ny * nx):
+        if interior_flat[idx] == 0:
+            rec[idx] = idx
+            lengths[idx] = 0.0
+            continue
+        j = idx // nx
+        i = idx % nx
+        z_c = z_flat[idx]
+        smax = _D8_TINY
+        best = idx
+        best_l = 0.0
+        for jj in range(-1, 2):
+            jn = j + jj
+            if jn < 0 or jn >= ny:
+                if wrap_y:
+                    jn = jn % ny
+                else:
+                    continue
+            for ii in range(-1, 2):
+                if jj == 0 and ii == 0:
+                    continue
+                in_ = i + ii
+                if in_ < 0 or in_ >= nx:
+                    if wrap_x:
+                        in_ = in_ % nx
+                    else:
+                        continue
+                n = jn * nx + in_
+                l = np.sqrt((dx * ii) ** 2 + (dy * jj) ** 2)
+                slope = (z_c - z_flat[n]) / l
+                if slope > smax:
+                    smax = slope
+                    best = n
+                    best_l = l
+        rec[idx] = best
+        lengths[idx] = best_l
+
+
+@numba.njit(cache=True)
+def _d8_stack(rec, n, stack):
+    """Outlet-first topological stack for the single-receiver graph: base cells
+    (``rec[i]==i``) first, then their donors (receiver-before-donor). Donor-CSR
+    BFS from the base cells — a valid topological order, which is all the
+    accumulators/eroders require (fortran's exact DFS visitation order is NOT
+    contracted, Map 3 §3(iii)). On the eps-filled surface ``rec`` is a forest of
+    trees rooted at the border/base cells, so the BFS emits every cell exactly
+    once."""
+    donor_count = np.zeros(n, dtype=np.int64)
+    for i in range(n):
+        r = rec[i]
+        if r != i:
+            donor_count[r] += 1
+    donor_off = np.zeros(n + 1, dtype=np.int64)
+    for i in range(n):
+        donor_off[i + 1] = donor_off[i] + donor_count[i]
+    cursor = donor_off[:-1].copy()
+    donor_list = np.zeros(donor_off[n], dtype=np.int64)
+    for i in range(n):
+        r = rec[i]
+        if r != i:
+            donor_list[cursor[r]] = i
+            cursor[r] += 1
+    queue = np.zeros(n, dtype=np.int64)
+    qhead = 0
+    qtail = 0
+    for i in range(n):
+        if rec[i] == i:
+            queue[qhead] = i
+            qhead += 1
+    head = 0
+    while qtail < qhead:
+        c = queue[qtail]
+        qtail += 1
+        stack[head] = c
+        head += 1
+        for k in range(donor_off[c], donor_off[c + 1]):
+            d = donor_list[k]
+            queue[qhead] = d
+            qhead += 1
+    # Defensive: any cell not reached (would signal a cycle — impossible on the
+    # eps-filled surface) is appended so ``stack`` stays a full permutation.
+    if head < n:
+        seen = np.zeros(n, dtype=np.uint8)
+        for t in range(head):
+            seen[stack[t]] = 1
+        for i in range(n):
+            if not seen[i]:
+                stack[head] = i
+                head += 1
+
+
+@numba.njit(cache=True)
+def _d8_basin(rec, stack, n, basin):
+    """Basin id of each cell = the index of the base (outlet) cell its receiver
+    chain terminates at. One forward pass over the outlet-first ``stack`` (the
+    receiver is always processed before its donors), so ``basin`` propagates
+    from each outlet down its tributaries. Labeling by outlet INDEX makes the
+    ids reproducible run-to-run (unlike fortran's unseeded ``random_number``
+    catch labels, Map 4 §4) — but ``basin`` is a diagnostic and stays out of
+    every equality gate regardless."""
+    for idx in range(n):
+        c = stack[idx]
+        r = rec[c]
+        if r == c:
+            basin[c] = c
+        else:
+            basin[c] = basin[r]
+
+
+def d8_interior_mask(border_status, ny, nx):
+    """The ``interior`` mask (1 = routable interior cell, 0 = self-receiving
+    boundary) directly from ``border_status`` — the in-house replacement for the
+    fortran-derived ``sfr_rec != arange`` mask (Map 3 §4). Provably identical:
+    after fortran ``LocalMinima`` the only self-receiving cells are ``bounds_bc``
+    = exactly the 'fixed_value' border rings (``FastScape_ctx.f90:589-592``).
+
+    'core' and 'looped' are both plain interior for EVERY router (OQ-1(b),
+    ratified): 'core' is non-periodic interior (periodicity is the separate wrap
+    axis, keyed on 'looped' only), aligning the SFR mask with the D-inf
+    convention siim already shipped. ``border_status`` = [left, right, top,
+    bottom]; node index = ``j*nx + i``."""
+    interior = np.ones(ny * nx, dtype=np.int8)
+    bs = list(np.broadcast_to(border_status, 4))
+    if bs[0] == 'fixed_value':
+        interior[0::nx] = 0            # left column   (i = 0)
+    if bs[1] == 'fixed_value':
+        interior[nx - 1::nx] = 0       # right column  (i = nx-1)
+    if bs[2] == 'fixed_value':
+        interior[:nx] = 0              # top row       (j = 0)
+    if bs[3] == 'fixed_value':
+        interior[nx * (ny - 1):] = 0   # bottom row    (j = ny-1)
+    return interior
+
+
+# =============================================================================
 # Topological level index for the level-scheduled parallel eroders
 # (eroders._erode_modeb_*_levels, the ``parallel_erode`` toggle). A node's
 # level is 1 + the max level over its (real) receivers, so every node in a

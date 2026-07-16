@@ -1,9 +1,10 @@
 # Documentation build requirements (Read the Docs / fresh envs).
-# The compiled 2D model stack (fastscape / fastscapelib-fortran) is NOT
-# required: docs/conf.py mocks whatever is missing, and the 2D example pages are
-# not executed. The pip-light runtime (numpy/scipy/numba/matplotlib) IS required
-# so the 1D getting-started page can execute at build time; ipykernel provides
-# the kernel MyST-NB runs it in.
+# Only the OPTIONAL fastscape adapter stack (fastscape / xsimlab /
+# fastscapelib-fortran) is not required: docs/conf.py mocks it for the
+# siim.fastscape API pages, and the 2D example pages are not executed. The
+# standalone runtime (numpy/scipy/numba/matplotlib/xarray) IS required so
+# siim.siim2d imports for real and the 1D getting-started page executes at
+# build time; ipykernel provides the kernel MyST-NB runs it in.
 sphinx>=8
 furo
 myst-nb
@@ -13,3 +14,4 @@ numpy
 scipy
 numba
 matplotlib
+xarray
