@@ -2,7 +2,8 @@
 render: supersampled + Gaussian-smoothed terrain, sub-grid across-channel-width
 ice (footprint fill — the display dual of the width carve), priority-flooded
 lakes, hillshade, contours, and an optional cross-section + hypsometry panel.
-Frame + animate only (no viewer, by design). See docs/dev/plotting_plan.md.
+Frame + animate only (no viewer, by design). See
+``docs/guides/outputs_and_io.md`` for the public plotting contract.
 
 ``field`` ∈ {``'bedrock'``, ``'bedrock+ice'``, ``'bedrock+lakes'``}.
 
@@ -192,8 +193,8 @@ class LandscapeMixin:
         ``ice_time_avg`` resolves to ``1`` (off) for both — it averages OUTPUT
         frames, so with coarsely spaced saves it double-exposes two glacial
         epochs; use it only for densely-sampled animations, where
-        ``ice_sigma_cells=3, ice_time_avg=2`` is the classic movie recipe of
-        ``docs/dev/step_flicker.md``. NB ``ice_sigma_cells`` is in SUBGRID
+        ``ice_sigma_cells=3, ice_time_avg=2`` is the recommended anti-flicker
+        movie recipe. NB ``ice_sigma_cells`` is in SUBGRID
         pixels, so its native-scale strength shifts with ``oversample`` and
         values >= ~1 native cell glob nearby ice and erase 1-cell threads.
 
@@ -239,7 +240,7 @@ class LandscapeMixin:
 
         Three display-side anti-flicker knobs damp the per-step ice-mask jitter
         in animations (all opt-in — no preset engages them; see
-        ``docs/dev/step_flicker.md``):
+        ``docs/guides/outputs_and_io.md``):
 
           - ``ice_smoothing`` (``'mask'`` default, or ``'field'``) — for
             ``ice_extent='cells'`` only (a ``ValueError`` otherwise, the
@@ -679,8 +680,8 @@ class LandscapeMixin:
         cells shown directly), or override individual knobs (explicit values
         always win over the preset). For
         DENSELY-SAMPLED output (frames close in model time), the classic
-        anti-flicker movie recipe is ``ice_sigma_cells=3, ice_time_avg=2``
-        (``docs/dev/step_flicker.md``) — deliberately NOT defaulted:
+        anti-flicker movie recipe is ``ice_sigma_cells=3, ice_time_avg=2`` —
+        deliberately NOT defaulted:
         ``ice_time_avg`` blends output frames (a double exposure of two
         glacial epochs when saves are far apart) and larger ``ice_sigma``
         globs and erases thin ice. ``min_ice_cells=6`` drops specks but

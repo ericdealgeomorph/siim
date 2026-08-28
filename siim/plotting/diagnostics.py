@@ -1,5 +1,5 @@
 """``steady_state`` — detect and plot when the 2D landscape reaches steady
-state. See docs/dev/plotting_plan.md."""
+state. See ``docs/guides/outputs_and_io.md`` for the public plotting contract."""
 
 import numpy as np
 

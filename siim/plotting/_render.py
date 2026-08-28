@@ -5,7 +5,7 @@ and the numba glacier-field rendering backend — rasterizers, soft hillshade,
 glacier-path tracing, priority-flood lakes, variable-sigma smoothing, the
 glacier-field builder, and the footprint ice-surface / smoothed-mask helpers —
 relocated here from the old ``siim2d_plotting`` module. See
-docs/dev/plotting_plan.md.
+``docs/guides/outputs_and_io.md`` for the public plotting contract.
 
 numpy/numba/scipy + the carve kernels at import; matplotlib/ipywidgets stay
 lazy inside the viewer/colorbar so the slider path imports light.
@@ -902,7 +902,7 @@ def _clean_ice_mask(mask, min_native_cells, oversample):
     and fills enclosed bare holes smaller than the same, where a native cell is
     ``oversample**2`` subgrid pixels. Bare regions touching the array border are
     NEVER filled (open margin / ocean stays open). ``min_native_cells <= 0`` is a
-    no-op. Ported from the display-pipeline probe (docs/dev/step_flicker.md)."""
+    no-op. This is display-only cleanup; it does not alter model output."""
     if not min_native_cells or min_native_cells <= 0:
         return mask
     from scipy.ndimage import label

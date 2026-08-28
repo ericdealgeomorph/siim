@@ -1,8 +1,8 @@
 """Sub-grid glacier-width carving (mode B only).
 
-Consolidated into the numerical core in the pre-v1.0 rewrite; the design
-record is ``docs/dev/subgrid_width_carving.md``. numpy/numba only -- no
-model/fastscape imports.
+Consolidated into the numerical core in the pre-v1.0 rewrite. See
+``docs/guides/concepts.md`` for the public description of sub-grid width
+carving. numpy/numba only -- no model/fastscape imports.
 """
 import numpy as np
 import numba

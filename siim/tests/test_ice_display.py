@@ -3,7 +3,7 @@ min_ice_cells speckle/hole cleanup, and ice_time_avg trailing average.
 
 Unit-tests the pure mask helpers in siim.plotting._render on small synthetic
 arrays (no figure rendering), plus a figure-level smoke test that landscape()
-accepts and renders the new kwargs. Design record: docs/dev/step_flicker.md.
+accepts and renders the new kwargs.
 """
 import os
 import sys

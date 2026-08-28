@@ -1,25 +1,25 @@
 """siim — Sliding Ice Incision Model.
 
 Coupled glacial-fluvial landscape evolution: a 1D profile model
-(``siim.siim1d``), a 2D fastscape/xsimlab-based model (``siim.siim2d``, with
-an escarpment variant in ``siim.escarpment``), and the analytical
-steady-state solution (``siim.analytical``) both numerical models embed
-as their reference.
+(``siim.siim1d``), a standalone 2D raster model (``siim.siim2d``, with an
+escarpment variant in ``siim.escarpment``), and the analytical steady-state
+solution (``siim.analytical``) both numerical models embed as their reference.
 
 Entry points::
 
     from siim.siim1d import siim                       # 1D profile model
     from siim.siim2d import siim                       # 2D landscape model
-    from siim.fastscape import glacial_processes       # glacial processes for your own fastscape model
+    from siim.fastscape import glacial_processes       # optional adapter for your own fastscape model
     from siim import analytical_steady_state_solution  # analytical reference
     from siim.analytical import GeneralProfile         # steepness-form theory
     from siim.analytical import MarginalCoulombProfile # exact d*phi=1 case
     from siim.forcing import ela_sawtooth, uplift_step, interp_forcing # time-varying forcing builders
 
-The 2D stack additionally requires xsimlab, fastscape, and
-fastscapelib-fortran; the 1D model and the analytical solution run on
-numpy/scipy/matplotlib/numba alone, and ``siim.analytical`` on numpy/scipy
-alone — which is why this module imports nothing eagerly.
+The 1D and 2D models run directly on the package's NumPy/Numba numerical core;
+the 2D driver uses in-house routing, flexure, and diffusion. xsimlab, fastscape,
+and fastscapelib-fortran are needed only for the optional ``siim.fastscape``
+adapter. ``siim.analytical`` itself needs only NumPy/SciPy. This module imports
+nothing eagerly so the optional adapter never affects a standard import.
 """
 
 import os as _os

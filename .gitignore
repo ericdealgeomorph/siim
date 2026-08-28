@@ -43,7 +43,7 @@ notebooks/stablity_analysis/
 *.mp4
 *.pkl
 
-# Claude
+# Local assistant settings
 .claude/
 
 # Project memory: scratch notes are ephemeral (keep dir, ignore contents)
@@ -73,8 +73,7 @@ notebooks/model_outputs/
 # ruff lint cache
 .ruff_cache/
 
-# Standalone bundle copied for Thea (a full copy of siim + the escarpment
-# notebooks, for sending to her); local-only, never tracked.
+# Local transfer bundle; never tracked.
 /for_thea/
 
 # coverage artifacts

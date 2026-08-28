@@ -1,0 +1,23 @@
+# Keep direct development-checkout source distributions on the same public
+# boundary as the release exporter. Include public documentation, package
+# tests, and their reference data even before a newly added file is committed.
+recursive-include docs *.bib *.md *.pdf *.png *.py *.txt
+recursive-include siim/tests *.npz *.py
+
+prune _memory
+prune docs/dev
+prune docs/_build
+prune escarpment_code
+prune notebooks
+prune paper_drafts
+prune siim/tests/data/reference_local
+prune tools
+prune .github
+
+exclude CLAUDE.md
+exclude for_thea.zip
+
+global-exclude .DS_Store
+global-exclude *.py[cod]
+global-exclude *.nb[ci]
+global-exclude __pycache__

@@ -1,10 +1,10 @@
 # Sphinx configuration for the siim documentation.
 #
-# Local build (miniforge base env has the full model stack):
+# Local build (from an environment with docs/requirements.txt installed):
 #   python -m sphinx -W -b html docs docs/_build/html
-# On Read the Docs the compiled model stack (fastscapelib-fortran) is not
-# installable; whatever heavy dependency is missing gets mocked below so
-# autodoc can still import every module.
+# The standard 1D/2D stack is installed on Read the Docs. Optional adapter or
+# presentation dependencies that are absent are mocked so autodoc can still
+# import their public modules.
 import importlib.util
 import os
 import sys
@@ -26,8 +26,8 @@ extensions = [
     'sphinxcontrib.bibtex',
 ]
 
-# Mock only what is actually missing (nothing, locally; the heavy 2D stack
-# on Read the Docs). numpy/scipy are hard requirements and never mocked.
+# Mock only optional adapter/presentation dependencies that are actually
+# missing. NumPy/SciPy are hard requirements and are never mocked.
 autodoc_mock_imports = [
     m for m in ('numba', 'xsimlab', 'fastscape', 'matplotlib', 'mpl_toolkits',
                 'pandas', 'tqdm')
@@ -43,8 +43,8 @@ napoleon_numpy_docstring = True
 myst_enable_extensions = ['dollarmath', 'amsmath']
 # Execute notebook pages (markdown notebooks carrying a kernelspec — e.g. the
 # 1D getting-started walkthrough) at build time so the examples stay tested.
-# Pages that need the 2D fastscape stack stay plain (no-kernelspec) markdown and
-# are not executed: Read the Docs can't compile fastscapelib-fortran.
+# The quick 1D notebook page executes during the build. The larger 2D example
+# remains plain Markdown so documentation builds do not run a landscape model.
 nb_execution_mode = 'auto'
 nb_execution_raise_on_error = True   # a broken example fails the build
 nb_execution_timeout = 300           # allow for numba JIT on the first run
@@ -59,9 +59,8 @@ intersphinx_mapping = {
 }
 
 templates_path = []
-# docs/dev/ holds internal dev notes (plans, handoffs) that are not part of the
-# rendered docs; excluding the whole tree keeps them out of the toctree (and
-# future-proofs new notes added during the ongoing refactor).
+# Internal development notes are not part of the rendered public documentation;
+# exclude that tree and common generated files.
 exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store', '**/__pycache__', 'dev/**']
 
 html_theme = 'furo'

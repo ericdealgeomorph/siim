@@ -1,0 +1,235 @@
+# Public release gates are deliberately split by responsibility:
+#   test-standalone — the complete Python-only suite and strict docs build on
+#     the primary supported interpreter;
+#   test-artifact — build and inspect the distributions, then smoke-test the
+#     installed wheel on the newest supported interpreter;
+#   test-macos — a small flexure run covering SIIM's macOS Numba workaround;
+#   test-adapter — the optional Fastscape/xsimlab contract in its pinned conda
+#     environment. The adapter stays a single Python 3.12 job because its
+#     compiled backend is not available from PyPI.
+name: ci
+
+# GitHub's runner fleet spans CPU generations. Portable Numba code generation
+# keeps bitwise reference tests independent of the particular runner host.
+env:
+  NUMBA_CPU_NAME: generic
+  NUMBA_CPU_FEATURES: ''
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-standalone:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install siim and its declared test dependencies
+        run: pip install -e '.[test]'
+      # cache=True misses cross-module njit edits: stale caches give false
+      # green/red on the bitwise battery gate.
+      - name: Clear numba cache
+        run: find siim -name '*.nb[ci]' -delete
+      - name: Standalone suite (everything but the adapter slice)
+        run: python -m pytest siim/tests -q -m 'not adapter'
+      - name: Docs build (warnings are errors)
+        run: |
+          pip install -r docs/requirements.txt
+          python -m sphinx -W -E -b html docs docs/_build/html
+
+  test-artifact:
+    name: Distribution artifact (Ubuntu, Python 3.14)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+      - name: Inspect both archives for private paths
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import tarfile
+          import zipfile
+
+          dist = Path("dist")
+          wheels = list(dist.glob("*.whl"))
+          sdists = list(dist.glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit(
+                  f"expected one wheel and one sdist, got {wheels!r} and {sdists!r}"
+              )
+
+          forbidden_components = {
+              ".agents", ".codex", "_memory", "paper_drafts",
+              "escarpment_code", "notebooks", "tools",
+          }
+          forbidden_files = {"CLAUDE.md", "for_thea.zip"}
+
+          def archive_names(path):
+              if path.suffix == ".whl":
+                  with zipfile.ZipFile(path) as archive:
+                      return archive.namelist()
+              with tarfile.open(path, "r:gz") as archive:
+                  return archive.getnames()
+
+          failures = []
+          for archive in (*wheels, *sdists):
+              for raw_name in archive_names(archive):
+                  path = PurePosixPath(raw_name.replace("\\", "/"))
+                  parts = path.parts
+                  has_private_component = forbidden_components.intersection(parts)
+                  has_private_docs = any(
+                      parts[i:i + 2] == ("docs", "dev")
+                      for i in range(len(parts) - 1)
+                  )
+                  has_wheel_tests = archive.suffix == ".whl" and any(
+                      parts[i:i + 2] == ("siim", "tests")
+                      for i in range(len(parts) - 1)
+                  )
+                  unsafe_path = path.is_absolute() or ".." in parts
+                  if (
+                      has_private_component
+                      or has_private_docs
+                      or has_wheel_tests
+                      or path.name in forbidden_files
+                      or unsafe_path
+                  ):
+                      failures.append(f"{archive.name}: {raw_name}")
+
+          if failures:
+              raise SystemExit(
+                  "private or unsafe paths found in distributions:\n  "
+                  + "\n  ".join(failures)
+              )
+          print(f"clean: {wheels[0].name} and {sdists[0].name}")
+          PY
+      - name: Install the built wheel in a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/siim-wheel-env"
+          "$RUNNER_TEMP/siim-wheel-env/bin/python" -m pip install dist/*.whl
+      - name: Smoke-test the installed wheel outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/siim-wheel-env/bin/python" - <<'PY'
+          from pathlib import Path
+          import os
+
+          import numpy as np
+          import siim
+          from siim.siim1d import siim as siim1d
+          from siim.siim2d import siim as siim2d
+
+          checkout = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          imported = Path(siim.__file__).resolve()
+          if imported == checkout or checkout in imported.parents:
+              raise AssertionError(f"SIIM was imported from the checkout: {imported}")
+
+          # The 1D model is deterministic; seed the process as well as the 2D
+          # model so both release smokes have an explicit reproducibility seam.
+          np.random.seed(0)
+          profile = siim1d({
+              "L": 2e3, "nx": 21, "T": 100.0, "nt": 3, "nt_out": 2,
+              "zELA": 700.0, "progress_bar": False,
+          })
+          profile.run()
+          assert profile.z_out.shape == (21, 2)
+          assert np.isfinite(profile.z_out).all()
+
+          landscape = siim2d({
+              "Lx": 1e4, "Ly": 1e4, "nx": 11, "ny": 11,
+              "T": 1e3, "nt": 3, "nt_out": 2, "seed": 0,
+              "zELA": 1000.0, "progress_bar": False,
+          })
+          landscape.run()
+          assert landscape.z_out.shape == (2, 11, 11)
+          assert np.isfinite(landscape.z_out).all()
+          print(f"installed wheel: {imported}")
+          PY
+
+  test-macos:
+    name: Standalone flexure smoke (macOS, Python 3.14)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install standalone package
+        run: python -m pip install .
+      - name: Exercise the default Numba threading layer and flexure
+        working-directory: ${{ runner.temp }}
+        run: |
+          unset NUMBA_THREADING_LAYER
+          python - <<'PY'
+          from pathlib import Path
+          import os
+
+          import numpy as np
+
+          assert "NUMBA_THREADING_LAYER" not in os.environ
+          import siim
+          assert os.environ["NUMBA_THREADING_LAYER"] == "workqueue"
+
+          checkout = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          imported = Path(siim.__file__).resolve()
+          if imported == checkout or checkout in imported.parents:
+              raise AssertionError(f"SIIM was imported from the checkout: {imported}")
+
+          from siim.siim2d import siim as siim2d
+
+          model = siim2d({
+              "Lx": 1e4, "Ly": 1e4, "nx": 11, "ny": 11,
+              "T": 1e3, "nt": 3, "nt_out": 2, "seed": 0,
+              "zELA": 1000.0, "flexure": True, "progress_bar": False,
+          })
+          model.run()
+          assert np.isfinite(model.z_out).all()
+          assert np.isfinite(model.rebound_out).all()
+          print(f"macOS workqueue smoke passed from {imported}")
+          PY
+
+  test-adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash -el {0} # login shell so the micromamba env is activated
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          create-args: >-
+            python=3.12
+          cache-environment: true
+      - name: Install siim (editable, no deps — adapter dependencies come from conda)
+        run: pip install -e . --no-deps
+      - name: Clear numba cache
+        run: find siim -name '*.nb[ci]' -delete
+      - name: Adapter suite (Fastscape/xsimlab composability contract)
+        run: python -m pytest siim/tests -q -m adapter

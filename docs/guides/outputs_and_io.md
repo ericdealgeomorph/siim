@@ -4,90 +4,154 @@
 
 Every model carries a plotter at `m.plot`:
 
-- **1D** — `m.plot.profile()` draws the long profile (bed, ice surface, and the
-  analytical reference). Returns `(fig, axes)`.
-- **2D** — `m.plot.map(field='bedrock')` renders a raster field (returns the
-  `Axes`); `m.plot.landscape()` gives an atlas-style shaded-relief render
-  (returns `(fig, ax)`).
+- **1D** — `m.plot.profile()` draws the long profile and returns
+  `(fig, axes)`.
+- **2D raw fields** — `m.plot.map(field='bedrock')` displays one stored raster
+  without terrain smoothing and returns the `Axes`.
+- **2D channel profiles** — `m.plot.profile()` extracts a channel and returns
+  `(fig, axes)`.
+- **2D cartography** — `m.plot.landscape()` returns `(fig, ax)` and has the
+  display presets described below.
 
-All three take a time index `i` (default `-1`, the last step). Colour/axis limits
-are per-method: `map` and `profile` use `field_min` / `field_max`; `landscape`
-uses `z_min` / `z_max` (terrain) and `H_min` / `H_max` (ice). Note the return
-shapes differ — `map` hands back a single `Axes`, while `profile` and `landscape`
-return `(fig, axes)` — so unpack accordingly. See {doc}`../api/model2d` for the
-full plotter API.
+All take an output index `i` (default `-1`, the last frame). `map` and
+`profile` use `field_min` / `field_max`; `landscape` uses `z_min` / `z_max`
+for terrain and `H_min` / `H_max` for ice colour. See {doc}`../api/model1d` and
+{doc}`../api/model2d` for the method signatures.
 
-## Displaying ice honestly
+## Smooth and raw landscape views
 
-`landscape(field='bedrock+ice')` draws ice two ways:
+`landscape` defaults to `style='smooth'`, an atlas-style presentation. With no
+other arguments it shows bare bedrock; terrain is supersampled 4×,
+Gaussian-de-staircased, hillshaded, and contoured. If you request
+`field='bedrock+ice'`, the same preset:
 
-- `ice_extent='footprint'` (default) is the **width-honest** view: ice is drawn
-  across the model's claimed valley width `W = α_g·H` — the display dual of the
-  sub-grid width carve, so a glacier looks as wide as the physics treats it.
-- `ice_extent='cells'` is the **raw state** view: only the glaciated channel
-  cells themselves.
+- draws ice across the claimed sub-grid valley width (`ice_extent='footprint'`);
+- hides columns with `H <= 100 m` (`H_threshold=100`);
+- smooths the ice outline by two sub-grid pixels; and
+- leaves connected-component removal and time averaging off.
 
-Nothing is hidden or smoothed by default. For smooth *animations* the validated
-recipe (a recommendation, not a default) is:
+This is intentionally a cartographic view, not an unmodified-cell view:
+
+```python
+m.plot.landscape(field='bedrock+ice')
+```
+
+For inspection use `style='raw'`. It selects `field='bedrock+ice'`, renders one
+pixel per cell, disables terrain/ice smoothing, hillshade, contours, and the
+trimline, shows channel-cell ice (`ice_extent='cells'`), and sets
+`H_threshold=0`. The raw preset still applies an upstream-area gate of
+`1e6 m²` to suppress small-catchment specks. To display every ice-bearing cell,
+disable that gate explicitly:
+
+```python
+m.plot.landscape(style='raw', area_threshold=0)
+```
+
+Every explicit keyword overrides its preset value. `animate_landscape`
+inherits the smooth preset; for densely sampled animation output, an optional
+anti-flicker recipe is:
 
 ```python
 m.plot.animate_landscape(field='bedrock+ice',
                          H_threshold=50, ice_sigma_cells=3, ice_time_avg=2)
 ```
 
-`H_threshold` drops sub-threshold specks, `ice_sigma_cells` smooths the ice
-outline, and `ice_time_avg=2` trailing-averages the ice layer to damp the
-discrete-D8 per-step flicker (terrain stays on the exact frame). You *can* add
-`min_ice_cells=6` to remove tiny components, but note it **hides real small
-glacierets** — leave it off unless the specks are pure flicker.
+`ice_time_avg` changes only the displayed ice layer, not terrain or stored
+state. `min_ice_cells=6` can remove small components, but it can also hide real
+small glaciers and is therefore never enabled by a preset.
 
-## Output fields you can read off `m`
+## 1D arrays
 
-After `m.run()` (or `load`), the run's arrays hang off the model, all
-`(time, y, x)` unless noted. Alongside each is its on-disk zarr variable name.
+The 1D model stores NumPy arrays directly. Spatial output has shape
+`(nx, n_output)`; `output_times` and `zELA_out` have length `n_output`.
 
-| attribute | zarr variable | meaning |
-|-----------|---------------|---------|
-| `m.z_out` | `topography__elevation` (mode A) | ice-surface elevation `zs` |
-| `m.zb_out` | `topography__elevation` (mode B/C) | tracked bed = channel floor |
-| `m.H_out` | `glacial_spl__ice_thickness` | width-mean ice thickness |
-| `m.area_out` | `glacial_flow__area` | upstream drainage area |
-| `m.Qg_out` | `glacial_flow__ice_flux` | ice flux |
-| `m.Qf_out` | `glacial_flow__water_flux` | water flux |
-| `m.erosion_rate_out` | `glacial_spl__erosion_rate` | erosion rate |
-| `m.denudation_out` | `glacial_spl__denudation` | per-step rock removed (Δ`zb` in B incl. carve, Δ`zs` in A) — the sediment / flexural-unloading source |
-| `m.receivers_out`, `m.stack_out`, `m.basin_out` | `glacial_flow__{receivers_2d,stack_2d,basin_ids}` | flow graph |
-| `m.rebound_out` | `flexure__rebound` | flexural deflection (`flexure=True`) |
-| `m.sediment_flux_out`, `m.eroded_volume_out` | `sediment__{flux,cumulative}` | sediment throughput + running total (`track_sediment=True`) |
+| attribute | meaning |
+|---|---|
+| `z_out`, `zb_out` | ice-surface elevation and channel-floor bed elevation |
+| `H_out` | width-mean ice thickness |
+| `Qg_out`, `Qf_out` | ice and water flux |
+| `erosion_rate_out` | erosion rate |
+| `tau_out`, `ub_out` | basal shear stress and sliding velocity |
+| `B_out` | local ice mass-balance rate |
+| `zo_out`, `xd_out` | divide elevation and position, shaped `(n_sides, n_output)` |
+| `Lt_out`, `zLt_out` | terminus position and elevation, shaped `(n_sides, n_output)` |
 
-`m` exposes **both** `z_out` (ice surface) and `zb_out` (bed) directly, so you
-rarely reconstruct by hand. If you read the raw zarr instead, the mapping is
-mode-aware: in mode B/C `topography` **is** the bed, so `z = zb + 1.5·H`
-(`1.5 = HC_OVER_H`, the channel-floor datum); in mode A `topography` is the
-surface and the bed is stored separately as `glacial_spl__bedrock_surface`.
+The first dimension of spatial arrays follows `m.x`, which runs from `L` down
+to zero. The 1D model has no built-in run `save`/`load` method.
+
+## 2D dataset and arrays
+
+The standalone driver builds `m.ds_out` as an **in-memory xarray Dataset**; a
+normal run does not create a Zarr store. The convenience attributes below are
+NumPy views of that dataset and have shape `(time, y, x)` unless noted.
+
+| attribute | `ds_out` variable | meaning |
+|---|---|---|
+| `z_out` | reconstructed or `topography__elevation` | ice-surface elevation `zs` |
+| `zb_out` | `topography__elevation` in B/C; `glacial_spl__bedrock_surface` in A | channel-floor bed elevation |
+| `H_out` | `glacial_spl__ice_thickness` | width-mean ice thickness |
+| `area_out` | `glacial_flow__area` | upstream drainage area |
+| `Qg_out` | `glacial_flow__ice_flux` | ice flux |
+| `Qf_out` | `glacial_flow__water_flux` | water flux |
+| `erosion_rate_out` | `glacial_spl__erosion_rate` | erosion rate |
+| `denudation_out` | `glacial_spl__denudation` | per-step rock removed: Δ`zb` in B/C including carving, or Δ`zs` in A |
+| `receivers_out` | `glacial_flow__receivers_2d` | receiver graph |
+| `stack_out` | `glacial_flow__stack_2d` | topological routing stack |
+| `basin_out` | `glacial_flow__basin_ids` | basin identifiers |
+| `lengths_out` | reconstructed from receivers/grid | node-to-receiver distance |
+| `rebound_out` | `flexure__rebound` | flexural displacement; present when `flexure=True` |
+| `sediment_flux_out` | `sediment__flux` | sediment throughput; present when `track_sediment=True` |
+| `eroded_volume_out` | `sediment__cumulative` | cumulative eroded volume; present when `track_sediment=True` |
+
+Mode B/C stores the bed as `topography__elevation` and reconstructs the ice
+surface as `z = zb + 1.5*H`. Mode A stores the ice surface as topography and a
+separate bed field. `1.5` is the channel-floor ratio `HC_OVER_H`; `H` remains
+the width-mean thickness used by the physics.
 
 ## The true-state output convention
 
-Outputs report the **true `(zb, H)` everywhere** — there is no presentation
-floor at base level. With a nonzero `bl` (see {doc}`configuring_a_run`), a drowned
-or relict bed shows through *below* the waterline: that is bed memory, not a bug.
-Water (ocean and lakes) is a display layer only — `landscape` renders it at
-`max(zs, bl)` and fills lakes for the picture, but the stored state keeps its true
-drowned elevation.
+Outputs report the true `(zb, H)` everywhere; base level is not a presentation
+floor in stored state. With nonzero `bl`, a drowned or relict bed may lie below
+the waterline. That is bed memory, not a failed clamp. Ocean and lake surfaces
+are display layers used by `landscape`, not substitutions in the output arrays.
 
-## Output files
+## Files and output locations
 
-Figures and saved runs are written under `model_outputs/` in the current
-working directory (not inside the installed package).
+Plot methods return Matplotlib objects and do not save unless their save/path
+argument requests it. Relative names are placed beneath the current working
+directory:
 
-## Saving and reloading a run (2D)
+- images: `model_outputs/images/`
+- movies: `model_outputs/movies/`
+- 2D saved runs: `model_outputs/saved_models/`
+
+An absolute output name is used as given.
+
+MP4 animation methods use Matplotlib's ffmpeg writer and require a system
+`ffmpeg` executable on `PATH`.
+
+## Saving and loading a 2D run
 
 ```python
-m.save('run_name')                 # writes under model_outputs/
+path = m.save('run_name')          # adds .pkl; returns the path written
 
 from siim.siim2d import load
-m = load('run_name')               # reload the saved run
+restored = load('run_name')
 ```
 
-Reloaded runs carry their output arrays and plotter, so you can re-plot or
-post-process without re-running.
+`save` writes atomically and records a save-format schema version, the
+producing SIIM version, the concrete model class, the original user-parameter
+dictionary, and `ds_out`. `load` checks the envelope, schema version, model
+identity, required keys, and value types; the producing package version is
+recorded for diagnostics. Unsupported, malformed, and old unversioned payloads
+fail with a directed error; cross-version migration is not promised.
+
+These files use Python pickle. **Load only files you trust:** unpickling can
+execute code before SIIM can validate the decoded object. The validation
+detects incompatible SIIM state; it is not a security sandbox.
+
+The saved parameter dictionary preserves the user's original inputs. External
+resources referenced there, such as an initial-topography CSV path, are not
+embedded automatically and must still be available when the model is rebuilt.
+Reloaded compatible runs carry their dataset, convenience arrays, and plotter,
+so they can be plotted and post-processed without rerunning.

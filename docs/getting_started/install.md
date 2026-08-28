@@ -1,25 +1,48 @@
 # Installation
 
-siim is a research package, installed from a clone. Since 0.9.1 the whole
-model — 1D, **2D included**, analytical, plotting — is **pip-installable**: it
-runs on numpy (2.x supported), scipy, numba, matplotlib, tqdm, and xarray,
-with the time loop, flow routing, flexure, and hillslope diffusion all
-implemented in-house. No conda, no Fortran.
+The standard installation includes the 1D model, the full standalone 2D model,
+the analytical solutions, and plotting. The time loop, flow routing, flexure,
+and hillslope diffusion are implemented in the package; this path needs neither
+conda nor Fortran.
 
-## Standard install (everything, incl. the 2D model)
+## Standard install
+
+Install the released package from PyPI:
 
 ```bash
-git clone <repository> siim
-cd siim
-pip install -e .          # editable; pulls the core deps (numpy, scipy, numba,
-                          # matplotlib, tqdm, xarray) if not already present
+python -m pip install siim
 ```
 
-That is the whole install:
+Or install an editable checkout for development:
+
+```bash
+git clone https://github.com/ericdealgeomorph/siim.git
+cd siim
+python -m pip install -e .
+```
+
+Both install NumPy, SciPy, Numba, Matplotlib, tqdm, xarray, and pandas
+automatically and support NumPy 2. The model imports directly after
+installation:
 
 ```python
 from siim.siim2d import siim as siim2d   # no fastscape/xsimlab needed
 ```
+
+Initial topography can be supplied as a NumPy array, pandas DataFrame, or CSV
+file without installing an additional Python package.
+
+Exporting MP4 animations also requires a system `ffmpeg` executable on `PATH`.
+It is not needed for simulations, static plots, or interactive viewers.
+
+## Numba threading
+
+On import, SIIM uses `os.environ.setdefault` to select Numba's `workqueue`
+threading layer when `NUMBA_THREADING_LAYER` is not already set. This
+process-wide default avoids a known macOS interaction between alternate
+threading runtimes and the NumPy/SciPy stack. To choose another installed Numba
+threading layer, set the environment variable **before** importing SIIM; an
+explicit user value is never overwritten.
 
 ## Optional: the fastscape adapter (conda)
 
@@ -27,21 +50,21 @@ from siim.siim2d import siim as siim2d   # no fastscape/xsimlab needed
 fastscape/xsimlab `@xs.process` classes, and `run(driver='xsimlab')` drives
 the 2D model through xsimlab orchestration. This is **optional** — the
 standalone 2D model needs none of it — and it is the one component that still
-wants conda: `pip install -e .[fastscape]` can deliver `fastscape` and
+wants conda. `python -m pip install 'siim[fastscape]'` can deliver `fastscape` and
 `xarray-simlab` from PyPI (note PyPI's fastscape is a stale 0.1.0), but
 **fastscapelib-fortran** — the Fortran backend fastscape's stock processes
 call at run time — has no PyPI wheel. The validated adapter environment is
-`environment.yml` (the fastscape-adapter / legacy env, which carries the
-`numpy<2` / `xarray<2026.5` / `zarr<3` quarantine pins around the
-unmaintained xsimlab):
+`environment.yml`, which carries the `numpy<2` / `xarray<2026.5` / `zarr<3`
+quarantine pins around the unmaintained xsimlab:
 
 ```bash
 conda env create -f environment.yml
-conda activate glacial
-pip install -e . --no-deps    # pure link — never lets pip touch the pinned env
+conda activate siim-adapter
+python -m pip install -e . --no-deps  # do not alter the pinned adapter env
 ```
 
 Inside the managed conda environment, always install with `--no-deps` so pip
-cannot upgrade the quarantined packages. Without the stack installed,
-`import siim.fastscape` raises a directed `ImportError` explaining exactly
-this.
+cannot upgrade the quarantined packages. If `fastscape` or `xarray-simlab`
+itself is absent, `import siim.fastscape` raises a directed `ImportError`.
+Missing `fastscapelib-fortran` may appear later, when a stock Fastscape process
+first calls its backend; the conda environment supplies all three components.

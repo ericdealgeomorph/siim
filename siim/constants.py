@@ -19,8 +19,8 @@ KT = 365.25 * 24 * 3600.0        # seconds per year [s yr^-1]
 # thickness state uses zs = zb + HC_OVER_H * H, i.e. the tracked bed is the
 # channel floor (thalweg) and H stays the width-MEAN depth that drives the
 # flux closures, sliding laws and erosion laws (which are untouched by this
-# constant). 1.0 reproduces the historical mean-bed datum (zs = zb + H).
-# See docs/dev/hc_convention_notes.md for the datum-redefinition argument.
+# constant). Setting the ratio to 1.0 recovers the historical mean-bed datum.
+# See ``docs/guides/concepts.md`` for the public datum convention.
 HC_OVER_H = 1.5
 
 # --- Package-wide parameter defaults ---------------------------------------
@@ -61,13 +61,13 @@ BL = 0.0          # base level: the water-line (Dirichlet) datum [m]. The
 # (largely latent in 1D, mildly behavioral in 2D). BORDER: the ramp is the
 # physical bound inside the closed-form IMPLICIT border budget (the bed digs
 # on the arrival slope to the flotation-draft equilibrium
-# zb* = bl - hc*H + delta*U/E; docs/dev/outflow_implicit_budget.md) — turning
+# zb* = bl - hc*H + delta*U/E) — turning
 # the gate off un-bounds the border (f == 1: measured runaway). Off is for
 # diagnostics only.
-# See docs/dev/boundary_conditions.md + docs/dev/outflow_bc_study.md.
+# See ``docs/guides/concepts.md`` for the boundary-condition contract.
 FLOTATION_GATE = True
 # Flotation-gate ramp width gamma (the effective-pressure softening of the
-# gate; docs/dev/soft_gate_probe.md). Instead of a hard on/off switch at the
+# gate). Instead of a hard on/off switch at the
 # waterline, glacial erosion is multiplied by
 #     f = clip((zs - bl) / (gamma*hc*H), 0, 1),   f = 0 exactly for zs <= bl
 # — the freeboard-proportional factor an effective-pressure erosion law gives
@@ -89,7 +89,7 @@ FLOTATION_RAMP = 0.1
 # produces (which would starve erosion and re-dam the border — the sill /
 # reflected-slope failure family). Baked in, not user-facing.
 S_FLOOR_BC = 1e-3
-# Level-scheduled parallel mode-B erosion (docs/dev/perf_audit.md §8): the
+# Level-scheduled parallel mode-B erosion: the
 # eroder dependency is a DAG depth, so topological levels run in order with
 # prange inside each — BIT-FOR-BIT identical to the serial walk at any thread
 # count (pinned by test_parallel_erode). Default ON (Eric, 2026-07-07; it is
@@ -115,9 +115,9 @@ NUMERICS_BACKEND = 'inhouse'
 DRIVER_DEFAULT = 'inhouse'
 # 2D flow-routing backend: 'inhouse_d8' = siim's numba D8 fill-then-route
 # producer (_core.step.route_d8 / _core.routing._d8_*) — the ONLY accepted
-# value since the S5 standalone flip (the fortran SFR arm is deleted). The
-# param survives as the ROUTER-CONTRACT plug point (docs/dev/
-# router_contract.md): a future backend (e.g. fastscapelib) re-widens the
+# value since the standalone-driver transition (the fortran SFR arm is deleted).
+# The param survives as the ROUTER-CONTRACT plug point: a future backend
+# (e.g. fastscapelib) re-widens the
 # accepted set. The S4 router swap was the one NON-bit-for-bit numeric change
 # of the standalone migration (tie-break/basin-carve paths differ from the
 # retired fortran SFR; gated behaviorally by test_d8_receiver_parity vs the
@@ -270,14 +270,14 @@ def widening_factor_from_rate(value):
 # replaces the raw lagged H feeding the surf2erode surface with an EMA
 # H_eff(t) = r*H_eff(t-1) + (1-r)*H_lag(t) (routing + accumulation only — the
 # kernel/carve/outputs stay on raw state, the runaway firewall). 0 = off
-# (bit-for-bit); r in [0, 1). See docs/dev/step_flicker.md.
+# (bit-for-bit); r in [0, 1). See ``docs/guides/concepts.md``.
 ROUTING_RELAX = 0.0
 
 # --- Fabricated trunk-surface routing (mode B/C, opt-in `trunk_surface`) ------
 # The trunk-surface provider routes + accumulates on a fabricated ice surface
 # with a LINEAR cross-valley dip toward the centerline, so flow converges onto
 # the trunk chain and the centerline's raw flux is the full cross-section
-# discharge (design record: docs/dev/trunk_surface_routing.md). The dip is a
+# discharge. The dip is a
 # routing NUMERICS device, not physics (real trunk surfaces are ~convex-up);
 # nothing physical is computed from it. Cross-slope S_c = TRUNK_DIP_K * S_v(s),
 # S_v the local down-valley surface slope at the source. D8 convergence needs

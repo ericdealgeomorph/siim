@@ -1,27 +1,32 @@
 # Configuring a run
 
 Both models take a parameter dict; a handful of keys set the regime, and the
-defaults are the model's native, glacially-interesting configuration.
+defaults are the model's native, glacially interesting configuration. This page
+explains the choices that interact. See {doc}`parameter_reference` for every
+accepted key, default, unit, and model-specific restriction.
 
 ## Surface-evolution mode — `mode`
 
-The default `'bedrock+ice_thickness'` tracks **two** state fields — the bedrock
-and the ice thickness — and rebuilds the ice surface each step, so carved
-overdeepenings persist on ice retreat (*bed memory*, the regime where the
-MISI-style autogenic cycling lives). The alternative, `'ice_surface'`, tracks a
-**single** field — the ice surface — and heals troughs instantly; use it for
-simpler steady-profile behaviour. (`'A'` / `'B'` are accepted as short aliases
-for `'ice_surface'` / `'bedrock+ice_thickness'`; `'C'` is a 2D-only alias for
-mode B with carving on — see the mode-C standard below.) The channel-floor datum
+`'bedrock+ice_thickness'` tracks **two** state fields — the bedrock and the ice
+thickness — and rebuilds the ice surface each step, so carved overdeepenings
+persist on ice retreat (*bed memory*, the regime where the MISI-style autogenic
+cycling lives). It is the 1D default and the dynamical state beneath the 2D
+mode-C default. The alternative, `'ice_surface'`, tracks a **single** field —
+the ice surface — and heals troughs instantly; use it for simpler steady-profile
+behaviour. (`'A'` / `'B'` are accepted as short aliases for these two modes;
+`'C'` is a 2D-only alias for mode B with carving on.) The channel-floor datum
 relating the tracked bed to the ice surface is the `hc_over_H` convention.
 
 ## Sub-grid glacier-width carving — `carve_width` (2D)
 
-Default `True` in `'bedrock+ice_thickness'` mode. A glacier of mean thickness
-*H* fills a valley of width *α_g·H* — many grid cells wide — and that footprint
-erodes the bed, giving troughs real width, a hypsometric feedback, and channel
-capture. The footprint widens at rate `widening_rate` (η, default `3.0`).
-Selecting `mode='ice_surface'` coerces carving off.
+The 2D package default is `mode='C'`, which resolves to mode B with
+`carve_width=True`. By contrast, spelling `mode='B'` leaves carving **off**
+unless you explicitly pass `carve_width=True`; `carve_width=None` is the
+mode-dependent sentinel that implements this distinction. A glacier of mean
+thickness *H* fills a valley of width *α_g·H* and that footprint erodes the bed,
+giving troughs real width, a hypsometric feedback, and channel capture. The
+footprint widens at rate `widening_rate` (η, default `3.0`). Mode A cannot be
+combined with carving and rejects `carve_width=True`.
 
 ## The mode-C standard (carved runs)
 
@@ -30,10 +35,12 @@ A carved bedrock run — `mode='bedrock+ice_thickness'` with carving on, i.e. th
 default: `trunk_surface=True` fabricates a converging ice surface so a wide
 trunk's flux is routed onto its centerline (honest cross-section discharge), and
 `routing_relax=0.5` EMA-relaxes the once-per-step routing surface to damp a
-cosmetic planview ice flicker. **Both act only on the routing graph and the
-mass-balance surface — never on the erosion/thickness physics or the outputs** —
-and both are opt-out (set them to `False` / `0.0`). Plain `mode='B'` (no carve)
-and `mode='A'` keep them off. An explicit value always wins over the default.
+planview ice flicker. Both modify the routing/mass-balance surface rather than
+post-processing stored output. They therefore can change the simulated routing,
+accumulation, and resulting evolution, even though erosion/thickness kernels and
+stored state remain raw. Both are opt-out (set them to `False` / `0.0`). Plain
+`mode='B'` (no carve) and `mode='A'` keep them off. An explicit value always
+wins over the mode-dependent default.
 
 *Which mode?* Reach for the mode-C default (`'C'`, or just leave `mode` unset)
 for realistic carved troughs with width and channel capture. Drop to plain

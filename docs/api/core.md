@@ -1,9 +1,9 @@
 # Numerical core — `siim._core`
 
-The fastscape-free numpy/numba kernels shared by the 1D profile model and the
-2D landscape model. Importing `siim._core` (and its submodules) needs
-numpy/numba only — no fastscape, xsimlab, or matplotlib — so the numerics stay
-testable without the model stack. The 1D and 2D models build one
+The fastscape-free numerical kernels shared by the 1D profile model and the 2D
+landscape model. Most use NumPy/Numba; spectral flexure uses SciPy. They need no
+fastscape, xsimlab, or Matplotlib, so the numerics remain testable without the
+optional adapter or plotting layer. The 1D and 2D models build one
 `GlacialParams` record and an integer `law_code` and call the step skeletons
 directly.
 

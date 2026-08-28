@@ -11,7 +11,8 @@ Unified call shape (identical in 1D and 2D):
 dict; ``None`` (or a ``None`` tuple side) means auto = the global, all-frame
 stable limit (so the axis is constant across a view/animation). ``field_min`` /
 ``field_max`` are the single-field shorthand. 5 fields: elevation,
-ice_thickness, erosion_rate, ice_flux, water_flux. See docs/dev/plotting_plan.md.
+ice_thickness, erosion_rate, ice_flux, water_flux. See
+``docs/guides/outputs_and_io.md`` for the public plotting and output contract.
 """
 
 

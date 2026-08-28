@@ -11,7 +11,8 @@ ends over one physical core:
 - **`siim.analytical`** — closed-form steady-state profiles and regime diagrams
   from the underlying theory
 
-Pure Python/NumPy/Numba — no Fortran, no framework lock-in.
+Python with NumPy/SciPy/Numba — no Fortran and no framework lock-in for the
+standalone models.
 
 ## Install
 
@@ -41,6 +42,7 @@ params = {
     'Lx': 100e3, 'Ly': 50e3,            # domain size (m)
     'nx': 201, 'ny': 101,               # grid
     'T': 5e6, 'nt': 501, 'nt_out': 51,  # 5 Myr run
+    'seed': 0,                           # reproducible initial relief noise
     'mode': 'C',                        # bed-memory + sub-grid glacier carving
 }
 

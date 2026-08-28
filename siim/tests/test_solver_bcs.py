@@ -95,7 +95,7 @@ def test_one_sided_head_cap_honors_B_cap():
 
 # ---------------------------------------------------------------------------
 # Base-level outlet OUTFLOW BC (mode-B walks, 1D): zero-gradient thickness +
-# arrival-slope bed erosion + flotation gate (docs/dev/boundary_conditions.md).
+# arrival-slope bed erosion + flotation gate.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("law", ["eff-exp", "power", "coulomb"])

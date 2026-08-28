@@ -1,9 +1,12 @@
 import numpy as np
+import os
 import pickle
+import tempfile
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from . import __version__ as _SIIM_VERSION
 from . import constants as _constants
 from .constants import (GRAVITY, KT, RHO_ICE, derive_coulomb,
                         derive_power)
@@ -22,8 +25,77 @@ except ImportError:  # numpy < 1.25 (np.RankWarning removed in numpy 2)
     _RankWarning = np.RankWarning
 
 
+_SAVE_FORMAT = "siim.model-state.pickle"
+_SAVE_SCHEMA_VERSION = 1
+_SAVE_REQUIRED_KEYS = frozenset({
+    "save_format", "schema_version", "siim_version", "model_identity",
+    "_user_params", "ds_out",
+})
 
 
+def _model_identity(model_cls):
+    return f"{model_cls.__module__}.{model_cls.__qualname__}"
+
+
+def _validate_saved_state(state, model_cls):
+    """Validate the small versioned envelope around a pickled model state."""
+    if not isinstance(state, dict):
+        raise ValueError(
+            "Invalid SIIM saved model: the top-level pickle payload must be a dict.")
+
+    # Before schema version 1, save() wrote only these two keys. Refuse that
+    # ambiguous payload explicitly instead of rebuilding it under today's
+    # parameter defaults and output conventions.
+    if ("schema_version" not in state
+            and {"_user_params", "ds_out"}.issubset(state)):
+        raise ValueError(
+            "Unsupported legacy SIIM saved model: this file predates the "
+            "versioned save format. Re-run and save it with the SIIM version "
+            "that created it before loading it here.")
+
+    missing = sorted(_SAVE_REQUIRED_KEYS - state.keys())
+    if missing:
+        raise ValueError(
+            f"Invalid SIIM saved model: missing required key(s): {missing}.")
+
+    if not isinstance(state["save_format"], str):
+        raise ValueError(
+            "Invalid SIIM saved model: 'save_format' must be a string.")
+    if state["save_format"] != _SAVE_FORMAT:
+        raise ValueError(
+            f"Unsupported SIIM save format {state['save_format']!r}; "
+            f"expected {_SAVE_FORMAT!r}.")
+
+    schema_version = state["schema_version"]
+    if type(schema_version) is not int:
+        raise ValueError(
+            "Invalid SIIM saved model: 'schema_version' must be an integer.")
+    if schema_version != _SAVE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported SIIM save schema version {schema_version}; this "
+            f"SIIM release supports version {_SAVE_SCHEMA_VERSION}.")
+
+    if not isinstance(state["siim_version"], str) or not state["siim_version"]:
+        raise ValueError(
+            "Invalid SIIM saved model: 'siim_version' must be a non-empty string.")
+
+    if not isinstance(state["model_identity"], str):
+        raise ValueError(
+            "Invalid SIIM saved model: 'model_identity' must be a string.")
+    expected_model = _model_identity(model_cls)
+    if state["model_identity"] != expected_model:
+        raise ValueError(
+            f"Saved model is for {state['model_identity']!r}, not "
+            f"{expected_model!r}; load it with the matching model class.")
+
+    if not isinstance(state["_user_params"], dict):
+        raise ValueError(
+            "Invalid SIIM saved model: '_user_params' must be a dict.")
+
+    import xarray as xr
+    if not isinstance(state["ds_out"], xr.Dataset):
+        raise ValueError(
+            "Invalid SIIM saved model: 'ds_out' must be an xarray.Dataset.")
 
 def _load_initial_topography(src):
     """Load initial topography from an ndarray, pandas DataFrame, or CSV file.
@@ -44,7 +116,6 @@ def _load_initial_topography(src):
         return np.asarray(src, dtype=float), None
 
     import pandas as pd
-    from pathlib import Path
 
     if isinstance(src, (str, Path)):
         df = pd.read_csv(src)
@@ -92,18 +163,23 @@ def _load_initial_topography(src):
 
 
 def _ibc_from_border_status(border_status):
-    """fastscapelib-fortran boundary code from a border_status list, matching
-    fastscape's ``BorderBoundary.initialize`` (boundary.py:95-98): ``ibc =
-    left*1 + right*100 + top*1000 + bottom*10`` with a digit 1 per 'fixed_value'
-    edge. The single source both the fortran router and the in-house
-    flexure/diffusion decode."""
+    """Encode ``border_status`` for the in-house flexure/diffusion kernels.
+
+    The retained boundary code is ``left*1 + right*100 + top*1000 +
+    bottom*10``, with a digit 1 per ``'fixed_value'`` edge. It matches the
+    historical Fastscape convention used by these numerical kernels.
+    """
     bs = list(np.broadcast_to(border_status, 4))   # [left, right, top, bottom]
     arr_bc = np.array([1 if s == 'fixed_value' else 0 for s in bs])
     return int(sum(arr_bc * np.array([1, 100, 1000, 10])))
 
 
 def load(filename):
-    """Module-level shortcut for ``siim.load(filename)``."""
+    """Module-level shortcut for :meth:`siim.load`.
+
+    ``filename`` must be a trusted SIIM pickle; pickle can execute code before
+    the saved-state envelope is validated.
+    """
     return siim.load(filename)
 
 
@@ -112,6 +188,24 @@ def load(filename):
 # =============================================================================
 
 class siim:
+    """Standalone two-dimensional coupled glacial-fluvial landscape model.
+
+    Parameters
+    ----------
+    user_params : dict, optional
+        Parameter overrides. Omitted keys use the documented model defaults;
+        unknown keys raise ``ValueError``. See the public parameter reference
+        for units, accepted values, and mode-specific behavior.
+
+    Notes
+    -----
+    The default driver is the in-house NumPy/Numba implementation and does not
+    require Fastscape or xsimlab. Call :meth:`run` to integrate, use the
+    ``*_out`` arrays or ``ds_out`` for scientific output, and use ``plot``
+    for visualization. :meth:`save` and :meth:`load` use versioned pickle files;
+    load only files from trusted sources.
+    """
+
     def __init__(self, user_params=None):
         if user_params is None:
             user_params = {}
@@ -221,9 +315,8 @@ class siim:
             # bit-for-bit; at the border its implicit solution is the
             # flotation sliding mode). Safe ceiling 0.2 (wide ramps can dome
             # cap=False configs). Only active when flotation_gate is on.
-            # See docs/dev/soft_gate_probe.md + outflow_implicit_budget.md.
             "flotation_ramp": _constants.FLOTATION_RAMP,
-            # Mode-B parallel-eroder toggle (docs/dev/perf_audit.md):
+            # Mode-B parallel-eroder toggle:
             # run the erosion step level-scheduled across threads (topological
             # levels of the flow graph). BIT-FOR-BIT identical to the serial
             # eroder at any thread count (pinned by test_parallel_erode);
@@ -237,7 +330,9 @@ class siim:
             "Ac": _constants.AC,
             "alpha_g": _constants.ALPHA_G,
             "lambda_p": _constants.LAMBDA_P,  # eff-exp/power critical ice thickness [m]
-            "mu": None,           # default per-law-derived from nu (advanced override)
+            # Default per-law-derived from nu. For exact power/Coulomb numerics
+            # an explicit override is analytical-only and warns.
+            "mu": None,
             "nu": _constants.NU,   # SS slope exponent (primary user input)
             "ell": None,           # erosion-law exponent in Eg = ce (kt ub)^ell; default per-law-derived from nu
             "k": _constants.K_ACCUM,  # accumulation-profile shape exponent (paper's p)
@@ -268,7 +363,7 @@ class siim:
             # 'inhouse_d8' = siim's numba D8 fill-then-route
             # (_core.step.route_d8) — the only accepted value since the 0.9.1
             # standalone flip; the param is the router-contract plug point
-            # (docs/dev/router_contract.md) for future backends. Only affects
+            # for future backends. Only affects
             # flow_routing='single' (the D-inf directions + mask + basin are
             # in-house on the same contract).
             "router_backend": _constants.ROUTER_DEFAULT,
@@ -336,8 +431,8 @@ class siim:
             # centerline, so flow CONVERGES onto the trunk chain and its raw flux
             # is the full cross-section. Also evaluates mass balance at the
             # trunk-surface elevation (re-tune zELA before comparing to
-            # non-trunk-surface runs). See the design record
-            # docs/dev/trunk_surface_routing.md. Knob: trunk_dip_k (0.6).
+            # non-trunk-surface runs). See ``docs/guides/concepts.md``.
+            # Knob: trunk_dip_k (0.6).
             # Default None = the mode-C STANDARD (resolved after mode
             # normalization): ON for mode C (mode B + carve), OFF for plain
             # mode B and mode A. An explicit True/False always wins.
@@ -348,7 +443,7 @@ class siim:
             # H_eff = r*H_eff_prev + (1-r)*H_lag instead of the raw lagged H,
             # damping the discrete-D8 per-step planview ice flicker.
             # Routing/accumulation only — the kernel/carve/outputs stay on raw
-            # state (the runaway firewall). See docs/dev/step_flicker.md. Default
+            # state (the runaway firewall). Default
             # None = the mode-C STANDARD (constants.MODE_C_ROUTING_RELAX for
             # mode C, 0.0 for plain mode B / mode A). An explicit value wins.
             "routing_relax": None,
@@ -716,6 +811,14 @@ class siim:
         # recomputes its own _Co from ce/cg/lambda_p/alpha_g/mu).
         self.ell, self.nu, self.mu, self.phi, _ = c
         if params.mu is not None:
+            if self.sliding_law in {'power', 'coulomb'}:
+                warnings.warn(
+                    f"Explicit 'mu' with sliding_law={self.sliding_law!r} is "
+                    "retained for the analytical steady-state interpretation "
+                    "and reported phi, but the exact numerical sliding law "
+                    "derives its flux exponent from nu/ell and does not use "
+                    "the override.",
+                    UserWarning, stacklevel=2)
             self.mu = params.mu
             self.phi = self.mu / self.nu
 
@@ -911,9 +1014,13 @@ class siim:
         from fastscape.models import basic_model
         # Drop the stock spl/drainage slots; the renamed glacial_spl / glacial_flow
         # slots (+ law) are added by _process_overrides via update_processes.
-        model = (basic_model
-                 .drop_processes(['spl', 'drainage'])
-                 .update_processes(self._process_overrides()))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="dropping variables using",
+                category=FutureWarning, module="xsimlab")
+            model = (basic_model
+                     .drop_processes(['spl', 'drainage'])
+                     .update_processes(self._process_overrides()))
 
         input_vars = {
             'grid__shape': [self.grid_ny, self.grid_nx],
@@ -983,34 +1090,19 @@ class siim:
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*IndexVariable.*", category=FutureWarning)
+            warnings.filterwarnings(
+                "ignore", message="dropping variables using",
+                category=FutureWarning, module="xsimlab")
             warnings.filterwarnings("ignore", message=".*squeeze.*", category=UserWarning)
 
+            # Both orchestration paths consume one output-schema definition.
+            # Dtypes matter only to the in-house buffers; xsimlab needs the
+            # same active names, each sampled on its ``time`` clock.
             output_vars = {
-                'topography__elevation': 'time',
-                'glacial_spl__ice_thickness': 'time',
-                'glacial_flow__ice_flux': 'time',
-                'glacial_flow__water_flux': 'time',
-                'glacial_flow__area': 'time',
-                'glacial_flow__basin_ids': 'time',
-                'glacial_flow__receivers_2d': 'time',
-                'glacial_flow__stack_2d': 'time',
-                'glacial_spl__erosion_rate': 'time',
-                'glacial_spl__denudation': 'time',  # per-step rock removed (delta-zb in B, delta-zs in A)
-                'uplift__uplift': 'time',   # per-step applied uplift (block or wave)
+                name: 'time'
+                for name, _dtype in _outputs.output_spec(
+                    self.mode, self.flexure, self.track_sediment)
             }
-            # bedrock_surface exists only on mode A (the ice-surface state, whose
-            # bed is the derived z - hc*H). Both mode-B citizens (GlacialSPLModeB
-            # and the carving GlacialSPLModeC) track the bed AS topography, so
-            # they have no separate bedrock_surface output.
-            if not self._citizen_mode_b:
-                output_vars['glacial_spl__bedrock_surface'] = 'time'
-
-            if self.track_sediment:
-                output_vars['sediment__flux'] = 'time'
-                output_vars['sediment__cumulative'] = 'time'
-
-            if self.flexure:
-                output_vars['flexure__rebound'] = 'time'  # per-step flexural deflection (m)
 
             ds_in = xs.create_setup(
                 model=model,
@@ -1089,9 +1181,12 @@ class siim:
         bs = list(np.broadcast_to(self.boundary_status, 4))
         out_idx = np.round(np.linspace(0, self.nt - 1, self.nt_out)).astype(int)
         law_code, gp = build_glacial_params(
-            self.sliding_law, self.Ko, self.ce, self.n, self.nu, self.m, self.mu,
-            self.Ac, self.alpha_g, self.lambda_p, self.lambda_c, self.tau_c,
-            self.coulomb_clamp, self.hc_over_H, self.H_diffusivity)
+            sliding_law=self.sliding_law, Ko=self.Ko, ce=self.ce,
+            n=self.n, nu=self.nu, m=self.m, mu=self.mu, Ac=self.Ac,
+            alpha_g=self.alpha_g, lambda_p=self.lambda_p,
+            lambda_c=self.lambda_c, tau_c=self.tau_c,
+            coulomb_clamp=self.coulomb_clamp, hc_over_H=self.hc_over_H,
+            H_diffusivity=self.H_diffusivity)
         # border_bed_uplift: static (scalar/(ny,nx)) or a clock series (nt,ny,nx).
         bbu_spec = self._make_border_bed_uplift()
         if isinstance(bbu_spec, tuple):
@@ -1209,7 +1304,7 @@ class siim:
             self.rebound_out = self.ds_out['flexure__rebound'].values
 
     def save(self, filename=None):
-        """Pickle the current model state (user_params + ds_out) to
+        """Atomically pickle the current model state (user_params + ds_out) to
         ``./model_outputs/saved_models/`` under the current working directory.
         With no filename, an auto-name combining a UTC timestamp and ``run_id``
         is generated. Returns the path written."""
@@ -1223,9 +1318,32 @@ class siim:
             filename = f"{filename}.pkl"
 
         path = Path(output_path(filename, 'saved_models'))
-        with open(path, 'wb') as f:
-            pickle.dump({'_user_params': self._user_params,
-                         'ds_out': self.ds_out}, f)
+        state = {
+            'save_format': _SAVE_FORMAT,
+            'schema_version': _SAVE_SCHEMA_VERSION,
+            'siim_version': _SIIM_VERSION,
+            'model_identity': _model_identity(type(self)),
+            '_user_params': self._user_params,
+            'ds_out': self.ds_out,
+        }
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode='wb', dir=path.parent, prefix=f'.{path.name}.',
+                    suffix='.tmp', delete=False) as f:
+                temp_path = Path(f.name)
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, path)
+        except BaseException:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
         print(f"Saved to {path}")
         return path
 
@@ -1233,15 +1351,27 @@ class siim:
     def load(cls, filename):
         """Rebuild a siim instance from a previously ``save()``-ed pickle.
         ``filename`` may be a bare name in ``./model_outputs/saved_models/``
-        (with or without the ``.pkl`` suffix) or an absolute / relative path."""
+        (with or without the ``.pkl`` suffix) or an absolute / relative path.
+
+        Pickle files can execute code while loading. Only load files from a
+        trusted source. Unversioned legacy payloads are rejected rather than
+        interpreted under current model conventions.
+        """
         path = Path(filename)
         if not path.is_file():
             candidate = Path(output_path(path.name, 'saved_models'))
             if not candidate.is_file() and not str(candidate).endswith('.pkl'):
                 candidate = candidate.with_suffix('.pkl')
             path = candidate
-        with open(path, 'rb') as f:
-            state = pickle.load(f)
+        try:
+            with open(path, 'rb') as f:
+                state = pickle.load(f)
+        except (pickle.UnpicklingError, EOFError, AttributeError, ImportError,
+                IndexError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Could not load SIIM saved model {path}: the pickle is invalid "
+                "or incompatible with this Python environment.") from exc
+        _validate_saved_state(state, cls)
         model = cls(state['_user_params'])
         model.ds_out = state['ds_out']
         model._unpack_outputs()

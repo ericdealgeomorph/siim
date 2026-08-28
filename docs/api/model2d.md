@@ -1,18 +1,24 @@
 # 2D landscape model
 
+The constructor accepts a parameter dictionary; see
+{doc}`../guides/parameter_reference` for every key and mode-dependent default.
+
 ## Wrapper / dispatch — `siim.siim2d`
 
 ```{eval-rst}
 .. automodule:: siim.siim2d
-   :members:
+
+.. autoclass:: siim.siim2d.siim
+   :members: run, save, load, extract_channel, strahler_order
    :show-inheritance:
+
+.. autofunction:: siim.siim2d.load
 ```
 
-The glacial xsimlab processes this model assembles (including `DinfFlowRouter`)
-are documented in {doc}`fastscape`; the numba kernels they dispatch into —
-ice-thickness closures, erosion loops, sub-grid carving, H diffusion, and the
-D-infinity routing primitives — live in the fastscape-free numerical core, see
-{doc}`core`.
+The standalone driver uses the fastscape-free numerical core for routing,
+ice-thickness closure, erosion, sub-grid carving, diffusion, and flexure; see
+{doc}`core`. Optional xsimlab process shells around the same step functions are
+documented in {doc}`fastscape`.
 
 ## Plotting — `siim.plotting`
 

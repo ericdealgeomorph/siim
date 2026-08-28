@@ -5,8 +5,7 @@ match fastscape's fortran ``SingleFlowRouter`` where routing is unambiguous, and
 resolve drainage validly everywhere else. This is the one NON-bit-for-bit numeric
 swap in the standalone migration: fortran carves depressions via MST sill-carving
 while the in-house eps-fills them, so on tie/flat/sill cells the receiver *chains*
-differ (different path to the same outlet) — hence a behavioral gate (Map 3 §3,
-``docs/dev/router_contract.md``):
+differ (different path to the same outlet) — hence a behavioral gate:
 
 * tie-free synthetics (``xtilt``, ``diag``): EXACT byte-equality of receivers +
   lengths (both surfaces are monotone ramps with a unique strict steepest

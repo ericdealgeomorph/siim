@@ -1,6 +1,5 @@
 #!/usr/bin/env python
-"""The reference battery — freeze + reproduce-gate for the standalone 2D model
-(``docs/dev/standalone_migration_plan.md`` S0/S5; ``…_maps.md`` Map 4 §0/§2).
+"""The reference battery — freeze + reproduce gate for the standalone 2D model.
 
 This script runs the 2D model ON ITS SHIPPED DEFAULTS — the in-house driver +
 in-house D8 router + in-house flexure/diffusion, since the S5 standalone flip

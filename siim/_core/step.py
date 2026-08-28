@@ -13,8 +13,8 @@ seam that survives S1 — the FFT flexure solve — is injected as a callable
 (:func:`glacial_flexure_step`'s ``flexure_solve`` argument), so this module never
 imports ``fastscapelib_fortran`` either.
 
-The subtleties that must survive the extraction bit-for-bit (see Map 1 of
-``docs/dev/standalone_migration_maps.md``):
+The step-order and state-separation subtleties that must remain bit-for-bit
+stable are summarized below:
 
 * the ``ice_thickness`` one-step lag (router/accumulator see ``H(t-1)`` — an
   ordering artifact reproduced by reading H into the routing surface before the
@@ -59,7 +59,7 @@ from .carve import (
 # ---------------------------------------------------------------------------
 # 1. Law record (GlacialLaw.initialize + _glacial_params_and_code)
 # ---------------------------------------------------------------------------
-def build_glacial_params(sliding_law, Ko, ce, n, nu, m, mu, Ac, alpha_g,
+def build_glacial_params(*, sliding_law, Ko, ce, n, nu, m, mu, Ac, alpha_g,
                          lambda_p, lambda_c, tau_c, coulomb_clamp, hc_over_H,
                          H_diffusivity):
     """(law_code, GlacialParams) for the given sliding law — the frozen per-run
@@ -254,8 +254,8 @@ def routing_surface(post_uplift_surface, hc_over_H, H_eff):
 # ---------------------------------------------------------------------------
 def _fabricate_trunk_surface(zs_dyn, zb, H_lag, border, alpha_g, dx, dy,
                              k_dip, floor, offsets, D, SRC, wrap_y, wrap_x):
-    """Build the fabricated trunk routing surface (design record
-    ``docs/dev/trunk_surface_routing.md``). Pure function (no process state) so
+    """Build the fabricated trunk routing surface described in
+    ``docs/guides/concepts.md``. Pure function (no process state) so
     the process and the channel-persistence test share one implementation.
 
     ``zs_dyn`` (ny, nx) is the dynamic ice surface ``zb + hc*H_lag``; ``zb`` the

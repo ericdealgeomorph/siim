@@ -1,4 +1,4 @@
-"""Mode C — the citizen mode-B bed+H class plus the sub-grid glacier-width
+"""Mode C — the citizen mode-B bed-and-thickness class plus the sub-grid glacier-width
 carve (:class:`siim.fastscape.GlacialSPLModeC`), the ``carve=True`` default path.
 
 Stage-1 port gates (citizen-refactor methodology):

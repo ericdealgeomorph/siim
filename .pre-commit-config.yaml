@@ -1,0 +1,23 @@
+# pre-commit — runs automatically on `git commit`.
+# One-time activation per repo:  pre-commit install
+# Manual full sweep:             pre-commit run --all-files
+
+# Leave data, manuscripts, notebooks, and archived/reference files untouched.
+exclude: '\.ipynb$|/fixtures/|/baselines/|/figs/|^paper_drafts/|_memory/archive/|golden.*\.json$'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=10240']   # backstop for accidentally added large artifacts
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.19
+    hooks:
+      - id: ruff                  # lint via ruff.toml (select = F); --fix applies safe fixes
+        args: [--fix]

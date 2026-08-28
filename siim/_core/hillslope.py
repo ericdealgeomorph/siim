@@ -2,14 +2,15 @@ r"""In-house hillslope diffusion (ADI), the standalone replacement for
 fastscapelib-fortran's ``fs.diffusion`` (stock ``LinearDiffusion``).
 
 Linear hillslope diffusion :math:`\partial z/\partial t = \nabla\cdot(k_d\nabla z)`
-advanced one step by the **alternating-direction-implicit** (ADI) scheme, ported
-directly from fastscapelib-fortran ``Diffusion.f90`` (v2.8.4): two ``dt/2``
+advanced one step by the **alternating-direction-implicit** (ADI) scheme,
+matching fastscapelib-fortran ``Diffusion.f90`` (v2.8.4): two ``dt/2``
 half-steps (x-implicit then y-implicit), arithmetic-mean face diffusivities, a
 Thomas tridiagonal solve per row/column, and the exact Dirichlet (fixed) /
 one-sided no-flux (free) edge branches keyed to the same ``ibc`` digit map. The
+Thomas solver is independently expressed from the standard row recurrence. The
 scheme is unconditionally stable and, for spatially-uniform ``k_d`` (siim's
-scalar ``D``), the identical float64 tridiagonal sequence the fortran runs — so
-it reproduces ``fs.diffusion`` bit-for-bit (twin-gated, ``rtol`` ~1e-12).
+scalar ``D``), reproduces ``fs.diffusion`` bit-for-bit (twin-gated,
+``rtol`` ~1e-12).
 
 numpy/numba only -- no fastscape/xsimlab imports (framework-free core). This is
 the HILLSLOPE diffuser (topography); distinct from :mod:`siim._core.diffusion`,
@@ -33,20 +34,26 @@ import numba
 
 
 @numba.njit(cache=True)
-def _tridag(a, b, c, r, u, n):
-    """Thomas tridiagonal solve (Numerical Recipes ``tridag``), ported verbatim
-    from ``Diffusion.f90``. ``a`` sub-diagonal, ``b`` diagonal, ``c`` super-
-    diagonal, ``r`` rhs; solution written into ``u`` (length ``n``). ``gam`` is
-    the scratch carry."""
-    gam = np.empty(n)
-    bet = b[0]
-    u[0] = r[0] / bet
-    for j in range(1, n):
-        gam[j] = c[j - 1] / bet
-        bet = b[j] - a[j] * gam[j]
-        u[j] = (r[j] - a[j] * u[j - 1]) / bet
-    for j in range(n - 2, -1, -1):
-        u[j] = u[j] - gam[j + 1] * u[j + 1]
+def _solve_tridiagonal(lower, diagonal, upper, rhs, solution, size):
+    """Solve a tridiagonal system with the standard Thomas recurrence.
+
+    ``lower[i]``, ``diagonal[i]``, and ``upper[i]`` multiply the unknowns at
+    indices ``i-1``, ``i``, and ``i+1``. The result is written into the
+    preallocated ``solution`` array. This implementation was independently
+    derived from that row equation; it performs no pivoting.
+    """
+    modified_upper = np.empty(size)
+
+    pivot = diagonal[0]
+    solution[0] = rhs[0] / pivot
+
+    for i in range(1, size):
+        modified_upper[i - 1] = upper[i - 1] / pivot
+        pivot = diagonal[i] - lower[i] * modified_upper[i - 1]
+        solution[i] = (rhs[i] - lower[i] * solution[i - 1]) / pivot
+
+    for i in range(size - 2, -1, -1):
+        solution[i] = solution[i] - modified_upper[i] * solution[i + 1]
 
 
 @numba.njit(cache=True)
@@ -106,7 +113,7 @@ def _adi_step(z, kd, dt, dx, dy, fix_r0, fix_rN, fix_c0, fix_cN):
             inf[nx - 1] = -axm
             f[nx - 1] = (zintp[r, nx - 1] + ayp * zintp[r + 1, nx - 1]
                          - (ayp + aym) * zintp[r, nx - 1] + aym * zintp[r - 1, nx - 1])
-        _tridag(inf, diag, sup, f, res, nx)
+        _solve_tridiagonal(inf, diag, sup, f, res, nx)
         for c in range(nx):
             zint[r, c] = res[c]
 
@@ -153,7 +160,7 @@ def _adi_step(z, kd, dt, dx, dy, fix_r0, fix_rN, fix_c0, fix_cN):
             inf[ny - 1] = -aym
             f[ny - 1] = (zint[ny - 1, c] + axp * zint[ny - 1, c + 1]
                          - (axp + axm) * zint[ny - 1, c] + axm * zint[ny - 1, c - 1])
-        _tridag(inf, diag, sup, f, res, ny)
+        _solve_tridiagonal(inf, diag, sup, f, res, ny)
         for r in range(ny):
             zintp[r, c] = res[r]
 

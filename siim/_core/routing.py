@@ -403,8 +403,7 @@ def _dinf_pack(rec1, rec2, w1, w2, len1, len2, n,
 # (``fs.flowroutingsingleflowdirection``). Same fill-then-route strategy as the
 # D-inf primitives above: spill-fill the depressions with _priority_flood_eps,
 # then a steepest-descent receiver scan on the FILLED surface that replicates
-# fortran ``find_receiver`` exactly (Map 3 §3 of the standalone-migration maps;
-# ``docs/dev/router_contract.md``). The routing delta vs fortran is confined to
+# fortran ``find_receiver`` exactly. The routing delta vs fortran is confined to
 # tie/flat/sill cells (in-house routes them down the eps-fill gradient, fortran
 # via MST sill-carving); on non-degenerate cells the receiver + length are
 # byte-identical, so this is a behavioral/attractor swap, not bit-for-bit.

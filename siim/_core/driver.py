@@ -3,8 +3,9 @@
 Owns the merged step chain and the two-cadence snapshot that xsimlab's driver
 performed for the ``siim.fastscape`` adapter path, calling the SAME
 framework-free step functions (:mod:`siim._core.step`) the ``@xs.process`` shells
-call — one implementation, two front ends. See Map 1 §1 (step order) and Map 2
-(driver / output I/O) of ``docs/dev/standalone_migration_maps.md``.
+call — one implementation, two front ends. The public model and output
+contracts are documented in ``docs/guides/concepts.md`` and
+``docs/guides/outputs_and_io.md``.
 
 Merged step order (a valid topological sort of the composition graph)::
 

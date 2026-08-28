@@ -1,12 +1,36 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "siim"
 version = "0.9.1"
 description = "Sliding Ice Incision Model (siim): coupled glacial-fluvial landscape evolution."
+readme = "README.md"
+authors = [
+    { name = "Eric Deal" },
+]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"  # code uses 3.12 f-string syntax (quote reuse, PEP 701)
+keywords = [
+    "geomorphology",
+    "glacier",
+    "landscape evolution",
+    "numerical modeling",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = [
     # The FULL standalone model: `import siim`, the 1D model (siim.siim1d),
     # the 2D model (siim.siim2d / siim.escarpment — in-house driver, D8/D-inf
@@ -22,6 +46,8 @@ dependencies = [
     "matplotlib",
     "tqdm",
     "xarray",
+    # CSV and DataFrame initial topography are part of the public model API.
+    "pandas",
 ]
 
 [project.optional-dependencies]
@@ -32,11 +58,35 @@ dependencies = [
 # PyPI wheel — the validated adapter env is conda:
 #   conda env create -f environment.yml
 fastscape = ["fastscape", "xarray-simlab"]
+test = [
+    "pytest",
+    # High-precision oracle used by the analytical profile tests.
+    "mpmath",
+]
+docs = [
+    "sphinx>=8",
+    "furo",
+    "myst-nb",
+    "sphinxcontrib-bibtex",
+    "ipykernel",
+]
+release = [
+    "build",
+    "twine",
+]
 # Dev-only: the fastscapelib (C++ successor) parity probe — a non-blocking,
 # workflow_dispatch-only CI stub pre-1.0 (OQ-5; plan S5 decision note 16).
 dev-parity = ["fastscapelib"]
 
+[project.urls]
+Homepage = "https://github.com/ericdealgeomorph/siim"
+Documentation = "https://siim.readthedocs.io"
+Repository = "https://github.com/ericdealgeomorph/siim"
+Issues = "https://github.com/ericdealgeomorph/siim/issues"
+Changelog = "https://github.com/ericdealgeomorph/siim/blob/main/CHANGELOG.md"
+
 [tool.setuptools]
+include-package-data = false
 packages = ["siim", "siim.analytical", "siim._core", "siim.plotting", "siim.fastscape"]
 
 [tool.pytest.ini_options]

@@ -78,6 +78,25 @@ def _load_initial_topography(src):
 
 # SIIM: a 1D model of coupled fluvial and glacial incision, with an analytical solution for the steady state profile.
 class siim:
+    """One-dimensional coupled glacial-fluvial profile model.
+
+    Parameters
+    ----------
+    user_params : dict, optional
+        Parameter overrides. Omitted keys use the documented model defaults;
+        unknown keys raise ``ValueError``. See the public parameter reference
+        for units, accepted values, and the distinction between numerical and
+        analytical-only controls.
+
+    Notes
+    -----
+    Construction validates parameters and prepares the embedded analytical
+    steady-state reference. Call :meth:`run` to integrate the numerical model;
+    results are exposed through the ``*_out`` arrays and ``plot`` helper.
+    The 1D model does not implement the 2D model's pickle ``save``/``load``
+    interface.
+    """
+
     def __init__(self, user_params=None):
         # Check that params is a dictionary if it is provided, otherwise set it to an empty dictionary
         if user_params is None: user_params = {}
@@ -149,8 +168,8 @@ class siim:
             # reduced/no glacial erosion. Border: the ramp is the physical
             # bound inside the closed-form IMPLICIT border budget (the bed
             # digs on the arrival slope to the flotation-draft equilibrium).
-            # False un-bounds the border — diagnostics only.
-            # See docs/dev/boundary_conditions.md.
+            # False un-bounds the border — diagnostics only. See the boundary
+            # condition notes in docs/guides/concepts.md.
             "flotation_gate": _constants.FLOTATION_GATE,
             # Flotation-ramp width gamma (default constants.FLOTATION_RAMP =
             # 0.1): the gate is the effective-pressure ramp — glacial erosion
@@ -159,7 +178,6 @@ class siim:
             # bit-for-bit; at the border its implicit solution is the
             # flotation sliding mode). Safe ceiling 0.2 (wide ramps can dome
             # cap=False configs). Only active when flotation_gate is on.
-            # See docs/dev/soft_gate_probe.md + outflow_implicit_budget.md.
             "flotation_ramp": _constants.FLOTATION_RAMP,
             # fluvial params
             "k_h": _constants.KH,
@@ -173,7 +191,9 @@ class siim:
             "alpha_g": _constants.ALPHA_G,
             "lambda_p": _constants.LAMBDA_P,  # eff-exp/power critical ice thickness [m]
             "lambda_c": None,     # regularized Coulomb sliding length; default constants.LAMBDA_C
-            "mu": None,           # SS flux exponent in U = Co Q^mu S^nu; default per-law-derived from nu
+            # SS flux exponent in U = Co Q^mu S^nu. For exact power/Coulomb
+            # numerics an explicit override is analytical-only and warns.
+            "mu": None,
             "nu": _constants.NU,  # SS slope exponent (primary user input)
             "ell": None,          # erosion-law exponent in Eg = ce (kt ub)^ell; default per-law-derived from nu
             "lam": None,          # AAR-like ratio (zo-zELA)/(zo-zLt); default d*sigma/(d*sigma+k)
@@ -200,7 +220,8 @@ class siim:
             #   'A' = z-tracking: z is the persistent state, slope is
             #         read off self.z, H solved explicitly; zb is bookkept via
             #         zb = z − hc_over_H·H at end of step.
-            #   'B' = z_b + H tracking (default; all sliding laws): z_b is the
+            #   'B' = bedrock + ice-thickness tracking (default; all sliding
+            #         laws): z_b is the
             #         persistent state, H solved jointly with z_s via the upstream
             #         walk on z_b, z_s = z_b + hc_over_H·H; preserves carved overdeepenings
             #         under ice retreat (bed memory) — the model's native regime.
@@ -474,12 +495,20 @@ class siim:
                              nu=params.nu, ell=params.ell)
         self.ell, self.nu, self.mu, self.phi, self.Co = c
         if params.mu is not None:
+            if self.sliding_law in {'power', 'coulomb'}:
+                warnings.warn(
+                    f"Explicit 'mu' with sliding_law={self.sliding_law!r} is "
+                    "retained for the analytical steady-state interpretation "
+                    "and reported phi, but the exact numerical sliding law "
+                    "derives its flux exponent from nu/ell and does not use "
+                    "the override.",
+                    UserWarning, stacklevel=2)
             self.mu = params.mu
             self.phi = self.mu / self.nu
             # Co carries mu in its exponent (paper Co(mu)); recompute it for the
-            # eff-exp/power laws whose kernels consume it, so an explicit mu
-            # override doesn't pair a stale Co with the new mu (audit B5).
-            # Coulomb's Co depends on ell, unchanged by a mu-only override.
+            # effective-exponent numerical law and analytical/reporting state.
+            # The exact power kernel derives its own exponent and prefactor;
+            # Coulomb's Co depends on ell and is unchanged by a mu-only override.
             if self.sliding_law != 'coulomb':
                 self.Co = Co_power(self.ce, self.cg, self.lambda_p,
                                    self.alpha_g, self.mu)
@@ -491,8 +520,10 @@ class siim:
         self.lam = (params.lam if params.lam is not None
                     else self.d * self.sigma / (self.d * self.sigma + self.k))
 
-        # Integration mode per step ('A' = z-tracking, 'B' = z_b+H-tracking).
-        # Surface-evolution mode: 'A' (z-tracking) or 'B' (zb+H tracking).
+        # Integration mode per step ('A' = z-tracking,
+        # 'B' = z_b + hc_over_H*H tracking).
+        # Surface-evolution mode: 'A' (z-tracking) or 'B' (bed + thickness
+        # tracking with the channel-floor surface convention).
         # Mode 'B' is implemented for all three sliding laws (eff-exp, power, coulomb).
         self.mode = _constants.normalize_mode(params.mode)
         if self.mode == 'C':
@@ -615,10 +646,12 @@ class siim:
             explicit slope.
           * Mode B (default; all three laws): the upstream walk solves H and the
             new ice-surface slope jointly per node, using self.zb (the persistent
-            bedrock state) and the receiver's just-solved z_s = zb_r + H_r.
+            bedrock state) and the receiver's just-solved
+            z_s = zb_r + hc_over_H*H_r.
         """
-        # Mode B path: the upstream walk solves H and z_s = zb + H jointly per
-        # node (tight closure), dispatched by sliding law.
+        # Mode B path: the upstream walk solves H and
+        # z_s = zb + hc_over_H*H jointly per node (tight closure), dispatched
+        # by sliding law.
         if self._mode_B_active:
             if self.sliding_law not in ("eff-exp", "power", "coulomb"):
                 raise ValueError(
@@ -726,7 +759,7 @@ class siim:
 
     def _erode_border_bed_1d(self):
         """Mode B: evolve the bed at base-level outlets under the OUTFLOW BC —
-        the IMPLICIT BORDER BUDGET (docs/dev/outflow_implicit_budget.md). An
+        the IMPLICIT BORDER BUDGET. An
         icy border bed keeps ERODING: dzb/dt = U − f·E, with E the glacial law
         on the interior ARRIVAL slope (zs[nb2] − zs[nb], floored at
         constants.S_FLOOR_BC — the ~0 local slope of zero-gradient-H would
@@ -862,7 +895,8 @@ class siim:
 
         # Mode B path (all three laws): z_b is the persistent state.
         #   1) uplift z_b on interior nodes.
-        #   2) build z' = z_b + H (H frozen from calculate_ice_thickness's
+        #   2) build z' = z_b + hc_over_H*H (H frozen from
+        #      calculate_ice_thickness's
         #      upstream walk this step).
         #   3) erode z'. Two behaviours, set by floating_termini:
         #      - default (True): a terminus in a closed basin is floating /
@@ -874,7 +908,8 @@ class siim:
         #        so the ice toe carves its overdeepening; only bare-rock lakes
         #        are frozen.
         #   4) erosion delta applied to z_b; carved depressions persist as state.
-        #   5) z = z_b + H for next step's routing (shows actual depressions).
+        #   5) z = z_b + hc_over_H*H for next step's routing (shows actual
+        #      depressions).
         if self._mode_B_active:
             fj = self._forcing_idx
             bl = self.bl_run[fj]  # per-step water-line datum
@@ -888,7 +923,7 @@ class siim:
             else:
                 raise ValueError("Boundary conditions not recognized for uplift calculation.")
 
-            # build z' = z_b + H (the real ice surface). This is the ROCK
+            # build z' = z_b + hc_over_H*H (the real ice surface). This is the ROCK
             # problem's working view: an ICE-FREE base-level outlet presents the
             # WATER LINE max(z', bl) — its Dirichlet datum — and the lake-fill
             # below propagates that water level over a submerged boundary trough
@@ -957,8 +992,8 @@ class siim:
             self._erode_border_bed_1d()
 
             # rebuild z for next step's routing, mass balance and output as
-            # z_s = z_b + H from current state — the TRUE state everywhere
-            # (true-state output convention, docs/dev/boundary_conditions.md):
+            # z_s = z_b + hc_over_H*H from current state — the TRUE state
+            # everywhere (the public output convention):
             # a relict drowned border bed shows through below bl, while a
             # through-flowing icy (outflow) border stands at its true surface
             # (no floor). Interior trough nodes likewise present
@@ -1167,8 +1202,9 @@ class siim:
 
         Returns
         -------
-        (surface_rms, bed_rms) : tuple of floats (m)
-            NaN if the analytical has no SS (``glacier_flag == -1``).
+        (surface_rms, bed_rms) : tuple of float
+            RMS values in metres. NaN if the analytical has no SS
+            (``glacier_flag == -1``).
         """
         a = self.analytical
         if a.surface is None:

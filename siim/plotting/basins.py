@@ -1,7 +1,8 @@
 """Channel + basin analysis: ``flux`` / ``hacks_law`` / ``largest_basins`` /
 ``largest_basins_history`` / ``sediment_history``. These need only model methods
 (``extract_channel`` / ``strahler_order``) + ``_add_colorbar`` — no glacier
-rasterizers. See docs/dev/plotting_plan.md.
+rasterizers. See ``docs/guides/outputs_and_io.md`` for the public plotting
+contract.
 """
 
 import warnings

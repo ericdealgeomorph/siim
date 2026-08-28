@@ -39,9 +39,12 @@ fig
 ```
 
 That is the whole loop: build from a dict, `run()`, then read the result off
-`m.plot` or the output arrays. Figures and saved runs are written under
+`m.plot` or the output arrays. The 1D model keeps its run in memory and does not
+provide the 2D model's pickle-based `save`/`load` helper. Plot methods return
+Matplotlib figures; methods with a `save` option write requested files beneath
 `model_outputs/` in the working directory.
 
-Next: the parameters that set the regime are collected in
-{doc}`../guides/configuring_a_run`; the 2D landscape model is in
+Next: the parameters that set the regime are explained in
+{doc}`../guides/configuring_a_run`, and every accepted key is listed in
+{doc}`../guides/parameter_reference`; the 2D landscape model is in
 {doc}`first_2d_run`.

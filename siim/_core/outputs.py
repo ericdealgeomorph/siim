@@ -5,9 +5,9 @@ this module allocates them to the exact dtypes and wraps them in the
 ``xarray.Dataset`` :meth:`siim.siim2d.siim._unpack_outputs` reads — same
 variable names, dims ``(time, y, x)``, coords (``time``/``x``/``y``/``tstep``),
 dtypes (float64 fields; int32 for ``basin_ids``/``receivers_2d``/``stack_2d``)
-and the mode/flag-conditional rows (Map 2 §1 of
-``docs/dev/standalone_migration_maps.md``). ``_unpack_outputs`` / ``save`` /
-``load`` are UNCHANGED — this reproduces the exact keys they consume.
+and the mode/flag-conditional rows. ``_unpack_outputs`` / ``save`` / ``load``
+consume the exact keys constructed here; see
+``docs/guides/outputs_and_io.md`` for the public output contract.
 
 xarray is the only heavy import; it stays function-local so
 ``import siim._core.outputs`` costs nothing until a dataset is built.
@@ -17,7 +17,7 @@ import numpy as np
 _FLOAT = np.float64
 _INT = np.int32
 
-# The always-present rows, in the siim2d output-var order (siim2d.py:913-925).
+# The always-present rows, shared by the in-house and xsimlab drivers.
 _BASE_SPEC = (
     ('topography__elevation', _FLOAT),
     ('glacial_spl__ice_thickness', _FLOAT),

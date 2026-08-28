@@ -8,7 +8,7 @@ climate forcing moves the equilibrium-line altitude (ELA) up and down.
 Three front ends share one set of physics and constants (`siim.constants`):
 
 - **1D profile model** (`siim.siim1d`) — a single glacial–fluvial long
-  profile; fast, numpy/scipy/numba only.
+  profile; fast and fully standalone.
 - **2D landscape model** (`siim.siim2d`) — a raster model (single-flow or
   D-infinity routing, sub-grid glacier-width carving), with a rifted-margin
   escarpment variant in `siim.escarpment`. Its default *mode-C standard*
@@ -27,13 +27,17 @@ model — see {doc}`guides/fastscape_processes`. It needs the fastscape stack
 (`pip install siim[fastscape]`, conda for the Fortran backend); the standalone
 2D model above does not.
 
-Theory follows the model-paper and theory-paper drafts; where a docstring
-cites the papers it refers to equations by LaTeX `\label`, not number.
+The model and theory papers document the governing equations. The current code
+uses the channel-floor convention `zs = zb + 1.5*H`; manuscript copies that
+still show `zs = zb + H` predate that convention and should not be used to infer
+the implemented datum. Where a docstring cites a paper equation, it uses its
+LaTeX `\label`, not a renumberable equation number.
 
 **New here?** Install siim ({doc}`getting_started/install`), then run the 1D
 walkthrough ({doc}`getting_started/first_1d_run`). {doc}`guides/concepts` gives
 the mental model (modes, the channel-floor datum, sub-grid width); the
-parameters that set the regime are collected in {doc}`guides/configuring_a_run`.
+parameters that set the regime are explained in {doc}`guides/configuring_a_run`,
+with every numerical-model key in {doc}`guides/parameter_reference`.
 
 ```{toctree}
 :maxdepth: 2
@@ -50,6 +54,7 @@ getting_started/first_2d_run
 
 guides/concepts
 guides/configuring_a_run
+guides/parameter_reference
 guides/outputs_and_io
 guides/fastscape_processes
 ```

@@ -1,10 +1,10 @@
-"""Outflow base-level ice BC (docs/dev/boundary_conditions.md).
+"""Outflow base-level ice boundary-condition regression tests.
 
 The domain edge is an arbitrary cut through a continuing glacier: a through-flowing
 border gets zero-gradient thickness (H_border = H_dominant_donor) and its bed keeps
 ERODING by the IMPLICIT BORDER BUDGET — dzb/dt = U - f*E on the interior ARRIVAL
-slope, f the flotation ramp, integrated by the closed-form backward-Euler step
-(docs/dev/outflow_implicit_budget.md), so the bed approaches the flotation-draft
+slope, f the flotation ramp, integrated by the closed-form backward-Euler step,
+so the bed approaches the flotation-draft
 equilibrium zb* = bl - hc*H + delta*U/E monotonically at any dt. The cheap suite
 gates (the probe's 7-battery):
 
@@ -342,8 +342,8 @@ def test_border_implicit_budget_kernel_2d():
 
 
 # ---------------------------------------------------------------------------
-# Flotation ramp (the effective-pressure softening of the gate;
-# docs/dev/soft_gate_probe.md): gamma = 0 IS the hard binary gate bit-for-bit,
+# Flotation ramp (the effective-pressure softening of the gate): gamma = 0 IS
+# the hard binary gate bit-for-bit,
 # the ramp partially scales in-band cells, and it damps the binary gate's
 # single-step overshoot at the toe.
 # ---------------------------------------------------------------------------

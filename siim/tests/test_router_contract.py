@@ -1,4 +1,4 @@
-"""The router conformance battery (``docs/dev/router_contract.md``).
+"""The router conformance battery.
 
 Every conforming flow router runs through the HARD requirements. The
 framework-free primitives (spill, flux conservation, stack validity, border

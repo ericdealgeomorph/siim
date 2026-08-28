@@ -233,7 +233,7 @@ def _plot(self, ax=None, *, solution: Optional[Solution] = None,
     -----
     The bed under ice is reconstructed on the channel-floor datum,
     ``zb = z - HC_OVER_H * H``; H is the width-mean depth and is not
-    rescaled (see ``docs/dev/hc_convention_notes.md``).
+    rescaled. See ``docs/guides/concepts.md`` for the public datum convention.
     """
     import matplotlib.pyplot as plt  # lazy: keep the module headless-importable
 
@@ -391,7 +391,7 @@ class GeneralProfile:
         Hack-flux exponent for ice-flux integration. Enters only via
         lam = d*sigma/(d*sigma + k). Default 0.5.
     phi : float, optional
-        Glacial concavity index (nu/mu). Coulomb -> 1/2, power-law -> 4/15.
+        Glacial concavity index (mu/nu). Coulomb -> 1/2, power-law -> 4/15.
         Default 0.5.
     theta : float, optional
         Fluvial concavity index (m/n). Default 0.5.
@@ -408,7 +408,8 @@ class GeneralProfile:
         power-law uses (2/3)(1/3 + phi).
     alpha_g : float, optional
         Valley width-to-thickness ratio (W = alpha_g H). Sets the AAR ablation
-        area; only the group alpha_g/kh matters. Default constants.ALPHA_G (10).
+        area; only the group alpha_g/kh matters. Default constants.ALPHA_G
+        (currently 5).
     kh : float, optional
         Hack coefficient (catchment area A = kh x^d). Sets the AAR accumulation
         area. Default constants.KH (5).
@@ -560,13 +561,16 @@ class GeneralProfile:
     @property
     def kappa_c(self):
         r"""Critical steepness ratio
-        :math:`\kappa_c = (k + d\sigma)/k = 1/(1-\lambda)`.
+        :math:`\kappa_c = 1/(1-\lambda)`.
 
         The critical value of ``kappa`` in the zELA(Lt) closure (theory
-        paper, *Coupled glacial-fluvial steady state*). Computed from the
-        exponents — an explicit ``lam`` override does not change it.
+        paper, *Coupled glacial-fluvial steady state*). With the default
+        exponent-derived ``lam``, this is :math:`(k+d\sigma)/k`; an explicit
+        ``lam`` override supplies the corresponding closure scale directly.
         """
-        return (self.k + self.d * self.sigma) / self.k
+        if self._lam_arg is None:
+            return (self.k + self.d * self.sigma) / self.k
+        return 1.0 / (1.0 - self.lam)
 
     @property
     def zfo(self):
@@ -933,7 +937,7 @@ class MarginalCoulombProfile:
         Glen's flow-law coefficient A [Pa^-3 s^-1]; the deformation prefactor
         2A/5 is applied internally. Default constants.AC (2.5e-24).
     alpha_g : float, optional
-        Valley width-to-thickness ratio. Default constants.ALPHA_G (10).
+        Valley width-to-thickness ratio. Default constants.ALPHA_G (currently 5).
     tau_c : float, optional
         Coulomb yield stress [Pa]. Default constants.TAU_C (1e5).
     lam_c : float, optional

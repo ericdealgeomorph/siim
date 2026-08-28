@@ -1,4 +1,4 @@
-"""Base-level BC: BL(t) water-line datum plumbing (docs/dev/boundary_conditions.md).
+"""Base-level BC: BL(t) water-line datum plumbing.
 
 Gates for the ``bl`` (water-line datum) forcing:
 

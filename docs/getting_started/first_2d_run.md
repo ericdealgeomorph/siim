@@ -10,7 +10,7 @@ installed.
 from siim.siim2d import siim as siim2d
 
 m = siim2d({'zELA': 1000, 'nx': 81, 'ny': 81, 'Lx': 2e4, 'Ly': 2e4,
-            'T': 5e5, 'nt': 251})
+            'T': 5e5, 'nt': 251, 'seed': 0})
 m.run()
 m.plot.map(field='bedrock')      # raster field; or m.plot.landscape() for relief
 ```
@@ -19,8 +19,9 @@ The 2D model takes the same kind of parameter dict as the 1D model. This is the
 default carved configuration — `'bedrock+ice_thickness'` mode with sub-grid
 glacier-width carving, single-flow routing, and the mode-C routing helpers
 (trunk-surface routing and routing relaxation) — also spelled `mode='C'`. Those
-choices are covered in {doc}`../guides/configuring_a_run`; plotting and saving
-runs in {doc}`../guides/outputs_and_io`.
+choices are covered in {doc}`../guides/configuring_a_run`; every accepted key is
+listed in {doc}`../guides/parameter_reference`; plotting and saving runs are in
+{doc}`../guides/outputs_and_io`.
 
 **One caveat on this grid.** The example's `nx = ny = 81` over `Lx = Ly = 2e4`
 gives `dx = 250 m`, and the carve footprint radius `R = α_g·H/2 ≈ 2.5·H` is only
@@ -29,5 +30,7 @@ no-op here and the run looks like plain mode B. To *see* the carving (real troug
 width, channel capture), use a grid with `dx` well below `α_g·H/2` (a few tens of
 metres); see {doc}`../guides/configuring_a_run`.
 
-Figures and saved runs are written under `model_outputs/` in the working
-directory.
+Plot calls return Matplotlib objects. A plot is written only when its save/path
+option is used; `m.save()` writes a versioned run pickle. Those files live
+beneath `model_outputs/` in the working directory unless you pass an absolute
+path.

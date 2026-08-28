@@ -1,26 +1,35 @@
 # Changelog
 
-Short release notes; the citable design records behind each item live in
-`docs/` and `docs/dev/`.
+Short release notes. Public behavior and configuration are documented in the
+guides and API reference under `docs/`.
 
-## 0.9.1 — July 2026 (current)
+## 0.9.1 — August 2026 (current)
 
-The standalone migration (`docs/dev/standalone_migration_plan.md`, stages
-S0–S5): siim's 2D model no longer requires the frozen fastscape/xsimlab/
-fastscapelib-fortran stack.
+The standalone migration: siim's 2D model no longer requires the frozen
+fastscape/xsimlab/fastscapelib-fortran stack.
 
 **Packaging (the headline)**
 - The 2D model (`siim.siim2d`, `siim.escarpment`) is now **pip-installable
   standalone**: `pip install siim` runs everything on numpy/scipy/numba/
-  matplotlib/tqdm/xarray (numpy 2 supported; `xarray` added to core deps,
-  unpinned). No conda required for default use.
+  matplotlib/tqdm/xarray/pandas (numpy 2 supported; `xarray` and `pandas` are
+  direct, unpinned core dependencies). No conda required for default use.
 - `siim.fastscape` is demoted to the **optional adapter**
-  (`pip install siim[fastscape]`); its modules raise a directed ImportError
-  without the stack. fastscapelib-fortran remains conda-only —
+  (`pip install siim[fastscape]`); importing it without Fastscape raises a
+  directed error, while missing conda-only runtime backends are reported when
+  the corresponding stock process is used. fastscapelib-fortran remains conda-only —
   `environment.yml` is retitled the fastscape-adapter / legacy env and keeps
   its numpy<2 / xarray<2026.5 / zarr<3 quarantine (which no longer constrains
   a default install). A `dev-parity` extra ships for the future fastscapelib
-  parity probe (workflow_dispatch-only CI stub pre-1.0).
+  parity probe (workflow_dispatch-only CI stub pre-1.0). The published
+  `environment.yml` is a lean `siim-adapter` environment rather than the full
+  paper/notebook development environment.
+- Importing the optional adapter no longer monkey-patches private xarray
+  internals or installs a process-wide warning filter. SIIM-owned xsimlab
+  compatibility warnings are suppressed only around the calls that emit them.
+- The release exporter now requires a committed, clean source snapshot and a
+  synchronized public target. Its dry run performs the same artifact build,
+  archive inspection, clean-environment install, smoke tests, and public-tree
+  diff as publication, without changing either working tree.
 
 **Numerics owned in-house (defaults flipped at 0.9.1)**
 - Time loop: an in-house framework-free driver (`siim._core.driver`) replaces
@@ -32,8 +41,8 @@ fastscapelib-fortran stack.
   2D landscapes are multistable under them — same-seed mode-B/C runs
   self-organise equivalent-but-different drainage networks (~100–170 m rms
   apart at identical attractor statistics). Gated behaviorally
-  (receiver parity vs frozen raw fortran refs, analytical oracle, attractor
-  statistics; `docs/dev/router_contract.md`). Compare attractors, not
+  (receiver parity vs frozen raw fortran refs, analytical oracle, and attractor
+  statistics). Compare attractors, not
   snapshots, against pre-0.9.1 runs.
 - Flexure: in-house scipy.fft plate solve. ⚠ Fixes the fortran `pihy`
   anisotropy bug — on `dx != dy` grids results differ from fortran **by
@@ -41,7 +50,8 @@ fastscapelib-fortran stack.
   the k=0 (domain-mean) mode is zeroed, matching fortran's far-field-neutral
   DST semantics.
 - Hillslope diffusion: in-house numba ADI, byte-identical to `fs.diffusion`
-  for siim's uniform diffusivity.
+  for siim's uniform diffusivity. Its Thomas solver is independently expressed
+  from the standard tridiagonal row recurrence.
 - The retired `'fortran'` options of `router_backend`/`numerics_backend` now
   raise directed errors; the params survive as the (public-contract) backend
   plug points.
@@ -56,9 +66,20 @@ fastscapelib-fortran stack.
   error); xsimlab RuntimeHooks remain available via `driver='xsimlab'`.
 - `nt_out` is validated to `1 <= nt_out <= nt` (previously `nt_out > nt`
   silently produced NaN frames under xsimlab).
-- Saved-run pickles keep the same format (`{'_user_params', 'ds_out'}`,
-  xarray Dataset, same variable names) — fresh saves round-trip; pre-0.9.1
-  saves are not migrated (pre-release posture).
+- An explicit analytical `lam` override now consistently sets
+  `kappa_c = 1/(1-lam)` in both `GeneralProfile` and `RegimeMap`; the default
+  exponent-derived closure is unchanged.
+- An explicit `mu` with an exact power or Coulomb numerical law is retained for
+  the analytical/reporting interpretation but now warns that the exact kernel
+  uses its law-derived exponent. The effective-exponent law continues to use
+  the override numerically.
+- Saved-run pickles now carry an explicit format/schema version, producing SIIM
+  version, concrete model identity, the original parameter dictionary, and the
+  xarray Dataset. Unversioned saves are rejected with a directed error rather
+  than silently interpreted under current defaults.
+- The standalone and adapter drivers now consume one shared output schema, and
+  construction of the numerical law record is keyword-only to make its
+  cross-module parameter contract resistant to accidental reordering.
 
 **Verification (per stage, recorded in the plan)**
 - Extraction + driver: bit-for-bit against the frozen reference battery and
@@ -77,27 +98,26 @@ docs `-W` green, dev-CI green. v1.0 is reserved for the public release.
 
 **Physics & boundary conditions**
 - Base-level BC redesign (mode B): water/rock separation with a time-dependent
-  Dirichlet water datum `bl(t)`; true-state outputs everywhere
-  (`docs/dev/boundary_conditions.md`).
+  Dirichlet water datum `bl(t)`; true-state outputs everywhere (see
+  `docs/guides/outputs_and_io.md`).
 - Ice borders are OUTFLOW boundaries: zero-gradient thickness (dominant donor
   in 2D) with the bed evolved by the implicit closed-form border budget on the
-  arrival slope — dt-robust at any dt, bounded at the flotation draft
-  (`docs/dev/outflow_implicit_budget.md`).
+  arrival slope — dt-robust at any dt, bounded at the flotation draft.
 - Waterline-flotation gate as an effective-pressure ramp
   (`flotation_gate`/`flotation_ramp`, γ = 0.1 default), interior + border.
 - Channel-floor datum `hc/H̄ = 1.5` implemented across the numerical models and
-  the analytical bed reconstructions (`docs/hc_convention_notes.md`).
+  the analytical bed reconstructions (see `docs/guides/concepts.md`).
 
 **Mode C (the flagship default: mode B + sub-grid width carving)**
 - Sub-grid glacier-width carving via exact power-diagram attribution
-  (`docs/subgrid_width_carving.md`); `widening_rate` default 3.0.
+  (see `docs/guides/configuring_a_run.md`); `widening_rate` default 3.0.
 - Mode-C standard: `trunk_surface=True`, `routing_relax=0.5` by default
-  (anti-flicker EMA; `docs/dev/step_flicker.md`); the flux-consolidation
+  (anti-flicker EMA); the flux-consolidation
   machinery removed.
-- D-inf routing rebuilt on the eps-filled surface (fill-based redesign,
-  `docs/dinf_routing.md`) + D-inf mode B.
+- D-inf routing rebuilt on the eps-filled surface (fill-based redesign) plus
+  D-inf mode B.
 
-**Performance (`docs/dev/perf_audit.md`)**
+**Performance**
 - `parallel_erode` (default ON): level-scheduled parallel mode-B erosion,
   bit-for-bit with the serial eroder — coulomb steps −43% (SFR) / −32% (D-inf)
   at 201×201.
@@ -105,8 +125,7 @@ docs `-W` green, dev-CI green. v1.0 is reserved for the public release.
   D-inf mode-C steps −19% (power) / −10% (coulomb) on top of the above.
 
 **Infrastructure**
-- Pre-1.0 code audit complete (91 findings adjudicated;
-  `docs/dev/audit_findings.md`).
+- Pre-1.0 code audit complete (91 findings adjudicated).
 - Sphinx docs site (Furo + MyST-NB), `-W` clean; RTD config at the root.
 - Frugal dev-CI (cached micromamba: suite + docs build per PR/push).
 - Packaging: conda-only for the 2D stack (`environment.yml` is the contract,

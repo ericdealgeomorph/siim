@@ -176,7 +176,7 @@ def _power_erode_2d_dinf(z, zo, Qf, Qg, H, dt, Ko, ce, m, n, t, lambda_p,
 # Coulomb (regularized Coulomb) sliding law.
 # Structurally identical to the 1D version in siim1d.py; only the outer loop
 # differs (walks fastscape's directed graph via stack/receivers instead of 1D
-# indices). See docs/dev/core_rewrite_plan.md for the derivation and history.
+# indices). See ``docs/guides/concepts.md`` for the governing-model overview.
 # =============================================================================
 
 
@@ -354,7 +354,7 @@ def _coulomb_erode_2d_dinf(z, zo, Qf, Qg, dt, Ko, ce, m, n, ell, t,
 # Mode-B border-bed glacial erosion rate, per law. The eroder loops skip
 # self-receiving outlet cells, so the border-bed budget needs the glacial
 # erosion rate computed explicitly here (consumed by the closed-form IMPLICIT
-# border step in the skeletons — docs/dev/outflow_implicit_budget.md; E is
+# border step in the skeletons; E is
 # frozen per step, the implicit solve handles the flotation ramp). Each
 # returns 0 when its slope/thickness guard fails, so the law-agnostic
 # skeleton calls them unconditionally.

@@ -1,0 +1,15 @@
+# Ruff — science-tuned: correctness linting, not style.
+#   ruff check .          # report
+#   ruff check --fix .    # apply safe fixes (e.g. remove unused imports)
+#
+# Pyflakes (F) is the high-signal half: unused imports/variables, undefined
+# names, redefinitions. Add "B" (likely-bug patterns) or "I" (import sorting)
+# if you want more. Style rules stay off (deliberate compact `a; b` / `if x: y`
+# and single-letter physics vars), so they never nag even if you pull in E.
+line-length = 110
+target-version = "py312"                                # minimum supported Python
+extend-exclude = ["**/archive/**", "**/_archive/**"]    # don't lint frozen code
+
+[lint]
+select = ["F"]
+ignore = ["E701", "E702", "E741", "E501", "E401"]

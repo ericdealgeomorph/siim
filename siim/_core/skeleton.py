@@ -25,7 +25,7 @@ from .routing import _priority_flood_eps, _levels_sfr, _levels_dinf
 @numba.njit(cache=True)
 def _flot_factor(zs, H, bl, hc_over_H, ramp):
     """Waterline-flotation factor f in [0, 1] multiplying glacial erosion
-    (the effective-pressure ramp; docs/dev/soft_gate_probe.md)::
+    (the effective-pressure ramp described in ``docs/guides/concepts.md``)::
 
         f = clip((zs - bl) / (ramp*hc_over_H*H), 0, 1)
 
@@ -48,8 +48,7 @@ def _flot_factor(zs, H, bl, hc_over_H, ramp):
 @numba.njit(cache=True)
 def _implicit_border_step(zb0, U, E, dt, H, hc_over_H, bl, ramp):
     """Closed-form backward-Euler step of the border-bed budget
-    dzb/dt = U - f(zb)*E, with f the flotation ramp evaluated at the NEW bed
-    (docs/dev/outflow_implicit_budget.md)::
+    dzb/dt = U - f(zb)*E, with f the flotation ramp evaluated at the NEW bed::
 
         g(z) = z - zb0 - (U - f(z)*E)*dt
         f(z) = clip((z + hc*H - bl) / (ramp*hc*H), 0, 1)
@@ -254,7 +253,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
     and 0.0 for the inactive-law constants, which reach only the unused
     dispatch branch.
 
-    Base-level ice border = OUTFLOW (docs/dev/boundary_conditions.md): the domain
+    Base-level ice border = OUTFLOW: the domain
     edge is an arbitrary cut through a continuing glacier. A through-flowing
     border gets zero-gradient thickness ``H_border = H_dominant_donor`` (the
     max-ice-flux interior donor), and its bed keeps eroding by the IMPLICIT
@@ -383,7 +382,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
         if ice_flux[i] <= 0.0 or H_flat[i] < 0.0 or H_flat[i] != H_flat[i]:
             H_flat[i] = 0.0
 
-    # --- 3. Build z' = zb + H and lake-fill in place via stack walk.
+    # --- 3. Build z' = zb + hc_over_H*H and lake-fill in place via stack walk.
     # An ICE-FREE border presents the WATER LINE max(.., bl) BEFORE the fill
     # (rho_i = rho_w: a still-water border below the datum is open water), so
     # the fill propagates the waterline across the submerged connected reach —
@@ -435,7 +434,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
             zb_flat[i] -= delta
 
     # --- 5b. Border bed at base-level outlets (OUTFLOW BC): the IMPLICIT
-    # BORDER BUDGET (docs/dev/outflow_implicit_budget.md). An icy border bed
+    # BORDER BUDGET. An icy border bed
     # keeps ERODING — dzb/dt = U − f·E with E the glacial law on the ARRIVAL
     # slope (the interior flow slope one cell inside: the dominant donor's own
     # upstream surface slope, floored at S_FLOOR_BC — the ~0 local slope of
@@ -472,8 +471,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
         elif zb_flat[i] < bl:
             zb_flat[i] = min(zb_flat[i] + border_bed_uplift[i] * dt, bl)
 
-    # --- 6. Output surface = zb + hc_over_H*H — the TRUE state everywhere
-    # (true-state output convention, docs/dev/boundary_conditions.md): a relict
+    # --- 6. Output surface = zb + hc_over_H*H — the TRUE state everywhere: a relict
     # drowned border bed shows through below bl, an icy through-flowing (outflow)
     # border stands at its true surface, and interior trough cells present their
     # drowned bed (mass balance melts at the real deep elevation, ice flux dies

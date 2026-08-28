@@ -12,6 +12,9 @@ proved the two orchestrations bit-for-bit on identical configs — so this gate
 asserts ``np.array_equal`` (the strongest that holds; the plan's rtol=1e-9
 floor is subsumed) on elevation + ice thickness at every output frame.
 """
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 
@@ -31,6 +34,21 @@ _P = dict(
     mode='B', trunk_surface=False, routing_relax=0.0,
     boundary_status=['fixed_value', 'fixed_value', 'looped', 'looped'],
     initial_max_elevation=800, progress_bar=False)
+
+
+def test_adapter_import_does_not_patch_xarray_process_wide(tmp_path):
+    """Importing the optional adapter must not rewrite private xarray APIs."""
+    code = """
+from xarray.core import utils
+
+original = utils.did_you_mean
+import siim.fastscape  # noqa: F401
+assert utils.did_you_mean is original
+"""
+    result = subprocess.run(
+        [sys.executable, '-c', code], cwd=tmp_path,
+        capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize('routing', ['single', 'dinf'])

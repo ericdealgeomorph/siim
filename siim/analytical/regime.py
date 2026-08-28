@@ -27,9 +27,11 @@ solves per point in physical units:
           & L_t' > 1 \text{ (glacial)}
    \end{cases}
 
-with :math:`r = (1-d\phi)/(1+\phi)` and :math:`\kappa_c = (k+d\sigma)/k`.
-The two branches join continuously at :math:`L_t' = 1`. The shape functions
-are evaluated through the analytically continued incomplete beta of
+with :math:`r = (1-d\phi)/(1+\phi)` and
+:math:`\kappa_c = 1/(1-\lambda)`. For the default exponent-derived
+:math:`\lambda`, :math:`\kappa_c = (k+d\sigma)/k`. The two branches join
+continuously at :math:`L_t' = 1`. The shape functions are evaluated through
+the analytically continued incomplete beta of
 :mod:`siim.analytical.core`, so the marginal-Coulomb case
 :math:`d\phi = 1` (and :math:`d\theta = 1`) needs no special casing — the
 kernel's exact ``b = 0`` logarithmic branch reproduces the
@@ -110,7 +112,9 @@ class RegimeMap:
     Attributes
     ----------
     kappa_c : float
-        Critical steepness ratio :math:`(k + d\sigma)/k = 1/(1-\lambda)`.
+        Critical steepness ratio :math:`1/(1-\lambda)`. With the default
+        exponent-derived :math:`\lambda`, this is
+        :math:`(k + d\sigma)/k`.
     alpha : float
         Geometric cutoff factor :math:`G(x_o')/F(x_o')` — the slope of the
         cold (fully-glaciated) regime boundary :math:`Y = \alpha\kappa/\kappa_c`.
@@ -158,11 +162,14 @@ class RegimeMap:
         self.dtheta = self.d * self.theta
         self.dphi = self.d * self.phi
         self.r = (1.0 - self.dphi) / (1.0 + self.phi)
-        self.kappa_c = (self.k + self.d * self.sigma) / self.k
         self.lam = (float(lam) if lam is not None
                     else self.d * self.sigma / (self.d * self.sigma + self.k))
         if not 0.0 <= self.lam < 1.0:
             raise ValueError(f'lam must be in [0, 1), got {self.lam}')
+        # Preserve the exponent-derived default exactly, while allowing an
+        # explicit AAR-like ratio to define the corresponding closure scale.
+        self.kappa_c = ((self.k + self.d * self.sigma) / self.k
+                        if lam is None else 1.0 / (1.0 - self.lam))
 
         # beta-kernel shape parameters of G
         self._a = 1.0 - self.phi

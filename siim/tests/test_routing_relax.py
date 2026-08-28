@@ -1,6 +1,6 @@
 """Routing-surface EMA relaxation (the ``routing_relax`` flag).
 
-Gates for the anti-flicker design in ``docs/dev/step_flicker.md``: the mode-B/C
+Gates for the anti-flicker routing design: the mode-B/C
 surf2erode routing + mass-balance surface is built from an EMA-relaxed lagged
 thickness ``H_eff = r*H_eff_prev + (1-r)*H_lag`` instead of the raw lagged H,
 damping the discrete-D8 per-step planview ice flicker (a cosmetic period-2
@@ -26,7 +26,7 @@ def _run_under_both_drivers(both_drivers):
 # Flicker-reduction regime: a small fluvial-warmed valley landscape glaciated
 # to ~50% coverage, where near-ELA D8 receiver flips produce the period-2 ice
 # flicker (lag-2 mask Jaccard > lag-1). Ko is raised so the warmup relief lands
-# near the ELA on a fast grid (see docs/dev/step_flicker.md probes).
+# near the ELA on a fast grid.
 # ---------------------------------------------------------------------------
 _NX, _NY, _DX = 71, 41, 500.0
 _FBASE = dict(

@@ -3,7 +3,8 @@ stored model field (bedrock, ice, ...).
 
 Registry-driven: adding a field is one entry in ``FIELD_REGISTRY`` (the data is
 always stored). No smoothing / hillshade / sub-grid ice — that is
-``landscape``. See docs/dev/plotting_plan.md.
+``landscape``. See ``docs/guides/outputs_and_io.md`` for the public plotting
+contract.
 
 ("field" here is *which stored variable* to draw — the ``field=`` argument and
 ``FIELD_REGISTRY`` — distinct from the ``map`` method that draws it.)

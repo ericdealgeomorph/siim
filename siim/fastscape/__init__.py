@@ -13,8 +13,10 @@ that drop into fastscape's ``basic_model`` once its stock
         glacial_processes(mode='B'))
 
 For the full coupled model with forcing, I/O and plotting, use
-:class:`siim.siim2d.siim` instead — it assembles its model from exactly this
-:func:`glacial_processes` call, so the two never diverge.
+:class:`siim.siim2d.siim` instead. Its default in-house driver calls the shared
+framework-free numerical core directly; its optional ``driver='xsimlab'`` path
+assembles these process classes. The two paths share the same law parameters
+and step kernels and are kept aligned by driver-conformance tests.
 
 Implementation lives in submodules: the glacial ``@xs.process`` classes in
 :mod:`siim.fastscape.processes`, and two reusable generic forcing processes
@@ -81,57 +83,6 @@ __all__ = [
 ]
 
 
-def _silence_xarray_did_you_mean():
-    """Neuter xarray's fuzzy 'did you mean ...?' KeyError suggestion builder.
-
-    xsimlab 0.5.0's per-step driver probes the run dataset with ``ds[key]`` for
-    ~35 keys per step that are NOT in the dataset. Each miss hits
-    ``Dataset.__getitem__``'s ``except KeyError`` path, which eagerly builds a
-    :func:`difflib.get_close_matches` suggestion *before* re-raising — ~0.24
-    ms/step (0.2-2.4% of a real run; audit N33). xsimlab immediately catches
-    and discards that KeyError, so the suggestion string is never surfaced on
-    the hot path.
-
-    We replace only ``xarray.core.utils.did_you_mean`` with a no-op returning
-    ``""``. Effect is confined to the *content* of a KeyError message for a
-    genuinely-missing variable: it still says "No variable named X" (and, per
-    xarray's own fallback, lists the available variables), just without the
-    fuzzy "did you mean?" hint. Idempotent and reversible; a no-op if xarray's
-    internals move. Measured ~22% faster per step on a small grid.
-    """
-    try:
-        from xarray.core import utils as _xr_utils
-    except Exception:
-        return
-    if getattr(_xr_utils, '_siim_did_you_mean_silenced', False):
-        return
-    _xr_utils._siim_did_you_mean_orig = _xr_utils.did_you_mean
-    _xr_utils.did_you_mean = lambda *args, **kwargs: ""
-    _xr_utils._siim_did_you_mean_silenced = True
-
-
-_silence_xarray_did_you_mean()
-
-
-def _silence_xsimlab_drop_futurewarning():
-    """Suppress the ``dropping variables using `drop` is deprecated``
-    FutureWarning that xsimlab 0.5.0 (frozen upstream) triggers on every run
-    (``stores.write_input_xr_dataset`` + the step-clock setup in ``drivers``
-    both call xarray's long-deprecated ``Dataset.drop``). Modern xarray
-    escalated the warning to FutureWarning ahead of removing the method —
-    third-party noise, not siim's to fix; ``environment.yml`` freezes xarray
-    below the removal (the same quarantine class as numpy<2). Scoped to
-    warnings raised FROM xsimlab so siim's own deprecations still surface.
-    Sibling of the ``did_you_mean`` neutering above (audit N33)."""
-    import warnings
-    warnings.filterwarnings(
-        "ignore", message="dropping variables using",
-        category=FutureWarning, module="xsimlab")
-
-
-_silence_xsimlab_drop_futurewarning()
-
-
 def glacial_processes(*, mode='B', carve=None, routing='single',
                       router_backend=None,
                       flexure=False, sediment=False, trunk_surface=False,
@@ -143,9 +94,10 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
         basic_model.drop_processes(['spl', 'drainage']).update_processes(
             glacial_processes(...))
 
-    or use :func:`glacial_model`, which does exactly that. This is siim's single
-    source of truth for process assembly — :class:`siim.siim2d.siim` builds its
-    model from this same function.
+    or use :func:`glacial_model`, which does exactly that. The optional
+    ``driver='xsimlab'`` path of :class:`siim.siim2d.siim` builds its model from
+    this function; the default in-house driver consumes the same shared law
+    records and numerical kernels without xsimlab.
 
     This facade stays EXPLICIT: every flag defaults off, with no mode-resolved
     magic (standalone fastscape users opt in by hand). The mode-C standard —
@@ -163,9 +115,11 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
         explicit ``carve=False`` contradicts it). Case-insensitive.
     carve : bool, optional
         Mode-B sub-grid glacier-width carving — wires :class:`GlacialSPLModeC`
-        (the citizen bed+H class plus the carve). Ignored for ``mode='A'``.
-        Defaults off here so the advertised default is the plain Mode-B citizen;
-        note :class:`siim.siim2d.siim` defaults carving *on*. ``mode='C'`` is the
+        (the citizen bed-and-thickness class plus the carve). Ignored for
+        ``mode='A'``.
+        Defaults off here so the advertised default is the plain Mode-B citizen.
+        :class:`siim.siim2d.siim` defaults to Mode C, which enables carving;
+        explicit Mode B leaves it off unless requested. ``mode='C'`` is the
         alias for turning it on.
     trunk_surface : bool, optional
         Fabricated trunk-surface routing (mode B/C) — swaps in
@@ -180,7 +134,7 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
         ``'inhouse_d8'`` — siim's numba :class:`D8FlowRouter` — is the only
         accepted value since the 0.9.1 standalone flip (the fortran
         ``SingleFlowRouter`` wiring was retired); the parameter is the
-        router-contract plug point (``docs/dev/router_contract.md``) for
+        router-contract plug point for
         future backends. Only affects ``routing='single'`` — the D-inf
         directions + mask + basin ride the same in-house contract.
     flexure, sediment : bool, optional
@@ -260,11 +214,19 @@ def glacial_model(*, mode='B', carve=None, routing='single', router_backend=None
     full coupled model with forcing, I/O and plotting, use
     :class:`siim.siim2d.siim` instead.
     """
-    return (basic_model
-            .drop_processes(['spl', 'drainage'])
-            .update_processes(glacial_processes(
-                mode=mode, carve=carve, routing=routing,
-                router_backend=router_backend,
-                flexure=flexure, sediment=sediment,
-                trunk_surface=trunk_surface,
-                numerics_backend=numerics_backend)))
+    # The frozen xsimlab stack emits an xarray ``Dataset.drop`` deprecation
+    # while composing the model. Keep third-party warning suppression local to
+    # this SIIM-owned call instead of changing the process-wide warnings state.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="dropping variables using",
+            category=FutureWarning, module="xsimlab")
+        return (basic_model
+                .drop_processes(['spl', 'drainage'])
+                .update_processes(glacial_processes(
+                    mode=mode, carve=carve, routing=routing,
+                    router_backend=router_backend,
+                    flexure=flexure, sediment=sediment,
+                    trunk_surface=trunk_surface,
+                    numerics_backend=numerics_backend)))

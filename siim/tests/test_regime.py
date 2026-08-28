@@ -21,13 +21,13 @@ L_DIM = 5.0e4   # m, arbitrary dimensional anchor
 KS_DIM = 300.0  # fluvial steepness anchor
 
 
-def _profile_from_nondim(rm, kappa, Y, L=L_DIM, ks=KS_DIM):
+def _profile_from_nondim(rm, kappa, Y, L=L_DIM, ks=KS_DIM, lam=None):
     """Map a nondim (kappa, Y) point onto a dimensional GeneralProfile."""
     zfo = ks * L ** (1.0 - rm.dtheta) * rm.F_xo
     cs = kappa * ks * L ** (1.0 - rm.dtheta - rm.r)
     return GeneralProfile(ks=ks, cs=cs, zELA=Y * zfo, L=L, xo=rm.xo * L,
                           d=rm.d, sigma=rm.sigma, phi=rm.phi,
-                          theta=rm.theta, k=rm.k)
+                          theta=rm.theta, k=rm.k, lam=lam)
 
 
 def _stable_glaciated(profile):
@@ -81,17 +81,50 @@ def test_closure_derivative_matches_finite_difference():
 # Agreement with the dimensional profile classes
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('params', [MARGINAL, GENERAL],
-                         ids=['marginal', 'general'])
-def test_pointwise_agreement_with_general_profile(params):
-    rm = RegimeMap(**params)
+def test_default_and_overridden_lam_define_kappa_c_consistently():
+    params = GENERAL
+    expected_default = (params['k'] + params['d'] * params['sigma']) / params['k']
+
+    rm_default = RegimeMap(**params)
+    gp_default = _profile_from_nondim(rm_default, kappa=0.6, Y=0.6)
+    assert rm_default.kappa_c == expected_default
+    assert gp_default.kappa_c == expected_default
+
+    lam = 0.2  # deliberately distinct from the exponent-derived value
+    expected_override = 1.0 / (1.0 - lam)
+    rm = RegimeMap(**params, lam=lam)
+    gp = _profile_from_nondim(rm, kappa=0.6, Y=0.6, lam=lam)
+    assert rm.lam == gp.lam == lam
+    assert rm.kappa_c == gp.kappa_c == expected_override
+    assert f'kappa_c={expected_override:.3f}' in repr(gp)
+
+
+def test_overridden_lam_closure_agrees_with_general_profile():
+    lam = 0.2
+    kappa = 0.7
+    rm = RegimeMap(**GENERAL, lam=lam)
+    gp = _profile_from_nondim(rm, kappa=kappa, Y=0.6, lam=lam)
+
+    # Exercise both sides of the mixed/fully-glaciated seam. These are two
+    # independently implemented forms of the same nondimensional closure.
+    Lt_nd = np.array([0.02, 0.2, 0.8, 1.0, 1.5, 4.0])
+    map_closure = rm.closure_Y(Lt_nd, kappa)
+    profile_closure = gp._zELA_of_Lt(Lt_nd * gp.L) / gp.zfo
+    np.testing.assert_allclose(map_closure, profile_closure, rtol=2e-13,
+                               atol=2e-15)
+
+@pytest.mark.parametrize(('params', 'lam'),
+                         [(MARGINAL, None), (GENERAL, None), (GENERAL, 0.2)],
+                         ids=['marginal', 'general', 'general-lam-override'])
+def test_pointwise_agreement_with_general_profile(params, lam):
+    rm = RegimeMap(**params, lam=lam)
     kappas = [0.2, 0.6, 0.9 * rm.kappa_c, 1.2 * rm.kappa_c]
     Ys = [0.25, 0.6, 0.9, 1.05]
     n_glaciated = 0
     n_fluvial = 0
     for kappa in kappas:
         for Y in Ys:
-            p = _profile_from_nondim(rm, kappa, Y)
+            p = _profile_from_nondim(rm, kappa, Y, lam=lam)
             assert np.isclose(p.kappa, kappa, rtol=1e-12)
             ref = _stable_glaciated(p)
             Lt_nd = float(rm.Lt(kappa, Y))
@@ -352,6 +385,8 @@ def test_validation_errors():
         RegimeMap(k=0.0)
     with pytest.raises(ValueError, match='Lt_max'):
         RegimeMap(Lt_max=0.5)
+    with pytest.raises(ValueError, match='lam'):
+        RegimeMap(lam=1.0)
     rm = RegimeMap()
     with pytest.raises(ValueError, match='branch'):
         rm.Lt(0.5, 0.5, branch='hot')

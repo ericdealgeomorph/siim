@@ -134,7 +134,11 @@ class GlacialLaw:
     n  = xs.variable(default=_constants.N_FLUVIAL,     description='Fluvial slope exponent')
     nu = xs.variable(default=_constants.NU,     description='Glacial slope exponent')
     m  = xs.variable(default=None,  description='Fluvial area exponent (default n/2)')
-    mu = xs.variable(default=None,  description='Glacial area exponent (default derived from nu: coulomb nu/2, power/eff-exp 4*nu/15)')
+    mu = xs.variable(
+        default=None,
+        description="Glacial flux exponent override. Used by the effective-"
+                    "exponent law; the exact power and Coulomb kernels derive "
+                    "their flux exponents from nu/ell and do not consume it.")
 
     # --- Ice rheology parameters ---
     Ac       = xs.variable(default=_constants.AC, description="Glen's flow-law coefficient A (deformation prefactor 2A/5 applied internally)")
@@ -156,9 +160,12 @@ class GlacialLaw:
 
     def initialize(self):
         self.params = build_glacial_params(
-            self.sliding_law, self.Ko, self.ce, self.n, self.nu, self.m,
-            self.mu, self.Ac, self.alpha_g, self.lambda_p, self.lambda_c,
-            self.tau_c, self.coulomb_clamp, self.hc_over_H, self.H_diffusivity)
+            sliding_law=self.sliding_law, Ko=self.Ko, ce=self.ce,
+            n=self.n, nu=self.nu, m=self.m, mu=self.mu, Ac=self.Ac,
+            alpha_g=self.alpha_g, lambda_p=self.lambda_p,
+            lambda_c=self.lambda_c, tau_c=self.tau_c,
+            coulomb_clamp=self.coulomb_clamp, hc_over_H=self.hc_over_H,
+            H_diffusivity=self.H_diffusivity)
 
 
 @xs.process
@@ -266,9 +273,9 @@ class GlacialSPLBase:
     # was an inert no-op on the public surface and was removed; audit m40.)
     border_bed_uplift = xs.variable(dims=[(), ('y', 'x')], default=0.0, description='Mode B: uplift rate (m/yr) applied to the bed at base-level borders — the U in the icy border budget (net U - f*E on the arrival slope, implicitly integrated) and the rate of the ice-free post-glacial recovery toward bl. Scalar or (y, x) field; time-varying via the clock like uplift__rate. The siim2d wrapper passes its tectonic U (local, per-step) by default; 0 freezes the ice-free bed')
     bl = xs.variable(dims=[()], default=_constants.BL, description="Mode B base level: the water-line (Dirichlet) datum (m). Scalar or a length-nt series on the clock (like zELA); per-step it floors the ice-free-border erosion working view + lake-fill seed, sets the ice-free recovery threshold, and is the flotation reference. Default constants.BL = 0 (bit-for-bit with the historical hard-coded datum).")
-    flotation_gate = xs.variable(default=_constants.FLOTATION_GATE, description="Mode B global waterline-flotation gate (default constants.FLOTATION_GATE = True): grounded <=> zs = zb + hc*H >= bl (rho_i = rho_w). Interior: a sub-waterline icy cell does reduced/no glacial erosion (and, via E_c <= 0, carves nothing). Border: the ramp is the physical bound inside the closed-form IMPLICIT border budget (the bed digs on the arrival slope to the flotation-draft equilibrium zb* = bl - hc*H + delta*U/E). False un-bounds the border (f == 1, measured runaway) — diagnostics only. See docs/dev/boundary_conditions.md.")
-    flotation_ramp = xs.variable(default=_constants.FLOTATION_RAMP, description="Flotation-ramp width gamma (default constants.FLOTATION_RAMP = 0.1): the flotation gate is the effective-pressure ramp — glacial erosion is multiplied by f = clip((zs - bl)/(gamma*hc*H), 0, 1), with f = 0 exactly for zs <= bl. At the border the ramp is solved implicitly (closed form) inside the border budget, giving the draft equilibrium with standoff gamma*hc*H*U/E. 0 = the hard binary gate (interior bit-for-bit; at the border the flotation sliding mode). Safe ceiling 0.2 (wide ramps can dome cap=False configs). Only active when flotation_gate is on. See docs/dev/soft_gate_probe.md + docs/dev/outflow_implicit_budget.md.")
-    parallel_erode = xs.variable(default=_constants.PARALLEL_ERODE, description="Mode-B parallel-eroder toggle (default constants.PARALLEL_ERODE = True): run the erosion step level-scheduled across threads (topological levels of the flow graph; nodes within a level are independent). BIT-FOR-BIT identical to the serial eroder at any thread count (disjoint writes, identical per-node arithmetic; pinned by test_parallel_erode) — a pure scheduling change. False = the serial eroder. See docs/dev/perf_audit.md.")
+    flotation_gate = xs.variable(default=_constants.FLOTATION_GATE, description="Mode B global waterline-flotation gate (default constants.FLOTATION_GATE = True): grounded <=> zs = zb + hc*H >= bl (rho_i = rho_w). Interior: a sub-waterline icy cell does reduced/no glacial erosion (and, via E_c <= 0, carves nothing). Border: the ramp is the physical bound inside the closed-form IMPLICIT border budget (the bed digs on the arrival slope to the flotation-draft equilibrium zb* = bl - hc*H + delta*U/E). False un-bounds the border (f == 1, measured runaway) — diagnostics only. See docs/guides/concepts.md.")
+    flotation_ramp = xs.variable(default=_constants.FLOTATION_RAMP, description="Flotation-ramp width gamma (default constants.FLOTATION_RAMP = 0.1): the flotation gate is the effective-pressure ramp — glacial erosion is multiplied by f = clip((zs - bl)/(gamma*hc*H), 0, 1), with f = 0 exactly for zs <= bl. At the border the ramp is solved implicitly (closed form) inside the border budget, giving the draft equilibrium with standoff gamma*hc*H*U/E. 0 = the hard binary gate (interior bit-for-bit; at the border the flotation sliding mode). Safe ceiling 0.2 (wide ramps can dome cap=False configs). Only active when flotation_gate is on. See docs/guides/concepts.md.")
+    parallel_erode = xs.variable(default=_constants.PARALLEL_ERODE, description="Mode-B parallel-eroder toggle (default constants.PARALLEL_ERODE = True): run the erosion step level-scheduled across threads (topological levels of the flow graph; nodes within a level are independent). BIT-FOR-BIT identical to the serial eroder at any thread count (disjoint writes, identical per-node arithmetic; pinned by test_parallel_erode) — a pure scheduling change. False = the serial eroder.")
     carve_width = xs.variable(default=True, description='Mode B only (ValueError otherwise; default True): carve the sub-grid glacier footprint (union of discs of width alpha_g*H around glaciated cells; power-diagram attribution) into the bed. Footprint cells — bare AND icy, INCLUDING terrain above the ice (ridge-eating = channel capture; no surface gate) — descend toward the parabola hung from the source ice surface: rim at zs = zb + HC_OVER_H*H, floor at the source bed. Self-attribution: target = own bed, a structural no-op')
     widening_rate = xs.variable(default=_constants.DEFAULT_WIDENING_RATE, description="Sub-grid widening rate eta = (E_widening - E_c)/E_c >= 0 (dimensionless): the footprint descends at E_widening = (1 + eta)*E_c, i.e. eta centerline-incision-rates of excess over the centerline incision E_c (0 = no net widening, footprint eaten at the channel rate; 1 = widen at the incision rate). None / inf / 'inf' / 'infinity' (any case) = instant U-imposition. Negative is rejected (use carve_width=False to disable).")
 
@@ -420,7 +427,8 @@ class GlacialSPLModeB(GlacialSPLBase):
 
 @xs.process
 class GlacialSPLModeC(GlacialSPLModeB):
-    """Mode C erosion: the citizen mode-B bed+H class (:class:`GlacialSPLModeB`)
+    """Mode C erosion: the citizen mode-B bed-and-thickness class
+    (:class:`GlacialSPLModeB`)
     plus the sub-grid glacier-width carve. Fills the ``glacial_spl`` slot for
     ``mode == 'B'`` with ``carve_width`` on (the default siim2d path).
 
@@ -511,8 +519,8 @@ class GlacialSurfaceToErode(SurfaceAfterTectonics):
     law record via :class:`GlacialLaw`. (A pre-uplift climate variant
     ``topo + hc_over_H*H`` is deferred to Phase 3.)
 
-    Anti-flicker relaxation (``routing_relax`` = r; design record
-    ``docs/dev/step_flicker.md``): the once-per-step H -> zs -> D8-receivers ->
+    Anti-flicker relaxation (``routing_relax`` = r): the once-per-step
+    H -> zs -> D8-receivers ->
     flux -> closure-H loop lags by one step and D8 receiver choice is discrete,
     so near-tied surfaces flip whole subtrees of flux each step and H ~ Q^(1/4..
     1/5) turns those O(1) swaps into a period-2 ice-thickness slosh (a cosmetic
@@ -521,7 +529,7 @@ class GlacialSurfaceToErode(SurfaceAfterTectonics):
     ``H_eff(t) = r*H_eff(t-1) + (1-r)*H_lag(t)`` (seeded ``H_eff(0) = H_lag``)
     instead of the raw lagged H. r = 0 (default) uses the raw H, bit-for-bit.
 
-    Firewall (the runaway lesson, ``docs/dev/flux_consolidation.md``): the
+    State-separation firewall: the
     relaxed H reaches ONLY this provider's elevation, which feeds ONLY the flow
     router graph and :class:`GlacialFlowAccumulator`'s mass-balance surface. The
     mode-B kernel reconstructs its own ``zs = zb + hc*H`` from the tracked bed +
@@ -562,8 +570,7 @@ class GlacialSurfaceToErode(SurfaceAfterTectonics):
 
 @xs.process
 class TrunkSurfaceToErode(GlacialSurfaceToErode):
-    """Fabricated trunk-surface routing (mode B/C, opt-in ``trunk_surface``;
-    design record ``docs/dev/trunk_surface_routing.md``).
+    """Fabricated trunk-surface routing (mode B/C, opt-in ``trunk_surface``).
 
     A trunk glacier of mean thickness H occupies width ``W = alpha_g*H`` —
     routinely several cells — but the flow graph carries its ice down 2-3
@@ -594,7 +601,7 @@ class TrunkSurfaceToErode(GlacialSurfaceToErode):
     taking a max with it would re-erect a spine). Outside footprints the surface
     is the dynamic ``zb + hc*H`` unchanged.
 
-    Discipline (the runaway lesson, ``docs/dev/flux_consolidation.md``): the
+    State-separation rule: the
     fabricated surface reaches ONLY the flow router (graph) and the accumulator's
     mass-balance surface. The mode-B kernel is UNTOUCHED — it uses the router's
     receiver graph but reconstructs its own ``zs = zb + hc*H`` for every closure
@@ -735,7 +742,7 @@ class GlacialFlexure(Flexure):
 
     The plate solve, densities, boundary handling and rebound feedback are inherited
     unchanged. The ice LOAD is applied everywhere ice is present, including afloat cells
-    (zs = zb + hc*H < bl): the waterline-flotation gate (docs/dev/boundary_conditions.md)
+    (zs = zb + hc*H < bl): the waterline-flotation gate
     gates glacial EROSION, not the flexural load. This is an accepted secondary seam —
     the ice mass is physically present regardless of grounding, and a true floating-shelf
     load would be reduced by the water it displaces; siim's overdeepenings sit right at
@@ -865,7 +872,7 @@ class D8FlowRouter(_InhouseRouterShell):
     lengths, all-ones weights / nb_receivers, outlet-first stack) via
     :func:`siim._core.step.route_d8` on the eps-filled surface; basin labeled by
     outlet index. The routing delta vs the fortran SFR is confined to
-    depression/tie cells (behavioral/attractor gate); ``docs/dev/router_contract.md``."""
+    depression/tie cells (behavioral/attractor gate)."""
 
     def _route(self):
         return route_d8(self.elevation, self.shape, self.dx, self.dy,
@@ -894,8 +901,8 @@ class DinfFlowRouter(_InhouseRouterShell):
     the mass balance samples real z (flux crossing a deep trough melts at
     the drowned elevation and dies) and the erosion/H kernels clip
     negative true-surface slopes to zero (lake interiors do not erode).
-    Looped boundaries wrap (fill and facet scan both). The citable
-    reference is docs/dev/dinf_routing.md.
+    Looped boundaries wrap (fill and facet scan both). See
+    ``docs/guides/concepts.md`` for the public routing overview.
     """
 
     def _route(self):

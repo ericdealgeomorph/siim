@@ -9,9 +9,10 @@ runs its own in-house time loop and needs none of it (see {doc}`../getting_start
 These snippets require the fastscape stack: `pip install siim[fastscape]`
 gives you `fastscape` + `xsimlab`, but the Fortran backend
 (`fastscapelib-fortran`) that fastscape's stock processes call at run time is
-conda-only (`conda env create -f environment.yml`). Without it,
-`import siim.fastscape` raises a directed `ImportError`. The snippets are not
-executed at build time.
+conda-only (`conda env create -f environment.yml`). Missing `fastscape` or
+`xarray-simlab` makes `import siim.fastscape` raise a directed `ImportError`;
+missing `fastscapelib-fortran` may instead fail when a stock Fastscape process
+first runs. The snippets are not executed at build time.
 
 ## The quickest path
 
@@ -42,8 +43,9 @@ model = (basic_model
          .update_processes(glacial_processes(mode='B', routing='dinf')))
 ```
 
-`glacial_processes()` is the single source of truth siim's own `siim2d` model
-assembles from, so a model you build this way runs exactly the same physics.
+`glacial_processes()` is the composition source of truth for the xsimlab
+adapter. Its process shells and the standalone 2D driver call the same
+framework-free step functions, so a model built this way runs the same physics.
 
 Both helpers take the same options:
 

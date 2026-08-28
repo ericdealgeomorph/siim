@@ -7,8 +7,8 @@ of the cumulative balance integral, equivalent to the paper's b=0-below-terminus
 branch on a chain and to the 2D accumulator's per-hop `max(field_ice, 0)`. The 2D
 accumulator (`_flow_accumulate_sd_2`) was already correct and is untouched.
 
-Evidence for the divergence being fixed: docs/dev/toe_1d2d_parity.md §C.2 — on a
-non-monotone flowline with a proglacial forebulge rising back above the ELA, the
+Evidence for the divergence being fixed: on a non-monotone flowline with a
+proglacial forebulge rising back above the ELA, the
 old 1D suppressed re-nucleation (one icy run) while 2D re-nucleated a second
 glacier (two runs). After the fix the 1D walk re-nucleates too.
 """
@@ -98,8 +98,7 @@ def test_reflect_is_pointwise_clip_on_monotone():
 def test_reflect_matches_2d_per_hop_clip_on_chain():
     """The 1D running clip reproduces the 2D accumulator's per-hop
     max(field_ice, 0) on a linear flow chain: both are the Lindley recursion
-    C_i = max(C_{i-1} + src_i, 0). This is the audit-m2 alignment of the two
-    front ends (docs/dev/toe_1d2d_parity.md §C.2)."""
+    C_i = max(C_{i-1} + src_i, 0). This aligns the two front ends."""
     rng = np.random.default_rng(0)
     src = rng.normal(size=40) * 3.0            # mixed accumulation / ablation
     # 2D chain 0->1->...->n-1 (outlet self-receiving); donor-first is stack[::-1]

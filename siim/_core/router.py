@@ -10,7 +10,8 @@ xsimlab dependency — the numba D8 single-flow producer (:func:`route_d8`) unde
 the retired fortran ``FortranRouter`` counterpart followed the same protocol.
 
 ``numpy``-only; imports only from :mod:`siim._core.step`, so the standalone
-driver stays framework-free (Map 3 §3-§4, ``docs/dev/router_contract.md``).
+driver stays framework-free. See ``docs/guides/concepts.md`` for the public
+routing overview.
 """
 import numpy as np
 
@@ -19,10 +20,11 @@ from .step import route_d8, route_dinf
 
 class RoutingArrays:
     """The router-contract array bundle the accumulator + kernels + carve
-    consume: ``stack`` (outlet-first), ``receivers`` (1D SFR / ``(n, 2)`` D-inf),
+    consume: ``stack`` (outlet-first for single-flow routing, donor-first for
+    D-inf), ``receivers`` (1D single-flow / ``(n, 2)`` D-inf),
     ``nb_receivers``, ``weights``, ``lengths``, and the diagnostic ``basin``
-    ``(ny, nx)`` int. The duck type any routing backend hands the driver
-    (the router-contract seam)."""
+    ``(ny, nx)`` int. The duck type any routing backend hands the driver (the
+    router-contract seam)."""
 
     __slots__ = ("stack", "receivers", "nb_receivers", "weights", "lengths",
                  "basin")

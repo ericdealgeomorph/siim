@@ -1,12 +1,12 @@
 """S2 twin gate: in-house ADI hillslope diffusion == fortran ``fs.diffusion``.
 
-The in-house numba ADI (:func:`siim._core.hillslope.diffuse`) is a direct port
-of fastscapelib-fortran ``Diffusion.f90`` (v2.8.4). For the spatially-uniform
-``kd`` (scalar ``D``) siim uses it is the IDENTICAL float64 tridiagonal sequence
-the fortran runs, so the two agree bit-for-bit. This drives the fortran through
-the exact context ops the stock ``LinearDiffusion`` process uses (set ``kd`` /
-``kdsed=-1`` / ``h`` / ``dt`` in the fortran context, call ``fs.diffusion()``,
-read ``h`` back) and diffs against the in-house solve.
+The in-house numba ADI (:func:`siim._core.hillslope.diffuse`) matches the
+fastscapelib-fortran ``Diffusion.f90`` (v2.8.4) stencil while using an
+independently expressed Thomas recurrence. For the spatially-uniform ``kd``
+(scalar ``D``) siim uses, the two agree bit-for-bit. This drives the fortran
+through the exact context ops the stock ``LinearDiffusion`` process uses (set
+``kd`` / ``kdsed=-1`` / ``h`` / ``dt`` in the fortran context, call
+``fs.diffusion()``, read ``h`` back) and diffs against the in-house solve.
 
 Conda-only (needs fastscapelib-fortran).
 """

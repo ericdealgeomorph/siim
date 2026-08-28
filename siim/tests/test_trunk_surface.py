@@ -1,6 +1,6 @@
 """Fabricated trunk-surface routing (the ``trunk_surface`` flag).
 
-Gates for the design in ``docs/dev/trunk_surface_routing.md``: routing +
+Regression gates for fabricated trunk-surface routing:
 accumulation on a fabricated ice surface (linear cross-valley dip toward the
 centerline) converge trunk flow onto the centerline chain, so the centerline's
 RAW flux is the full cross-section discharge — consolidation by routing, not the
@@ -122,7 +122,7 @@ def test_capture_grows_toward_the_toe():
 # (eps-fill + facet, as DinfFlowRouter does) and accumulate a uniform ice
 # input. Measured mid-trunk centerline capture ~= 0.76 (>= the 0.7 bless
 # threshold) -> the combo is BLESSED (no guard); pinned by a floor regression
-# with headroom below the measured value. See docs/dev/trunk_surface_routing.md.
+# with headroom below the measured value.
 # ---------------------------------------------------------------------------
 def _capture_dinf(zb, H, jc, dx, k_dip=0.6, alpha_g=10.0, col=8):
     """trunk_surface centerline capture under the D-infinity router."""
