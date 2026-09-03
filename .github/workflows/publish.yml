@@ -1,0 +1,56 @@
+# Publishes the sdist and wheel to PyPI via trusted publishing (OIDC): PyPI
+# trusts this exact workflow file in ericdealgeomorph/siim (environment
+# `pypi`), so no long-lived credential is stored anywhere. Runs when a release
+# tag is pushed; workflow_dispatch covers publishing a tag that predates this
+# workflow. The full test and private-path inspection gates live in ci.yml and
+# tools/export_public.sh — this workflow only rebuilds, sanity-checks, and
+# uploads. PyPI releases are immutable: a version can be yanked, never
+# replaced.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Refuse a tag that does not match the packaged version
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          test "v$version" = "$GITHUB_REF_NAME" \
+            || { echo "tag $GITHUB_REF_NAME does not match version $version" >&2; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write # the OIDC exchange with PyPI; nothing else
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
