@@ -53,7 +53,7 @@ model.plot.landscape(i=-1)             # final topography
 
 The 1D model (`from siim.siim1d import siim`) and the analytical solutions
 (`from siim.analytical import GeneralProfile`) follow the same shape. See the
-[documentation](https://github.com/ericdealgeomorph/siim/tree/main/docs) for the full parameter reference,
+[documentation](https://siim.readthedocs.io) for the full parameter reference,
 guides, and the theory background.
 
 ## Citing

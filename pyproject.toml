@@ -80,7 +80,7 @@ dev-parity = ["fastscapelib"]
 
 [project.urls]
 Homepage = "https://github.com/ericdealgeomorph/siim"
-Documentation = "https://github.com/ericdealgeomorph/siim/tree/main/docs"
+Documentation = "https://siim.readthedocs.io"
 Repository = "https://github.com/ericdealgeomorph/siim"
 Issues = "https://github.com/ericdealgeomorph/siim/issues"
 Changelog = "https://github.com/ericdealgeomorph/siim/blob/main/CHANGELOG.md"
