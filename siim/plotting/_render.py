@@ -895,34 +895,72 @@ def _field_ice_mask(H_nat, Y, X, sigma, H_threshold):
     return field > thr
 
 
-def _clean_ice_mask(mask, min_native_cells, oversample):
+def _label_looped(mask, wrap_y, wrap_x):
+    """``scipy.ndimage.label`` made seam-aware: components that touch both
+    seams of a looped axis are merged into one (union-find over the seam
+    pairs). The returned labels are then non-contiguous, which the
+    ``bincount``/``isin`` bookkeeping in :func:`_clean_ice_mask` does not care
+    about. With neither axis looped this is plain ``label``."""
+    from scipy.ndimage import label
+    lab, n = label(mask)
+    if not n or not (wrap_y or wrap_x):
+        return lab
+    parent = np.arange(n + 1)
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    seams = []
+    if wrap_x:
+        seams.append((lab[:, 0], lab[:, -1]))
+    if wrap_y:
+        seams.append((lab[0, :], lab[-1, :]))
+    for a, b in seams:
+        both = (a > 0) & (b > 0)
+        for u, v in zip(a[both], b[both]):
+            ru, rv = find(int(u)), find(int(v))
+            if ru != rv:
+                parent[max(ru, rv)] = min(ru, rv)
+    return np.array([find(k) for k in range(n + 1)])[lab]
+
+
+def _clean_ice_mask(mask, min_native_cells, oversample, wrap_y=False,
+                    wrap_x=False):
     """Speckle/hole cleanup of a subgrid ice mask (``min_ice_cells``).
 
     Drops connected ice components smaller than ``min_native_cells`` native cells
     and fills enclosed bare holes smaller than the same, where a native cell is
     ``oversample**2`` subgrid pixels. Bare regions touching the array border are
     NEVER filled (open margin / ocean stays open). ``min_native_cells <= 0`` is a
-    no-op. This is display-only cleanup; it does not alter model output."""
+    no-op. This is display-only cleanup; it does not alter model output.
+
+    ``wrap_y``/``wrap_x`` (the model's looped axes) make the cleanup seam-aware:
+    a glacier straddling a looped seam counts — and survives — as ONE component
+    instead of two sub-minimum halves, and a looped edge is not "array border",
+    so a bare hole across the seam is fillable. Both default ``False`` (the
+    plain non-periodic behaviour)."""
     if not min_native_cells or min_native_cells <= 0:
         return mask
-    from scipy.ndimage import label
     minpix = int(min_native_cells) * int(oversample) ** 2
     m = np.asarray(mask, dtype=bool)
     # 1. Remove small ice components.
-    lab, n = label(m)
-    if n:
-        sizes = np.bincount(lab.ravel())
-        m = m & ~np.isin(lab, np.nonzero(sizes < minpix)[0])
-    # 2. Fill small enclosed bare holes — but never a bare region touching the
-    #    array border (that is open margin, not an enclosed hole).
-    lab, n = label(~m)
-    if n:
-        sizes = np.bincount(lab.ravel())
-        border_labs = np.unique(np.concatenate(
-            [lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
-        small = sizes < minpix
-        small[border_labs] = False
-        m = m | np.isin(lab, np.nonzero(small)[0])
+    lab = _label_looped(m, wrap_y, wrap_x)
+    sizes = np.bincount(lab.ravel())
+    m = m & ~np.isin(lab, np.nonzero(sizes < minpix)[0])
+    # 2. Fill small enclosed bare holes — but never a bare region touching a
+    #    non-looped array border (that is open margin, not an enclosed hole).
+    lab = _label_looped(~m, wrap_y, wrap_x)
+    sizes = np.bincount(lab.ravel())
+    edges = ([] if wrap_y else [lab[0], lab[-1]]
+             ) + ([] if wrap_x else [lab[:, 0], lab[:, -1]])
+    small = sizes < minpix
+    small[0] = False                       # label 0 here is the ice, not a hole
+    if edges:
+        small[np.unique(np.concatenate(edges))] = False
+    m = m | np.isin(lab, np.nonzero(small)[0])
     return m
 
 

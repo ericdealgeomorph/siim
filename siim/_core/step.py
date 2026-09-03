@@ -150,17 +150,33 @@ def initial_topography(elevation_init, shape, border_status, seed,
 #     xs.process classes in forcing.py become shells over these, so escarpment's
 #     three override seams work under BOTH the xsimlab and the in-house drivers.)
 # ---------------------------------------------------------------------------
-def plateau_surface(x, y, shape, border_status, seed, noise_amplitude,
-                    plateau_zo, plateau_dz, plateau_frac, plateau_w):
-    """Arctan-smoothed plateau initial topography + tie-breaking noise (zeroed on
-    'fixed_value' edges). Body of ``PlateauSurface.initialize``."""
-    X, _Y = np.meshgrid(x, y)
+def plateau_profile(x, plateau_zo, plateau_dz, plateau_frac, plateau_w):
+    """1-D arctan-smoothed plateau profile on the coordinate ``x``: exactly 0 at
+    ``x[0]``, rising across an escarpment centred at
+    ``x_esc = (1 - plateau_frac)*Lx`` with transition width ``plateau_w``, then
+    dropping ``plateau_dz`` linearly to exactly ``plateau_zo - plateau_dz`` at
+    ``x[-1]``. The raw arctan ramp is rescaled so the domain ends land on 0 / 1
+    (the raw ramp only reaches them asymptotically — with the default
+    frac/w on a 50 km domain the low edge sat at 0.25*zo, a permanent sill
+    above the border's water datum)."""
+    x = np.asarray(x, dtype=float)
     Lx = float(x[-1] - x[0])
     x_esc = (1.0 - plateau_frac) * Lx
-    x_or = X - float(x[0])
+    x_or = x - float(x[0])
     ramp = (1.0 + 2.0 / np.pi * np.arctan((x_or - x_esc) / plateau_w)) / 2.0
+    ramp = (ramp - ramp[0]) / (ramp[-1] - ramp[0])
     slope = plateau_dz * np.clip(x_or - x_esc, 0.0, None) / max(Lx - x_esc, 1e-9)
-    topo = ramp * (plateau_zo - slope)
+    return ramp * (plateau_zo - slope)
+
+
+def plateau_surface(x, y, shape, border_status, seed, noise_amplitude,
+                    plateau_zo, plateau_dz, plateau_frac, plateau_w):
+    """Arctan-smoothed plateau initial topography (:func:`plateau_profile`
+    tiled along y) + tie-breaking noise (zeroed on 'fixed_value' edges, so a
+    fixed x-border starts exactly on 0 / ``plateau_zo - plateau_dz``). Body of
+    ``PlateauSurface.initialize``."""
+    topo = np.tile(plateau_profile(x, plateau_zo, plateau_dz, plateau_frac,
+                                   plateau_w), (len(y), 1))
 
     if seed is not None and not (isinstance(seed, float) and np.isnan(seed)):
         seed = int(seed)
@@ -493,7 +509,9 @@ def run_modeB_kernel(zb_flat, H_flat, ice_flux, water_flux, law_code, gp, dt,
     FIREWALL: the kernel reconstructs its OWN ``zs = zb + hc*H`` from the raw H
     for every closure and erosion slope — it never sees the relaxed/fabricated
     routing surface. De-squeezes the size-1 clock slices of ``border_bed_uplift``
-    and ``bl`` inside, so the shell and the driver share the treatment."""
+    and ``bl`` inside, so the shell and the driver share the treatment. ``bl``
+    may also be the driver's flat ``(ny*nx,)`` per-side border datum (see
+    :func:`siim._core.driver._bl_field`)."""
     ny, nx = int(shape[0]), int(shape[1])
     dx_cell = float(dx)
     dy_cell = float(dy)
@@ -503,9 +521,16 @@ def run_modeB_kernel(zb_flat, H_flat, ice_flux, water_flux, law_code, gp, dt,
     if bbu.ndim == 3:
         bbu = bbu[0]
     bbu_flat = np.broadcast_to(bbu, (ny, nx)).ravel()
-    # Per-step water-line datum (the clock strips the 'tstep' dim, so bl is a
-    # scalar each step) + the global flotation gate and its ramp width.
-    bl = float(np.asarray(bl).ravel()[-1])
+    # Per-step water-line datum + the global flotation gate and its ramp width.
+    # ``bl`` arrives either as a scalar (the clock strips the 'tstep' dim, so
+    # the adapter's bl is scalar each step) — broadcast to the uniform field —
+    # or as the driver's flat (ny*nx,) PER-SIDE border datum; the kernel gives
+    # each interior node the datum of the outlet its basin drains to.
+    bl_arr = np.asarray(bl, dtype=np.float64)
+    if bl_arr.size == ny * nx:
+        bl = np.ascontiguousarray(bl_arr.ravel())
+    else:
+        bl = np.full(ny * nx, float(bl_arr.ravel()[-1]))
     gate = bool(gate)
     ramp = float(ramp)
     par = bool(parallel)

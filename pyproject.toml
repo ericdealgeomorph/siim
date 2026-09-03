@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "siim"
-version = "0.9.1"
+version = "0.9.2"
 description = "Sliding Ice Incision Model (siim): coupled glacial-fluvial landscape evolution."
 readme = "README.md"
 authors = [
@@ -80,7 +80,7 @@ dev-parity = ["fastscapelib"]
 
 [project.urls]
 Homepage = "https://github.com/ericdealgeomorph/siim"
-Documentation = "https://siim.readthedocs.io"
+Documentation = "https://github.com/ericdealgeomorph/siim/tree/main/docs"
 Repository = "https://github.com/ericdealgeomorph/siim"
 Issues = "https://github.com/ericdealgeomorph/siim/issues"
 Changelog = "https://github.com/ericdealgeomorph/siim/blob/main/CHANGELOG.md"

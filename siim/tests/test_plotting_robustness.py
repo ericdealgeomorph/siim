@@ -96,3 +96,33 @@ def test_m33_chain_length_bounded_on_cyclic_receivers():
     out = _trace_paths_arrays(rec.reshape(ny, nx), H.reshape(ny, nx),
                               area.reshape(ny, nx), nx, ny, 300.0, 300.0, 1e3)
     assert out is not None and len(out) == 4   # returns (would hang pre-fix)
+
+
+# --- min_ice_cells cleanup is seam-aware on looped axes ---------------------
+
+def test_clean_ice_mask_seam_aware():
+    """_clean_ice_mask labelled with non-periodic connectivity, so a glacier
+    straddling a looped seam was two sub-minimum components and min_ice_cells
+    deleted it — while the identical glacier mid-domain survived. Holes across
+    the seam were likewise never fillable (the seam counted as 'array border').
+    The wrap flags default False, so every non-looped call is unchanged."""
+    from siim.plotting._render import _clean_ice_mask
+    os_, minc = 4, 6                       # minpix = minc*os_**2 = 96 px
+    mask = np.zeros((48, 48), dtype=bool)
+    mask[20:28, :8] = True                 # 64 px left of the x seam
+    mask[20:28, -8:] = True                # 64 px right of it -> 128 together
+    mid = np.zeros((48, 48), dtype=bool)
+    mid[20:28, 20:36] = True               # the same 128 px, mid-domain
+
+    assert _clean_ice_mask(mid, minc, os_).sum() == 128        # kept anywhere
+    assert _clean_ice_mask(mask, minc, os_).sum() == 0         # seam: erased
+    assert _clean_ice_mask(mask, minc, os_, wrap_x=True).sum() == 128
+    assert _clean_ice_mask(mask, minc, os_, wrap_y=True).sum() == 0  # wrong axis
+    assert _clean_ice_mask(mask.T, minc, os_, wrap_y=True).sum() == 128
+
+    # a bare hole straddling the seam is enclosed on a looped axis -> fillable
+    hole = np.ones((48, 48), dtype=bool)
+    hole[20:24, :3] = False
+    hole[20:24, -3:] = False
+    assert (~_clean_ice_mask(hole, minc, os_)).sum() == 24     # border: kept open
+    assert (~_clean_ice_mask(hole, minc, os_, wrap_x=True)).sum() == 0

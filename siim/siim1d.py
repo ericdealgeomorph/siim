@@ -366,6 +366,10 @@ class siim:
         # threshold); the scalar self.bl is the analytical-reference value (time-
         # MEAN for a series) — but the analytical stays at the datum, so a
         # nonzero mean only drives a heads-up warning (see _analytical_user_params).
+        if isinstance(params.bl, dict):
+            raise ValueError("per-side bl is 2D only (siim.siim2d): the 1D "
+                             "profile has no domain sides, only its outlet(s). "
+                             "Pass a scalar or a length-nt series.")
         if np.isscalar(params.bl) or params.bl is None:
             self.bl = _constants.BL if params.bl is None else float(params.bl)
             self.bl_run = self.bl * np.ones_like(self.t)

@@ -83,6 +83,26 @@ def _resolve_style(style, field, H_threshold, ice_sigma_cells, ice_time_avg,
             area_threshold, contour_interval)
 
 
+def _frozen_scale_kwargs(m, landscape_kwargs):
+    """Freeze ``landscape``'s AUTO colour scales across a whole animation.
+
+    A still autoscales per frame, which in a movie puts every frame on its own
+    scale: the bed colorbar top tracks each frame's highest peak and the
+    ``ice_cmap`` norm collapses to ``H_min + 1`` on ice-free frames, so colours
+    pulse for reasons that are not in the model (``map`` freezes its clim
+    globally for the same reason). Resolve both ONCE over all output frames —
+    ``max z_out`` bounds every frame's composited surface and
+    ``hc_over_H * max H_out`` every drawn column — unless the caller pinned
+    them. Returns a new kwargs dict; both the serial and the parallel frame
+    paths then render on the one scale."""
+    kwargs = dict(landscape_kwargs)
+    if kwargs.get('z_max') is None:
+        kwargs['z_max'] = float(np.nanmax(np.asarray(m.z_out)))
+    if kwargs.get('H_max') is None:
+        kwargs['H_max'] = float(m.hc_over_H * np.nanmax(np.asarray(m.H_out)))
+    return kwargs
+
+
 _ANIM_WORKER = {}
 
 # Everything landscape() reads off self.model, split by transport: the big
@@ -256,7 +276,9 @@ class LandscapeMixin:
           - ``min_ice_cells`` (int, default 0 = off; NATIVE cells) — cleans the
             final subgrid mask (both extents): removes ice components smaller
             than ``min_ice_cells`` native cells and fills enclosed bare holes
-            smaller than the same (holes touching the array border stay open).
+            smaller than the same (holes touching a non-looped array border
+            stay open). Seam-aware: on a looped axis a glacier straddling the
+            seam is ONE component, not two sub-minimum halves.
           - ``ice_time_avg`` (int >= 1; ``None`` resolves to ``1`` (off) for
             both styles) — replaces the ICE layer's thickness with the
             trailing mean of the last ``ice_time_avg`` output frames (clamped
@@ -295,14 +317,21 @@ class LandscapeMixin:
             raise ValueError(
                 "ice_smoothing='field' applies to ice_extent='cells' only "
                 "(the footprint mask is not threshold-generated).")
+        if ice_smoothing == 'field' and H_threshold <= 0:
+            raise ValueError(
+                "ice_smoothing='field' needs H_threshold > 0: the clipped "
+                f"field min(H, 2*H_threshold) is all zero at {H_threshold!r}, "
+                "so NO ice would be drawn (style='raw' resolves H_threshold "
+                "to 0 — pass an explicit H_threshold with it).")
         if int(ice_time_avg) < 1:
             raise ValueError(f"ice_time_avg must be >= 1, got {ice_time_avg!r}")
 
         z_in = m.z_out[i]
         H_in = m.H_out[i]
         # ICE-layer thickness: optionally a trailing time-average (display-only
-        # anti-flicker). Terrain / hypsometry / cross-section stay on frame i via
-        # z_in / zb_in / area_in below.
+        # anti-flicker). It feeds ONLY the ice mask and the depth colouring —
+        # terrain / hypsometry / cross-section stay on frame i via z_in / H_in /
+        # zb_in / area_in below (in BOTH extents; see the footprint branch).
         H_ice = H_in if int(ice_time_avg) <= 1 else _mean_recent_H(
             m.H_out, i, int(ice_time_avg))
         zb_in = m.zb_out[i]
@@ -319,23 +348,42 @@ class LandscapeMixin:
         # and cross-section bedrock all read this (zb_out, not z - hc*H).
         zb_sub = map_coordinates(zb_in, [Y, X], order=3, mode='nearest')
 
+        # Looped axes: the footprint fill, the mask cleanup and the lake flood
+        # all need the same seam awareness, so read the flags once.
+        bs = list(getattr(m, 'boundary_status', ['fixed_value'] * 4))
+        wrap_x = bs[0] == 'looped'
+        wrap_y = bs[2] == 'looped'
+
         if show_ice and ice_extent == 'footprint':
             # Footprint fill (display dual of the width carve): per-cell ice
             # surface from the power-diagram attribution, computed native + up.
-            bs = list(getattr(m, 'boundary_status', ['fixed_value'] * 4))
             z_fill_nat, ice_nat, depth_nat = _footprint_ice_surface(
                 H_ice, zb_in, rec_in, m.alpha_g,
                 m.Ly / (ny - 1), m.Lx / (nx - 1),
-                wrap_y=bs[2] == 'looped', wrap_x=bs[0] == 'looped',
+                wrap_y=wrap_y, wrap_x=wrap_x,
                 H_threshold=H_threshold, area_in=area_in,
                 area_threshold=area_threshold, hc_over_H=m.hc_over_H)
+            if int(ice_time_avg) > 1:
+                # ...but the fill also carries the TERRAIN here, and
+                # ice_time_avg is an ice-layer knob: rebuild the composited
+                # surface from frame i's H so the trailing mean never leaks
+                # into terrain / hillshade / contours / hypsometry / section
+                # (the 'cells' extent already reads z_in). Skipped entirely at
+                # ice_time_avg = 1, where the single fill above is frame i.
+                z_fill_nat = _footprint_ice_surface(
+                    H_in, zb_in, rec_in, m.alpha_g,
+                    m.Ly / (ny - 1), m.Lx / (nx - 1),
+                    wrap_y=wrap_y, wrap_x=wrap_x,
+                    H_threshold=H_threshold, area_in=area_in,
+                    area_threshold=area_threshold, hc_over_H=m.hc_over_H)[0]
             # order-1 (bilinear) for the ice-filled surface: it carries a
             # trimline step (flat z_s meeting terrain), and bicubic overshoots
             # there into a faint margin halo; the later Gaussian smooth recovers
             # interior smoothness regardless.
             z_sub = map_coordinates(z_fill_nat, [Y, X], order=1, mode='nearest')
             ice_mask = _smooth_ice_mask(ice_nat, Y, X, ice_sigma_cells)
-            ice_mask = _clean_ice_mask(ice_mask, min_ice_cells, oversample)
+            ice_mask = _clean_ice_mask(ice_mask, min_ice_cells, oversample,
+                                       wrap_y=wrap_y, wrap_x=wrap_x)
             # depth for ice_cmap colouring: bilinear + mask-confined. order-0
             # staircased against the bicubic terrain; a plain order-1 upsample
             # bleeds toward 0 across the ice/rock edge, so renormalise by the
@@ -363,7 +411,8 @@ class LandscapeMixin:
                 if area_threshold > 0:
                     cells_ok = cells_ok & (area_in >= area_threshold)
                 ice_mask = _smooth_ice_mask(cells_ok, Y, X, ice_sigma_cells)
-            ice_mask = _clean_ice_mask(ice_mask, min_ice_cells, oversample)
+            ice_mask = _clean_ice_mask(ice_mask, min_ice_cells, oversample,
+                                       wrap_y=wrap_y, wrap_x=wrap_x)
             H_col = np.where(ice_mask, m.hc_over_H * H_sub, 0.0)
 
         paths_xy = None
@@ -385,7 +434,11 @@ class LandscapeMixin:
         else:
             z_smooth = z_composite
         if z_max is None:
-            z_max = float(z_smooth.max())
+            # nanmax, not max: one NaN otherwise blanks the whole map silently.
+            # The cross-section draws the UNSMOOTHED composite against this same
+            # limit, so cover it too — else the map's Gaussian shaves the peaks
+            # and the section profile runs off the top of its panel.
+            z_max = float(max(np.nanmax(z_smooth), np.nanmax(z_composite)))
 
         cmap = plt.get_cmap(cmap_bed)
         norm = Normalize(vmin=z_min, vmax=z_max)
@@ -415,9 +468,13 @@ class LandscapeMixin:
         lake_mask = None
         lake_filled = None
         if show_lake:
-            lake_filled = _priority_flood(z_smooth, wrap_y=bs[2] == 'looped',
-                                          wrap_x=bs[0] == 'looped')
-            lake_mask = (lake_filled - z_smooth) > lake_min_depth
+            # Flood the TRUE (pre-smoothing) composite — the very surface the
+            # cross-section paints down to. Flooding z_smooth instead bridges
+            # bed slots narrower than the Gaussian and hands the section a
+            # water table it cannot meet (the phantom-ice split, 2026-07-16).
+            lake_filled = _priority_flood(z_composite, wrap_y=wrap_y,
+                                          wrap_x=wrap_x)
+            lake_mask = (lake_filled - z_composite) > lake_min_depth
             if show_ice:
                 lake_mask = lake_mask & ~ice_mask
             if lake_min_area > 0 and lake_mask.any():
@@ -431,9 +488,9 @@ class LandscapeMixin:
             rgb[lake_mask] = np.asarray(to_rgb(lake_color))
             z_lake_surface = np.where(lake_mask, lake_filled, z_smooth)
 
+        dx_sub = m.Lx / (nx_sub - 1)
+        dy_sub = m.Ly / (ny_sub - 1)
         if hillshade:
-            dx_sub = m.Lx / (nx_sub - 1)
-            dy_sub = m.Ly / (ny_sub - 1)
             rgb = _shade_rgb_soft(rgb, z_lake_surface, dx_sub, dy_sub,
                                   ve, azdeg, altdeg)
 
@@ -456,7 +513,12 @@ class LandscapeMixin:
                     fig = plt.figure(figsize=(fig_width, fig_height))
                 ax = fig.add_subplot(1, 1, 1)
         fig = ax.figure
-        extent = [0, m.Lx / 1e3, 0, m.Ly / 1e3]
+        # imshow places pixel CENTRES inside `extent`, but the array is
+        # NODE-valued: run the raster half a subgrid pixel past each edge so
+        # node j lands on x = Lx*j/(nx_sub-1) — the coordinate the contours,
+        # trimline and section line use. (Axis limits stay at [0, Lx]/[0, Ly].)
+        extent = [-0.5 * dx_sub / 1e3, (m.Lx + 0.5 * dx_sub) / 1e3,
+                  -0.5 * dy_sub / 1e3, (m.Ly + 0.5 * dy_sub) / 1e3]
         # 'raw' renders blocky (nearest): bilinear blends a 1-cell ice channel
         # ~50/50 into its neighbours when oversample=1, washing out exactly the
         # thin ice raw is meant to show honestly. 'smooth' keeps bilinear (its
@@ -464,6 +526,8 @@ class LandscapeMixin:
         # de-staircases the atlas look).
         interp = 'nearest' if style == 'raw' else 'bilinear'
         ax.imshow(rgb, origin='lower', extent=extent, interpolation=interp)
+        ax.set_xlim(0, m.Lx / 1e3)
+        ax.set_ylim(0, m.Ly / 1e3)
 
         x_axis = np.linspace(0, m.Lx / 1e3, nx_sub)
         y_axis = np.linspace(0, m.Ly / 1e3, ny_sub)
@@ -501,6 +565,9 @@ class LandscapeMixin:
 
         if colorbar:
             sm_bed = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            # Without ice the composite IS the bare bed — name it as map() does.
+            bed_label = ('Surface elevation (m)' if show_ice
+                         else 'Bedrock elevation (m)')
             if show_ice and ice_cmap_obj is not None:
                 # Two stacked bars MUST share one divider, else separate
                 # make_axes_locatable calls each place a bar immediately right of
@@ -509,18 +576,17 @@ class LandscapeMixin:
                 from mpl_toolkits.axes_grid1 import make_axes_locatable
                 divider = make_axes_locatable(ax)
                 cax_bed = divider.append_axes('right', size='4%', pad=0.05)
-                ax.figure.colorbar(sm_bed, cax=cax_bed, label='Surface elevation (m)')
+                ax.figure.colorbar(sm_bed, cax=cax_bed, label=bed_label)
                 sm_ice = plt.cm.ScalarMappable(cmap=ice_cmap_obj, norm=ice_norm)
                 cax_ice = divider.append_axes('right', size='4%', pad=0.7)
                 ax.figure.colorbar(sm_ice, cax=cax_ice, label='Ice thickness (m)')
             else:
-                _add_colorbar(sm_bed, ax, label='Surface elevation (m)')
+                _add_colorbar(sm_bed, ax, label=bed_label)
 
         if cross_section is not None:
             y_km = float(cross_section)
             ax.axhline(y_km, color=cross_section_color, lw=1.0, alpha=0.8, zorder=3)
             if ax_cs is not None:
-                dy_sub = m.Ly / (ny_sub - 1)
                 j_cs = max(0, min(ny_sub - 1, int(round(y_km * 1e3 / dy_sub))))
                 # The section reads the PRE-smoothing composite, never z_smooth:
                 # the map's Gaussian (sigma_cells) bridges bed slots narrower
@@ -536,7 +602,19 @@ class LandscapeMixin:
                 row_colors = cmap(norm(z_grid.flatten()))
 
                 if show_ice:
-                    cs_bedrock = np.minimum(zb_sub[j_cs, :], cs_profile)
+                    # Bilinear bed for the SECTION only: the map's BICUBIC
+                    # zb_sub overshoots above the (bilinear) filled ice
+                    # surface, which zeroed the ice band on columns the map
+                    # paints as ice. Match orders instead — and keep the bed
+                    # ON the profile wherever no ice is drawn, so an ice-free
+                    # column still paints a zero-thickness band (no phantom
+                    # ice from the order-3/order-1 gap).
+                    cs_zb = map_coordinates(
+                        zb_in, [np.full(nx_sub, y_idx[j_cs]), x_idx],
+                        order=1, mode='nearest')
+                    cs_bedrock = np.where(ice_mask[j_cs, :],
+                                          np.minimum(cs_zb, cs_profile),
+                                          cs_profile)
                     upper_for_bed = cs_bedrock
                 else:
                     cs_bedrock = None
@@ -673,6 +751,11 @@ class LandscapeMixin:
         the arrays the workers need). Frame content is identical either way —
         only the wall clock changes.
 
+        The auto colour scales are FROZEN over the run: ``z_max`` (and, with
+        ``ice_cmap``, the ice norm's ``H_max``) are resolved once across all
+        output frames instead of per frame, so a frame's colours mean the same
+        thing throughout the movie; pass explicit values to override.
+
         Inherits ``landscape``'s ``style='smooth'`` default (the cartographic
         view — supersampled + hillshaded terrain, footprint-width ice, thin
         ice thresholded at ``H_threshold=100``). Pass ``style='raw'`` for the
@@ -699,6 +782,7 @@ class LandscapeMixin:
             raise ValueError(
                 "animate_landscape renders every frame; per-frame 'save' "
                 "makes no sense here — use 'path' for the movie file.")
+        landscape_kwargs = _frozen_scale_kwargs(m, landscape_kwargs)
         if run_id is not None:
             path = f"{run_id}_landscape"
         path = output_path(path, 'movies')

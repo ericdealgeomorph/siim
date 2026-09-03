@@ -288,12 +288,15 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
         Flat (nn,) uplift rate (m/yr); only border (self-receiving) cells are
         read — the U in the icy border budget and the rate of the ice-free
         post-glacial recovery toward bl.
-    bl : float
+    bl : float or ndarray
         Base level: the per-step water-line (Dirichlet) datum. Replaces the
         literal 0 at every waterline site — the ice-free-border erosion-view
         floor + lake-fill seed, the border recovery threshold, and the
-        flotation reference. Default 0.0 (bit-for-bit with the historical
-        hard-coded datum).
+        flotation reference. A scalar is the single domain-wide datum
+        (default 0.0, bit-for-bit with the historical hard-coded datum); a
+        flat ``(nn,)`` array carries each base-level BORDER node's own side
+        datum (per-side ``bl``), and every interior node then inherits the
+        datum of the outlet its basin drains to (step 0a).
     gate : bool
         Waterline-flotation gate (default constants.FLOTATION_GATE = True):
         the rho_i = rho_w effective-pressure law. Interior: scales the erosion
@@ -316,6 +319,18 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
     """
     Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p, lambda_c, tau_c, coulomb_clamp, rho_g_g, hc_over_H, D_H = p
     nn = zb_flat.shape[0]
+
+    # --- 0a. Per-node water datum: ``bl`` carries each base-level BORDER
+    # node's own side datum (a scalar broadcasts to the uniform field, so the
+    # single-datum case is bit-for-bit), and every interior node inherits the
+    # datum of the OUTLET its basin drains to. The stack is receiver-first, so
+    # one forward pass resolves it; a self-receiving node (a border, or an
+    # interior pit the fill left) keeps its own entry. ---
+    bl_node = np.zeros(nn) + bl
+    for inode in stack:
+        r = rec[inode]
+        if r != inode:
+            bl_node[inode] = bl_node[r]
 
     # --- 0. Dominant donor per cell (the max-ice-flux cell draining into it).
     # A border reads dom for its zero-gradient thickness (step 1) and the
@@ -393,8 +408,8 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
     z_filled = np.empty(nn)
     for i in range(nn):
         z_filled[i] = zb_flat[i] + hc_over_H * H_flat[i]
-        if rec[i] == i and H_flat[i] <= 0.0 and z_filled[i] < bl:
-            z_filled[i] = bl
+        if rec[i] == i and H_flat[i] <= 0.0 and z_filled[i] < bl_node[i]:
+            z_filled[i] = bl_node[i]
     _lake_fill_sfr_2d(z_filled, stack, rec)
     z_pre = z_filled.copy()
 
@@ -427,7 +442,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
         if delta > 0.0:
             if gate and H_flat[i] > 0.0:
                 f = _flot_factor(zb_flat[i] + hc_over_H * H_flat[i],
-                                 H_flat[i], bl, hc_over_H, ramp)
+                                 H_flat[i], bl_node[i], hc_over_H, ramp)
                 if f <= 0.0:
                     continue
                 delta *= f
@@ -465,11 +480,12 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
             if gate:
                 zb_flat[i] = _implicit_border_step(
                     zb_flat[i], border_bed_uplift[i], E, dt,
-                    H_flat[i], hc_over_H, bl, ramp)
+                    H_flat[i], hc_over_H, bl_node[i], ramp)
             else:                    # unbounded control (diagnostics only)
                 zb_flat[i] += (border_bed_uplift[i] - E) * dt
-        elif zb_flat[i] < bl:
-            zb_flat[i] = min(zb_flat[i] + border_bed_uplift[i] * dt, bl)
+        elif zb_flat[i] < bl_node[i]:
+            zb_flat[i] = min(zb_flat[i] + border_bed_uplift[i] * dt,
+                             bl_node[i])
 
     # --- 6. Output surface = zb + hc_over_H*H — the TRUE state everywhere: a relict
     # drowned border bed shows through below bl, an icy through-flowing (outflow)
@@ -504,9 +520,10 @@ def _dinf_modeB_recv(zb_flat, H_flat, inode, nb_receivers, receivers,
 
 @numba.njit(cache=True)
 def _dinf_modeB_filled_view(zb_flat, H_flat, receivers, hc_over_H, ny, nx,
-                            wrap_y, wrap_x, bl=_BL):
+                            wrap_y, wrap_x, bl_node):
     """Erosion working view: z' = zb + hc_over_H*H with ICE-FREE borders floored
-    at the water line bl, depression-filled by the flat (eps = 0) priority flood
+    at their own water line ``bl_node[i]``, depression-filled by the flat
+    (eps = 0) priority flood
     seeded at the borders — the 2D generalization of the SFR lake-fill stack
     walk. An ICY (outflow) border keeps its true surface (a free outflow, not
     still base water). Returns the filled view."""
@@ -517,8 +534,8 @@ def _dinf_modeB_filled_view(zb_flat, H_flat, receivers, hc_over_H, ny, nx,
         z_raw[i] = zb_flat[i] + hc_over_H * H_flat[i]
         if receivers[i, 0] == i:
             interior[i] = 0
-            if H_flat[i] <= 0.0 and z_raw[i] < bl:
-                z_raw[i] = bl
+            if H_flat[i] <= 0.0 and z_raw[i] < bl_node[i]:
+                z_raw[i] = bl_node[i]
         else:
             interior[i] = 1
     z_filled = np.empty(nn)
@@ -555,12 +572,35 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
     arrival slope (:func:`_implicit_border_step`, ramp-bounded at the
     flotation draft). The flotation ``gate``/``ramp`` is the rho_i = rho_w
     effective-pressure law (``ramp`` = gamma; 0 = the hard binary gate /
-    sliding mode). ``bl`` is the per-step water-line datum (default 0.0 =
-    bit-for-bit). ``parallel_erode``: level-scheduled parallel erosion step,
+    sliding mode). ``bl`` is the per-step water-line datum — a scalar
+    (default 0.0 = bit-for-bit) or a flat ``(nn,)`` per-side border datum
+    resolved to the interior by the dominant-receiver basin-outlet walk (see
+    the SFR twin).
+    ``parallel_erode``: level-scheduled parallel erosion step,
     bit-for-bit with the serial eroder (see the SFR twin). Default False.
     """
     Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p, lambda_c, tau_c, coulomb_clamp, rho_g_g, hc_over_H, D_H = p
     nn = zb_flat.shape[0]
+
+    # --- 0a. Per-node water datum (see the SFR twin): border nodes carry their
+    # own side's datum, interior nodes inherit their basin OUTLET's. The D-inf
+    # stack is donor-first, so the resolving pass runs in REVERSE, following the
+    # DOMINANT (largest-weight) receiver — slot 0 is the cardinal facet of the
+    # _dinf_pack layout, not necessarily the bigger share, so the argmax is
+    # taken explicitly (ties keep slot 0). ``receivers[i, 0] == i`` stays the
+    # border marker the rest of the kernel uses. ---
+    bl_node = np.zeros(nn) + bl
+    for idx in range(stack.shape[0] - 1, -1, -1):
+        inode = stack[idx]
+        r = receivers[inode, 0]
+        if r == inode:
+            continue                             # outlet: keeps its own datum
+        w_max = weights[inode, 0]
+        for k in range(1, nb_receivers[inode]):
+            if weights[inode, k] > w_max:
+                w_max = weights[inode, k]
+                r = receivers[inode, k]
+        bl_node[inode] = bl_node[r]
 
     # --- 0. Dominant donor per cell (max-ice-flux donor over its D-inf
     # receivers); borders read it for zero-gradient thickness (step 1) and
@@ -625,7 +665,7 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
 
     # --- 3. filled erosion view ---
     z_filled = _dinf_modeB_filled_view(zb_flat, H_flat, receivers, hc_over_H,
-                                       ny, nx, wrap_y, wrap_x, bl)
+                                       ny, nx, wrap_y, wrap_x, bl_node)
     z_pre = z_filled.copy()
 
     # --- 4. erode the filled view in place (per-law D-inf dispatch; serial
@@ -655,7 +695,7 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
         if delta > 0.0:
             if gate and H_flat[i] > 0.0:
                 f = _flot_factor(zb_flat[i] + hc_over_H * H_flat[i],
-                                 H_flat[i], bl, hc_over_H, ramp)
+                                 H_flat[i], bl_node[i], hc_over_H, ramp)
                 if f <= 0.0:
                     continue
                 delta *= f
@@ -692,11 +732,12 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
             if gate:
                 zb_flat[i] = _implicit_border_step(
                     zb_flat[i], border_bed_uplift[i], E, dt,
-                    H_flat[i], hc_over_H, bl, ramp)
+                    H_flat[i], hc_over_H, bl_node[i], ramp)
             else:                    # unbounded control (diagnostics only)
                 zb_flat[i] += (border_bed_uplift[i] - E) * dt
-        elif zb_flat[i] < bl:
-            zb_flat[i] = min(zb_flat[i] + border_bed_uplift[i] * dt, bl)
+        elif zb_flat[i] < bl_node[i]:
+            zb_flat[i] = min(zb_flat[i] + border_bed_uplift[i] * dt,
+                             bl_node[i])
 
     # --- 6. output surface = zb + hc_over_H*H, the TRUE state everywhere
     # (true-state output convention; see the SFR twin's step 6). ---

@@ -44,7 +44,7 @@ own constructor signatures in {doc}`../api/analytical`.
 | `zELA` | `1500` | Equilibrium-line altitude (m), scalar or length-`nt` series. The minimum of a series supplies the analytical maximum-glaciation reference. |
 | `zT` | `None` | All-snow elevation (m). To derive ELA from it, pass `zELA=None`; then `zELA = zT - P/beta`. If `P` is a series, the derived ELA is also time-varying. An explicit `zELA` wins. |
 | `U` | `1e-3` | Tectonic uplift rate (m/yr). Accepted array shapes differ by model; see below. |
-| `bl` | `0` | Base-level waterline (m), scalar or length-`nt` series. A nonzero value warns that the analytical reference remains graded to datum zero. |
+| `bl` | `0` | Base-level waterline (m), scalar or length-`nt` series. A nonzero value warns that the analytical reference remains graded to datum zero. In 2D it also accepts a per-side dict with keys `'left'`, `'right'`, `'bottom'`, `'top'` (each value a scalar or a series): one datum per `'fixed_value'` outlet, with unlisted sides at `0`; a datum on a non-outlet side, or an unknown key, raises. Each interior node then takes its basin outlet's datum, and a corner shared by two fixed sides takes the x-side (`'left'`/`'right'`) value. Per-side `bl` needs the in-house driver. In 2D `bl` is consumed by modes B and C only — 2D mode A holds its borders at their initial elevation and ignores `bl` (scalar or per-side) entirely. |
 | `flotation_gate` | `True` | Apply the waterline/effective-pressure gate to mode-B/C glacial erosion. `False` is an unbounded diagnostic control. |
 | `flotation_ramp` | `0.1` | Dimensionless gate width γ. Must be nonnegative; `0` is the hard gate and values through `0.2` are the intended range. |
 | `border_bed_uplift` | `None` → local `U` | Uplift of mode-B/C bed at base-level outlets. `0` freezes border recovery; accepted shapes follow `U` as described below. |
@@ -192,7 +192,7 @@ keys. The uplift and initial-topography switches are independent.
 | `x_escarpment` | `0` | Initial wave-centre position relative to the left edge (m). |
 | `wave_calibration` | `1` | Dimensionless multiplier on the wave's peak rate; `1` deposits `delta_h` for a complete passage. |
 | `U_inf` | `0` | Background uplift rate added to the wave (m/yr). For the embedded analytical reference, representative uplift is `U_inf + delta_h/T`. |
-| `init_type` | `'sloped'` | `'sloped'` uses the standard generated/imported surface. `'plateau'` selects the arctangent-smoothed plateau and requires `plateau_zo`; it cannot be combined with `initial_topography`. |
+| `init_type` | `'sloped'` | `'sloped'` uses the standard generated/imported surface. `'plateau'` selects the arctangent-smoothed plateau (exactly `0` at the left edge and `plateau_zo - plateau_dz` at the right edge) and requires `plateau_zo`; it cannot be combined with `initial_topography`. For a plain `siim2d` run, `siim.escarpment.plateau_topography` builds the same surface together with the per-side `bl` that puts the right outlet at the plateau's edge elevation. |
 | `plateau_zo` | `None` | Plateau elevation (m); required with `init_type='plateau'`. |
 | `plateau_dz` | `1` | Elevation change across the plateau (m), used to seed the divide. |
 | `plateau_frac` | `0.8` | Fraction of the x extent occupied by the plateau. |

@@ -119,3 +119,24 @@ orthogonal to the water forcing `bl`.
 The default (`bl = 0`) suits a single-outlet domain. There is no border
 time-step restriction: the border budget is implicit (it cannot overshoot), so
 the old `dt ≤ 500 yr` icy-border caveat stays retired.
+
+**Per-side base level (2D).** A 2D domain can drain to outlets at genuinely
+different water lines — a fjord coast on one side, an inland basin on the other.
+Pass `bl` as a dict keyed by side, `{'left': …, 'right': …, 'bottom': …,
+'top': …}`, each value a scalar or a length-`nt` series (mixing allowed);
+unspecified sides stay at the default `0`. Only `'fixed_value'` sides are
+base-level outlets, so a datum on a `'looped'` or `'core'` side raises, as does
+an unknown key. Each border node then carries its own side's datum, and every
+interior node uses the datum of **the outlet its basin drains to** — the whole
+watershed of a coastal outlet is graded, floated and flooded against that
+coast's water line. A corner shared by two fixed sides takes the x-side
+(`left`/`right`) value. Per-side `bl` needs the in-house driver (the optional
+xsimlab adapter takes a single scalar per step and raises on a dict); a dict
+whose fixed sides all carry the same value is the scalar path bit-for-bit. In
+2D, `bl` — scalar or per-side — is consumed by **modes B and C only**: 2D mode
+A holds its borders at their initial elevation and ignores `bl` entirely
+(a known gap, not a per-side limitation), so a dict passed to a mode-A run is
+accepted and does nothing. The analytical steady-state reference stays graded
+to zero and is not offset-corrected per side, so `rms_vs_analytical` and the
+analytical overlay are not meaningful across outlets at different data (the
+constructor warns; `self.bl` is then only the fixed-side mean, a label).

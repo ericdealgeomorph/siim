@@ -296,7 +296,10 @@ class siim:
             # (default constants.BL = 0) or a length-nt series on the 'tstep'
             # clock like zELA/P; the per-step value floors the erosion working
             # view, the border-bed budget, the flotation reference and the
-            # recovery threshold. The analytical reference stays at the datum
+            # recovery threshold. Also accepts a PER-SIDE dict
+            # {'left'|'right'|'bottom'|'top': scalar or series} — one datum per
+            # fixed_value outlet, each interior node taking its basin outlet's
+            # (in-house driver only). The analytical reference stays at the datum
             # (bl scalar-reduced, not forwarded — nonzero mean warns).
             "bl": _constants.BL,
             # Global waterline-flotation gate (mode B; default
@@ -501,6 +504,53 @@ class siim:
             "e_thickness": 35e3,      # effective elastic plate thickness Te (m)
         }
 
+    #: ``bl`` dict keys, in boundary_status order.
+    _BL_SIDES = ('left', 'right', 'bottom', 'top')
+
+    def _parse_bl_sides(self, bl, boundary_status):
+        """Validate a PER-SIDE ``bl`` dict against ``boundary_status`` and return
+        a 4-list [left, right, bottom, top] of ``(scalar, series)`` entries —
+        one per ``fixed_value`` side (unspecified sides default to
+        ``constants.BL``), ``None`` for the others. Only ``fixed_value`` sides
+        are base-level outlets, so a datum on any other side is a contradiction
+        rather than a no-op and raises."""
+        bs = list(np.broadcast_to(boundary_status, 4))
+        unknown = sorted(set(bl) - set(self._BL_SIDES))
+        if unknown:
+            raise ValueError(
+                f"unknown bl side(s) {unknown}: bl dict keys must be a subset "
+                f"of {list(self._BL_SIDES)}")
+        for side in bl:
+            status = str(bs[self._BL_SIDES.index(side)])
+            if status != 'fixed_value':
+                raise ValueError(
+                    f"bl[{side!r}] given but that side's boundary_status is "
+                    f"{status!r}: only 'fixed_value' sides are base-level "
+                    "outlets and carry a water datum.")
+        if 'fixed_value' not in bs:
+            raise ValueError(
+                "per-side bl given but no boundary_status side is "
+                "'fixed_value': there is no base-level outlet to place it on.")
+        sides = []
+        for k, side in enumerate(self._BL_SIDES):
+            if bs[k] != 'fixed_value':
+                sides.append(None)
+                continue
+            value = bl.get(side, _constants.BL)
+            if value is None:
+                sides.append((_constants.BL, None))
+                continue
+            arr = np.asarray(value, dtype=float)
+            if arr.ndim == 0:                     # scalar (incl. a 0-d array)
+                sides.append((float(arr), None))
+                continue
+            if arr.ndim != 1 or arr.shape[0] != self.nt:
+                raise ValueError(
+                    f"bl[{side!r}] must be a scalar or a length-nt={self.nt} "
+                    f"series, got shape {arr.shape}")
+            sides.append((float(arr.mean()), arr))
+        return sides
+
     def set_and_check_parameters(self, user_params):
         defaults = self._default_params()
 
@@ -569,13 +619,22 @@ class siim:
                 raise ValueError(
                     f"P array must have length nt={self.nt}, got {len(P_arr)}"
                 )
-        # base level bl: scalar (default constants.BL) or a length-nt series
+        # base level bl: scalar (default constants.BL), a length-nt series
         # wired onto the 'tstep' clock in run() (glacial_spl__bl), paralleling P
-        # above. The scalar self.bl is the analytical-reference value (time-MEAN
-        # for a series) — but the analytical stays at the datum, so a nonzero
-        # mean only drives a heads-up warning (see _analytical_user_params).
+        # above, or a PER-SIDE dict {'left'|'right'|'bottom'|'top': scalar or
+        # series} giving each fixed_value outlet its own water datum (mode B,
+        # in-house driver). The scalar self.bl is the analytical-reference value
+        # (time-MEAN for a series; the mean over the fixed sides for a dict) —
+        # but the analytical stays at the datum, so a nonzero mean only drives a
+        # heads-up warning (see _analytical_user_params).
         self._bl_series = None
-        if np.isscalar(params.bl) or params.bl is None:
+        self._bl_sides = None
+        if isinstance(params.bl, dict):
+            self._bl_sides = self._parse_bl_sides(params.bl,
+                                                  params.boundary_status)
+            self.bl = float(np.mean([e[0] for e in self._bl_sides
+                                     if e is not None]))
+        elif np.isscalar(params.bl) or params.bl is None:
             self.bl = _constants.BL if params.bl is None else float(params.bl)
         else:
             bl_arr = np.asarray(params.bl, dtype=float)
@@ -593,7 +652,17 @@ class siim:
             raise ValueError("flotation_ramp (gamma) must be >= 0.")
         # Mode-B parallel-eroder toggle (bit-for-bit; default constants.PARALLEL_ERODE).
         self.parallel_erode = bool(params.parallel_erode)
-        if self.bl != 0.0:
+        if self._bl_sides is not None:
+            if any(e[0] != 0.0 for e in self._bl_sides if e is not None):
+                warnings.warn(
+                    "Per-side base level bl: the analytical steady-state "
+                    "reference stays at the datum (bl=0) and CANNOT be "
+                    "offset-corrected, since the outlets sit at different "
+                    "data — rms_vs_analytical and the analytical overlay are "
+                    f"not meaningful across them (self.bl = {self.bl:g} is the "
+                    "fixed-side mean, a label only).",
+                    UserWarning, stacklevel=2)
+        elif self.bl != 0.0:
             warnings.warn(
                 "Nonzero base level bl: the analytical steady-state reference "
                 "stays at the datum (bl=0), so comparisons (rms_vs_analytical, "
@@ -1010,6 +1079,11 @@ class siim:
         from :func:`glacial_processes`, run it, and store ``self.ds_out``.
         Adapter-env only (conda; ``environment.yml``) — the stack imports are
         lazy so the standalone default path never touches them."""
+        if self._bl_sides is not None:
+            raise NotImplementedError(
+                "per-side bl (a dict) is in-house-driver only: the xsimlab "
+                "adapter's glacial_spl__bl is a single scalar per step. Run "
+                "with driver='inhouse' (the default).")
         import xsimlab as xs
         from fastscape.models import basic_model
         # Drop the stock spl/drainage slots; the renamed glacial_spl / glacial_flow
@@ -1225,7 +1299,7 @@ class siim:
             # forcing series / scalars
             zELA_series=self._zELA_series, zELA=self.zELA,
             runoff_series=self._P_series, P=self.P,
-            bl_series=self._bl_series, bl=self.bl,
+            bl_series=self._bl_series, bl=self.bl, bl_sides=self._bl_sides,
             bbu_static=bbu_static, bbu_series=bbu_series,
             # injected seams
             uplift_fn=self._driver_uplift_fn(),

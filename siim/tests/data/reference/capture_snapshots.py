@@ -22,7 +22,7 @@ regenerated. Their fidelity to live fortran is re-certified by the conda
 directly (never a regenerated surface — plan decision note 12).
 
 Frozen artifacts are IMMUTABLE outside an explicitly decision-noted sanctioned
-regeneration (four to date; see the plan). CI writes them only with
+regeneration (five to date; see the plan). CI writes them only with
 ``--if-absent`` so a committed reference is never silently overwritten;
 ``test_reference_snapshots.py`` is the reproduce/gate.
 

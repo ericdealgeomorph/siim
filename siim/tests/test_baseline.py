@@ -302,6 +302,31 @@ def test_escarpment_wave_plateau_smoke():
     assert m.z_out[-1].max() > 0, "degenerate topography"
 
 
+def test_plateau_edges_sit_on_their_datums():
+    """The plateau ramp is rescaled so the fixed x-borders start EXACTLY on
+    0 / zo - dz. The raw arctan only reaches 0/1 asymptotically (default
+    frac/w on 50 km left the low edge at 0.25*zo — a sill above the border's
+    water datum that never lowers), and `plateau_topography` hands back the
+    matching right-side datum for plain siim2d runs."""
+    from siim._core.step import plateau_profile
+    from siim.escarpment import plateau_topography
+    x = np.linspace(0, 50e3, 21)
+    z = plateau_profile(x, 1500.0, 1.0, 0.8, 10e3)
+    assert z[0] == 0.0 and z[-1] == pytest.approx(1499.0, abs=1e-9)
+    assert np.all(np.diff(z[:8]) > 0), "ramp must rise monotonically across the escarpment"
+
+    topo, bl = plateau_topography(21, 5, 50e3, zo=1500, frac=0.8, w=10e3, dz=1)
+    assert topo.shape == (5, 21) and bl == {'right': 1499.0}
+    assert np.array_equal(topo[0], z)
+
+    # In a plain (ice-free) siim2d run both fixed borders stay on their datums.
+    p = _small_esc(zELA=15000); p['nx'], p['ny'] = 21, 21
+    p['initial_topography'], p['bl'] = plateau_topography(21, 21, p['Lx'], zo=1500)
+    m = siim2d(p); m.run()
+    assert np.all(m.z_out[-1][:, 0] == 0.0)
+    assert np.all(m.z_out[-1][:, -1] == pytest.approx(1499.0))
+
+
 @pytest.mark.parametrize("bad,match", [
     ({'uplift_type': 'wave'},   "requires delta_h"),
     ({'init_type': 'plateau'},  "requires plateau_zo"),

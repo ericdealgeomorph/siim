@@ -69,6 +69,28 @@ def _slice_forcing(series, scalar, k):
     return series[k] if series is not None else scalar
 
 
+# Border rings in boundary_status order [left, right, bottom, top] (the
+# side->slice mapping of step.uplift_mask).
+_BL_SIDE_SLICES = ((slice(None), 0), (slice(None), -1),
+                   (0, slice(None)), (-1, slice(None)))
+
+
+def _bl_field(bl_sides, shape, k):
+    """Per-node water datum for step ``k`` (PER-SIDE ``bl``): each
+    ``fixed_value`` border node carries its own side's datum; interior entries
+    are placeholders (0) that the mode-B kernel overwrites with the datum of
+    the outlet its basin drains to. Corner nodes touched by two fixed sides
+    take the x-side (left/right) value — the x-sides are written last.
+    ``bl_sides`` is the 4-list of ``(scalar, series)`` entries parsed by
+    ``siim.siim2d.siim.set_and_check_parameters`` (``None`` off fixed sides)."""
+    field = np.zeros(shape)
+    for s in (2, 3, 0, 1):                      # bottom, top, then left, right
+        if bl_sides[s] is not None:
+            scalar, series = bl_sides[s]
+            field[_BL_SIDE_SLICES[s]] = _slice_forcing(series, scalar, k)
+    return field.ravel()
+
+
 def run_loop(cfg):
     """Run the merged in-house time loop; return the packed ``ds_out`` step
     buffers (a ``{name: (nt_out, ny, nx) ndarray}`` dict per the output spec).
@@ -115,7 +137,8 @@ def run_loop(cfg):
         surface_forcing = uplift                  # TectonicForcing group sum (1 member)
         zELA_k = _slice_forcing(cfg.zELA_series, cfg.zELA, k)
         runoff_k = _slice_forcing(cfg.runoff_series, cfg.P, k)
-        bl_k = _slice_forcing(cfg.bl_series, cfg.bl, k)
+        bl_k = (_bl_field(cfg.bl_sides, shape, k) if cfg.bl_sides is not None
+                else _slice_forcing(cfg.bl_series, cfg.bl, k))
         bbu_k = _slice_forcing(cfg.bbu_series, cfg.bbu_static, k)
 
         # --- surf2erode (post-uplift routing/mass-balance surface) ---
@@ -143,7 +166,7 @@ def run_loop(cfg):
 
         # --- erosion kernel (writes H(t); FIREWALL: raw H, own zs) ---
         if is_mode_b:
-            zb_flat = topo.flatten()               # pre-uplift bed (fresh copy)
+            zb_flat = post_uplift.flatten()        # post-uplift bed (kernel contract; fresh copy)
             H_flat = H.flatten()                   # raw lagged H(t-1) (fresh copy)
             zb_in = zb_flat.copy()
             surface_out = run_modeB_kernel(

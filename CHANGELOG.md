@@ -3,7 +3,54 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.1 — August 2026 (current)
+## 0.9.2 — September 2026 (current)
+
+- **Mode B/C: the kernel now erodes the post-uplift bed.** The in-house driver
+  and the Fastscape adapter both handed the mode-B/C kernel the pre-uplift bed
+  and composed uplift afterwards. `fixed_value` border cells never uplift, so
+  the first interior row equilibrated against the pinned outlet and was then
+  lifted by `U*dt` every step — a permanent `U*dt` lip along every base-level
+  border that raised the whole landscape by that amount (300 m at
+  `dt = 300 kyr`). Mode A, the 1D model, and the kernel's documented contract
+  already used the post-uplift bed. Mode-B/C results change by `U*dt` near
+  borders (A is bit-identical); driver/adapter parity stays bit-for-bit, and
+  the B/C reference battery was re-frozen on the CI capture environment.
+- **Nine ice-display fixes from a mode-C visualization audit.** Lakes flood
+  the true composite surface, so the cross-section matches the map (the
+  `lakes` field was previously unreachable); `ice_smoothing='field'` with
+  `H_threshold <= 0` raises instead of silently drawing nothing;
+  `animate_landscape` freezes `z_max`/`H_max` over the run and one NaN no
+  longer blanks the map; `ice_time_avg` feeds only the ice mask and depth
+  colour in both extents (the footprint extent no longer time-averages the
+  terrain/section); auto `z_max` covers the unsmoothed section profile;
+  `_clean_ice_mask` is seam-aware on looped axes; the raster extent registers
+  with the contour/trimline/section coordinates; the section bed line is
+  bilinear to match the ice surface; bare-bed views are labelled "Bedrock
+  elevation". Each fix carries a regression test.
+- **Plateau initial surface: edges on their datums + a public builder.** The
+  arctan plateau (`siim_escarpment(init_type='plateau')`, the fastscape
+  `PlateauSurface`) now rescales its ramp so the fixed x-borders start exactly
+  on `0` / `plateau_zo - plateau_dz`; the raw arctan only reached them
+  asymptotically (with the default `plateau_frac`/`plateau_w` on a 50 km domain
+  the low edge sat at `0.25*plateau_zo`, a permanent sill above the border's
+  water datum). Behavioral for every plateau run (no reference-battery case
+  uses one). New `siim.escarpment.plateau_topography(nx, ny, Lx, zo, frac, w,
+  dz)` returns the same surface for plain `siim2d` runs together with the
+  per-side base level `{'right': zo - dz}` that puts the plateau's outlet at
+  its own edge elevation.
+- **Per-side base level (2D).** `bl` now also accepts a dict keyed by side
+  (`{'left'|'right'|'bottom'|'top': scalar or length-nt series}`), giving each
+  `'fixed_value'` outlet its own water datum; unspecified sides keep
+  `constants.BL`, and a datum on a non-outlet side or an unknown key raises.
+  Border nodes carry their own side's datum and every interior node inherits
+  the datum of the outlet its basin drains to (corners shared by two fixed
+  sides take the x-side value). Scalar and series `bl` are unchanged
+  bit-for-bit; per-side `bl` requires the in-house driver (the xsimlab adapter
+  takes one scalar per step and raises on a dict), and — like scalar `bl` in 2D
+  — is consumed by modes B/C only (2D mode A ignores `bl`). 1D rejects a dict.
+  See `docs/guides/configuring_a_run.md`.
+
+## 0.9.1 — August 2026
 
 The standalone migration: siim's 2D model no longer requires the frozen
 fastscape/xsimlab/fastscapelib-fortran stack.
@@ -55,6 +102,17 @@ fastscape/xsimlab/fastscapelib-fortran stack.
 - The retired `'fortran'` options of `router_backend`/`numerics_backend` now
   raise directed errors; the params survive as the (public-contract) backend
   plug points.
+
+**Bug fix — mode B/C outlet lip (2026-09-02)**
+- The 2D mode-B/C kernel now receives the **post-uplift** bed (the kernel's
+  documented contract; mode A and the 1D model already did). Both the in-house
+  driver and the Fastscape adapter eroded the pre-uplift bed against the pinned
+  `fixed_value` borders and composed uplift afterwards, leaving a permanent
+  `U*dt` step on the first interior row at every base-level border and raising
+  the whole landscape by that amount (300 m at dt = 300 kyr). ⚠ Mode-B/C
+  results change by `U*dt` near borders (and negligibly elsewhere via the
+  absolute-datum terms); the frozen B/C reference battery needs a sanctioned
+  regeneration. Driver/adapter parity remains bit-for-bit.
 
 **API changes (pre-release, no deprecation cycle)**
 - Default `boundary_status` is now the explicit

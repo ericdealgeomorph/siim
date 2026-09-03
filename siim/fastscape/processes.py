@@ -369,10 +369,10 @@ class GlacialSPLModeA(GlacialSPLBase):
 class GlacialSPLModeB(GlacialSPLBase):
     """Mode B erosion as a fastscape *citizen* (Fork B), no carve.
 
-    The tracked state ``topography__elevation`` IS the pre-uplift bed ``zb`` (the
-    sub-grid channel floor); ``ice_thickness`` carries H. Each step reads the
-    bed from ``SurfaceTopography.elevation`` (the persisted state — pre-this-step
-    uplift; fastscape composes uplift at finalize) and H from ``ice_thickness``,
+    The tracked state ``topography__elevation`` IS the bed ``zb`` (the sub-grid
+    channel floor); ``ice_thickness`` carries H. Each step hands the kernel the
+    POST-uplift bed (persisted state + this step's ``TectonicForcing`` bed motion;
+    fastscape composes the same uplift at finalize) and H from ``ice_thickness``,
     runs the UNCHANGED mode-B kernel (which reconstructs ``zs = zb + hc_over_H*H``
     internally), and reports a genuine erosion height:
 
@@ -380,17 +380,22 @@ class GlacialSPLModeB(GlacialSPLBase):
         ``erosion    = denudation``       (the erosion-group height)
 
     fastscape then finalizes ``zb_new = zb + uplift - erosion = zb + uplift -
-    delta-zb``, so the bed evolves correctly. No ``bedrock_surface`` output —
+    delta-zb`` = the kernel's eroded post-uplift bed, so the bed evolves correctly. No ``bedrock_surface`` output —
     ``topography`` IS the bed (the derived display surface ``zb + hc_over_H*H``
     is reconstructed by the consumer / plotter). The sub-grid width carve rides
     on the :class:`GlacialSPLModeC` subclass; routing/erosion slopes come from
     the reconstructed ice surface (:class:`GlacialSurfaceToErode`).
     """
 
-    # The persisted bedrock state, read pre-this-step uplift. self.surface
+    # The persisted bedrock state (pre-this-step uplift; see bed_uplift). self.surface
     # (= SurfaceToErode, the reconstructed ice surface here) drives the kernel's
     # routing/slopes; this foreign supplies the actual bed the kernel evolves.
     bed_state = xs.foreign(SurfaceTopography, 'elevation', intent='in')
+    # This step's imposed bed uplift (TectonicForcing sums the block/wave uplift
+    # group; zero on fixed_value borders). The kernel contract is the POST-uplift
+    # bed: eroding the pre-uplift bed against the pinned borders left a U*dt lip
+    # on the first interior row at every base-level border.
+    bed_uplift = xs.foreign(TectonicForcing, 'bedrock_upward', intent='in')
 
     def _run_modeB_kernel_nocarve(self, zb_flat, H_flat, dt):
         """No-carve mode-B kernel dispatch — thin wrapper over the framework-free
@@ -410,9 +415,9 @@ class GlacialSPLModeB(GlacialSPLBase):
     @xs.runtime(args=("step_delta",))
     def run_step(self, dt):
         dt = _scalar_dt(dt)                   # numpy-2-safe (audit m1)
-        # The bed is the persisted state (pre-this-step uplift). flatten()
-        # returns a fresh copy, so zb_flat is safe to mutate in place.
-        zb_flat = self.bed_state.flatten()
+        # Post-uplift bed (kernel contract): persisted state + this step's uplift.
+        # The sum is a fresh array, so zb_flat is safe to mutate in place.
+        zb_flat = (self.bed_state + self.bed_uplift).flatten()
         H_flat = self.ice_thickness.flatten()
         zb_in = zb_flat.copy()                # pre-kernel bed -> denudation = delta-zb
         self._run_modeB_kernel_nocarve(zb_flat, H_flat, dt)
@@ -484,7 +489,7 @@ class GlacialSPLModeC(GlacialSPLModeB):
         # Citizen mode-B run_step (bed = the persisted topography state) with the
         # sub-grid carve applied to the bed after the kernel. carve OFF ->
         # GlacialSPLModeB.run_step bit-for-bit.
-        zb_flat = self.bed_state.flatten()
+        zb_flat = (self.bed_state + self.bed_uplift).flatten()   # post-uplift bed (kernel contract)
         H_flat = self.ice_thickness.flatten()
         zb_in = zb_flat.copy()          # pre-kernel bed -> denudation datum + carve zb_pre
         surface_out = self._run_modeB_kernel_nocarve(zb_flat, H_flat, dt)

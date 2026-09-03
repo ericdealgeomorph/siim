@@ -33,7 +33,30 @@ import numpy as np
 from types import SimpleNamespace
 
 from .siim2d import siim
-from ._core.step import plateau_surface, uplift_mask, wave_uplift
+from ._core.step import plateau_profile, plateau_surface, uplift_mask, wave_uplift
+
+
+def plateau_topography(nx, ny, Lx, zo=1000.0, frac=0.8, w=10e3, dz=1.0):
+    """Plateau initial surface for plain ``siim2d`` runs, with its own base level.
+
+    Returns ``(topo, bl)``: the ``(ny, nx)`` surface — exactly 0 at the left
+    edge, rising to ``zo`` across an escarpment centred at ``x = (1 - frac)*Lx``
+    with transition width ``w`` (m), then dropping ``dz`` linearly to exactly
+    ``zo - dz`` at the right edge — and the per-side base level
+    ``{'right': zo - dz}`` to pass as the ``bl`` parameter. The right outlet's
+    water line is then the plateau's own edge elevation, so every basin
+    draining onto the plateau is graded to plateau height and base level does
+    not incise the plateau from behind; the left outlet keeps the default
+    datum. Same profile as ``siim_escarpment(init_type='plateau')``
+    (:func:`siim._core.step.plateau_profile`); siim2d adds its own
+    ``noise_amplitude`` (zeroed on fixed borders) on top. Usage::
+
+        params['initial_topography'], params['bl'] = plateau_topography(
+            nx, ny, Lx, zo=2000, frac=0.85, w=25e3, dz=1000)
+    """
+    x = np.linspace(0.0, Lx, nx)
+    topo = np.tile(plateau_profile(x, zo, dz, frac, w), (ny, 1))
+    return topo, {'right': zo - dz}
 
 
 class siim_escarpment(siim):

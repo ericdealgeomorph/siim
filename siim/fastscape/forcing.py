@@ -75,9 +75,10 @@ class WaveUplift:
 class PlateauSurface:
     """Arctan-smoothed plateau initial topography (replaces InitialTopography).
 
-    Arctan ramp from ~0 on the low-x side to plateau_zo on the high-x side,
-    centered at x_escarpment = (1 - plateau_frac) * Lx with transition width
-    plateau_w. A small slope plateau_dz across the plateau seeds the divide.
+    Arctan ramp from exactly 0 on the low-x side to plateau_zo on the high-x
+    side, centered at x_escarpment = (1 - plateau_frac) * Lx with transition
+    width plateau_w (rescaled so the domain ends land on 0 / plateau_zo -
+    plateau_dz). A small slope plateau_dz across the plateau seeds the divide.
     Uniform noise is added for D8 tie-breaking and zeroed on 'fixed_value'
     edges (matching InitialTopography, so the boundary z stays put across the
     run).
