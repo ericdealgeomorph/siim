@@ -242,8 +242,8 @@ class siim:
         is scalar — see the time-MEAN/MIN reductions in set_and_check_parameters).
         Base level ``bl`` is scalar-reduced (``self.bl``) but deliberately NOT
         forwarded: the analytical is graded to the datum (z(outlet)=0), so a
-        nonzero bl only shifts the profile by a constant (set_and_check_parameters
-        warns) — per the array-forcing memory rule + the design study's §7 Q5. The
+        nonzero bl only shifts the profile by a constant (the overlay warns when
+        drawn) — per the array-forcing memory rule + the design study's §7 Q5. The
         1D-reference grid is one-sided (reflecting at the head, base_level at
         the outlet) and uses L = Lx; per-basin geometry is overridden via
         _set_analytical_grid after extract_channel fits Hack's law. BCs and nx
@@ -625,8 +625,9 @@ class siim:
         # series} giving each fixed_value outlet its own water datum (mode B,
         # in-house driver). The scalar self.bl is the analytical-reference value
         # (time-MEAN for a series; the mean over the fixed sides for a dict) —
-        # but the analytical stays at the datum, so a nonzero mean only drives a
-        # heads-up warning (see _analytical_user_params).
+        # but the analytical stays at the datum, so a nonzero mean only sets a
+        # heads-up note, emitted when the analytical overlay is drawn
+        # (plotting.profiles._analytical_overlay; see _analytical_user_params).
         self._bl_series = None
         self._bl_sides = None
         if isinstance(params.bl, dict):
@@ -652,22 +653,21 @@ class siim:
             raise ValueError("flotation_ramp (gamma) must be >= 0.")
         # Mode-B parallel-eroder toggle (bit-for-bit; default constants.PARALLEL_ERODE).
         self.parallel_erode = bool(params.parallel_erode)
+        self._analytical_bl_note = None
         if self._bl_sides is not None:
             if any(e[0] != 0.0 for e in self._bl_sides if e is not None):
-                warnings.warn(
+                self._analytical_bl_note = (
                     "Per-side base level bl: the analytical steady-state "
                     "reference stays at the datum (bl=0) and CANNOT be "
                     "offset-corrected, since the outlets sit at different "
-                    "data — rms_vs_analytical and the analytical overlay are "
-                    f"not meaningful across them (self.bl = {self.bl:g} is the "
-                    "fixed-side mean, a label only).",
-                    UserWarning, stacklevel=2)
+                    "data — the analytical overlay is not meaningful across "
+                    f"them (self.bl = {self.bl:g} is the fixed-side mean, a "
+                    "label only).")
         elif self.bl != 0.0:
-            warnings.warn(
+            self._analytical_bl_note = (
                 "Nonzero base level bl: the analytical steady-state reference "
-                "stays at the datum (bl=0), so comparisons (rms_vs_analytical, "
-                "the analytical overlay) are offset by ~bl.",
-                UserWarning, stacklevel=2)
+                "stays at the datum (bl=0), so the analytical overlay is "
+                "offset by ~bl.")
 
         self.beta = params.beta
         if params.zELA is None and params.zT is None:
@@ -1425,8 +1425,10 @@ class siim:
     @classmethod
     def load(cls, filename):
         """Rebuild a siim instance from a previously ``save()``-ed pickle.
-        ``filename`` may be a bare name in ``./model_outputs/saved_models/``
-        (with or without the ``.pkl`` suffix) or an absolute / relative path.
+        ``filename`` may be a name under ``./model_outputs/saved_models/``
+        (with or without the ``.pkl`` suffix; a subfolder such as
+        ``'batch/run003'`` round-trips with :meth:`save`) or an absolute /
+        relative path.
 
         Pickle files can execute code while loading. Only load files from a
         trusted source. Unversioned legacy payloads are rejected rather than
@@ -1434,7 +1436,7 @@ class siim:
         """
         path = Path(filename)
         if not path.is_file():
-            candidate = Path(output_path(path.name, 'saved_models'))
+            candidate = Path(output_path(str(path), 'saved_models'))
             if not candidate.is_file() and not str(candidate).endswith('.pkl'):
                 candidate = candidate.with_suffix('.pkl')
             path = candidate

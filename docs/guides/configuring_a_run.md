@@ -135,6 +135,6 @@ whose fixed sides all carry the same value is the scalar path bit-for-bit. In
 A holds its borders at their initial elevation and ignores `bl` entirely
 (a known gap, not a per-side limitation), so a dict passed to a mode-A run is
 accepted and does nothing. The analytical steady-state reference stays graded
-to zero and is not offset-corrected per side, so `rms_vs_analytical` and the
-analytical overlay are not meaningful across outlets at different datums (the
-constructor warns; `self.bl` is then only the fixed-side mean, a label).
+to zero and is not offset-corrected per side, so the analytical overlay is not
+meaningful across outlets at different datums (drawing the overlay warns;
+`self.bl` is then only the fixed-side mean, a label).

@@ -17,6 +17,7 @@ Gates for the ``bl`` (water-line datum) forcing:
 """
 import os
 import sys
+import warnings
 
 import numpy as np
 import pytest
@@ -330,11 +331,27 @@ def test_bl_per_side_rejects_non_outlet_and_unknown_side():
 
 def test_bl_per_side_warns_that_the_analytical_is_not_offset_corrected():
     """With outlets at different data there is no single offset to add to the
-    analytical reference, so the per-side warning says so instead of promising
-    an ~bl shift (self.bl stays the fixed-side mean, a label)."""
-    with pytest.warns(UserWarning, match='CANNOT be offset-corrected'):
+    analytical reference, so the warning says so instead of promising an ~bl
+    shift (self.bl stays the fixed-side mean, a label). It fires when the
+    analytical overlay is drawn — NOT at construction, where it only nagged
+    every batch run that never looks at the overlay."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', UserWarning)
         m = siim2d(_p2d_sides(bl={'left': 0.0, 'right': 300.0}))
     assert m.bl == 150.0
+    with pytest.warns(UserWarning, match='CANNOT be offset-corrected'):
+        m.plot._analytical_overlay(bistable=False)
+
+
+def test_bl_nonzero_scalar_warns_only_when_the_overlay_is_drawn():
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', UserWarning)
+        m = siim2d(_p2d_sides(bl=300.0))
+    with pytest.warns(UserWarning, match='offset by ~bl'):
+        m.plot._analytical_overlay(bistable=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', UserWarning)
+        siim2d(_p2d_sides(bl=0.0)).plot._analytical_overlay(bistable=False)
 
 
 def test_bl_per_side_is_2d_only():

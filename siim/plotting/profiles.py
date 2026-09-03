@@ -95,11 +95,14 @@ class ProfileMixin:
     def _analytical_overlay(self, bistable):
         """Analytical SS reference (or None) as a SimpleNamespace; assumes the
         analytical grid was set by a prior ``_get_channel``."""
+        import warnings
         from types import SimpleNamespace
         m = self.model
         surface, bed = m.analytical._analytical_profiles()
         if surface is None or bed is None:
             return None
+        if getattr(m, '_analytical_bl_note', None):
+            warnings.warn(m._analytical_bl_note, UserWarning, stacklevel=2)
         return SimpleNamespace(
             x=(m.L - m.x) / 1e3, surface=surface, bed=bed,
             surface_alt=(m.analytical.surface_alt

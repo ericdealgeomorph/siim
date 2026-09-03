@@ -3,7 +3,17 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.5 — September 2026 (current)
+## 0.9.6 — September 2026 (current)
+
+- **2D base-level warning moved to its point of use.** A nonzero or per-side
+  `bl` no longer warns at model construction; the note that the analytical
+  steady-state reference stays at the datum is emitted when the analytical
+  overlay is actually drawn (`profile`/`analytical` plots). Batch runs that
+  never look at the overlay are quiet. 1D is unchanged.
+- `siim2d.load` accepts a name with a subfolder (`'batch/run003'`), matching
+  what `save` writes.
+
+## 0.9.5 — September 2026
 
 - **Documentation overhaul.** The public docs were rewritten as plain
   reference documentation (independently reviewed, and verified line-by-line

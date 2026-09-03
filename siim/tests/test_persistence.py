@@ -99,6 +99,16 @@ def test_versioned_save_load_reconstructs_outputs_without_running(tmp_path):
     assert np.array_equal(loaded.output_times, np.array([0.0]))
 
 
+def test_save_load_round_trip_subfolder_name(tmp_path, monkeypatch):
+    """A batch-style name with a subfolder loads by the same relative name."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(siim2d, "_unpack_outputs", lambda self: None)
+    path = _model_for_save().save("batch/run003")
+    assert path == tmp_path / "model_outputs" / "saved_models" / "batch" / "run003.pkl"
+    assert siim2d.load("batch/run003")._user_params == {}
+    assert siim2d.load("batch/run003.pkl")._user_params == {}
+
+
 def test_failed_save_preserves_existing_file_and_cleans_temp(tmp_path, monkeypatch):
     path = tmp_path / "state.pkl"
     original = b"existing saved model"
