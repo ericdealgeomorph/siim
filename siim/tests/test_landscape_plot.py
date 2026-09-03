@@ -252,10 +252,13 @@ def test_animate_freezes_the_auto_colour_scales(_iced_model, tmp_path,
         fig, _ = m.plot.landscape(i=i, oversample=2, **kw)
         got = {a.get_ylabel(): tuple(a.get_ylim()) for a in fig.axes
                if a.get_ylabel() in ('Surface elevation (m)',
-                                     'Ice thickness (m)')}
+                                     'Ice column depth (m)')}
         plt.close(fig)
         return got
 
+    assert set(limits(0, **kwargs)) == {'Surface elevation (m)',
+                                        'Ice column depth (m)'}, \
+        "test setup: the bed and ice colorbars were not both found"
     assert limits(0, **kwargs) == limits(-1, **kwargs)
     auto = dict(field='bedrock+ice', ice_cmap='Blues')
     assert limits(0, **auto) != limits(-1, **auto), \
@@ -304,6 +307,7 @@ def test_ice_time_avg_keeps_the_terrain_on_frame_i(_iced_model):
                 fig, ax = m.plot.landscape(
                     field='bedrock+ice', i=i, ice_extent=extent, oversample=1,
                     ice_time_avg=k, H_threshold=0.0, hillshade=False,
+                    ice_shading='flat',      # count flat ice_color pixels
                     contour_interval=0, cross_section=15.0)
                 nx_sub = _map_rgb(ax).shape[1]
                 profiles[k] = _section_lines(_section_axes(fig), nx_sub)[-1]
@@ -368,6 +372,7 @@ def test_section_paints_a_band_under_every_masked_ice_column(_iced_model):
     fig, ax = m.plot.landscape(field='bedrock+ice', i=-1, oversample=4,
                                H_threshold=0.0, ice_sigma_cells=0,
                                hillshade=False, contour_interval=0,
+                               ice_shading='flat',   # locate ice by ice_color
                                cross_section=1.5)
     rgb = _map_rgb(ax)
     ny_sub, nx_sub = rgb.shape[:2]
@@ -391,3 +396,44 @@ def test_bare_bed_colorbar_is_labelled_bedrock(_basin_model):
         fig, _ = m.plot.landscape(field=field, i=-1, hillshade=False)
         assert want in [a.get_ylabel() for a in fig.axes]
         plt.close(fig)
+
+
+def test_two_colorbars_do_not_collide_at_paper_width(_iced_model):
+    """The veil adds a second colorbar, and its pad is in INCHES: it has to
+    clear the elevation bar's tick labels + rotated title at every figure
+    width. Measured, that is a typographic width (~0.7 in), so the pad is
+    floored there and only grows on a figure wider than 14 in — a purely
+    relative pad overlaps the two bars below ~14 in."""
+    m = _iced_model
+    for fw in (5, 7, 14, 20):
+        fig, ax = m.plot.landscape(field='bedrock+ice', i=-1, fig_width=fw)
+        fig.canvas.draw()
+        bars = {a.get_ylabel(): a for a in fig.axes}
+        bed, ice = bars['Surface elevation (m)'], bars['Ice column depth (m)']
+        # tightbbox: the bar plus its tick labels and title, i.e. what must fit
+        bed_x1 = (bed.get_tightbbox(fig.canvas.get_renderer())
+                  .transformed(fig.transFigure.inverted()).x1)
+        assert ice.get_position().x0 > bed_x1, \
+            f"the two colorbars collide at fig_width={fw}"
+        assert ax.get_position().width > 0.5, \
+            f"the map is squeezed to {ax.get_position().width:.2f} at fig_width={fw}"
+        plt.close(fig)
+
+
+def test_section_names_its_ela_and_states_the_exaggeration(_iced_model):
+    """The section's ELA was a black dash indistinguishable from the contour
+    grid, and the panel's strong vertical exaggeration was unstated."""
+    from siim.plotting.landscape import ELA_COLOR
+    m = _iced_model
+    fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, cross_section=15.0)
+    ax_cs = _section_axes(fig)
+    texts = [t.get_text() for t in ax_cs.texts]
+    assert 'ELA' in texts
+    assert any(t.startswith('VE ') for t in texts), texts
+    zela = float(m.plot.model._zELA_output[-1])
+    ela_lines = [ln for ln in ax_cs.lines
+                 if ln.get_linestyle() == '--'
+                 and np.allclose(ln.get_ydata(), zela)]
+    assert ela_lines, "no dashed ELA line in the section"
+    assert matplotlib.colors.to_hex(ela_lines[0].get_color()) == ELA_COLOR
+    plt.close(fig)

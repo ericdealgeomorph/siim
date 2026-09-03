@@ -153,10 +153,13 @@ class ProfileMixin:
                 ax.axhline(m._zELA_output[idx], c='goldenrod', ls='-', lw=1, label='ELA')
                 ax.set_ylabel('Elevation (m)')
             elif field == 'ice_thickness':
-                ax.plot(x, ch.H[idx], 'steelblue', lw=1.5, label='2D ice thickness')
+                ax.plot(x, ch.H[idx], 'steelblue', lw=1.5, label='2D mean ice thickness')
                 if an is not None and an.H is not None:
-                    ax.plot(an.x, an.H, 'b--', lw=1, label='Analytical ice thickness')
-                ax.set_ylabel('Ice thickness (m)')
+                    ax.plot(an.x, an.H, 'b--', lw=1,
+                            label='Analytical mean ice thickness')
+                # H is the WIDTH-MEAN thickness the physics consumes, not the
+                # column depth landscape() paints (hc_over_H * H at the floor).
+                ax.set_ylabel('Mean ice thickness (m)')
             elif field == 'erosion_rate':
                 ax.plot(x, ch.erosion_rate[idx], 'firebrick', lw=1.5, label='Erosion rate')
                 ax.axhline(m.U, color='black', linestyle='--', lw=1, label='Uplift rate')
@@ -327,8 +330,8 @@ class ProfileMixin:
                         ax.axhline(m._zELA_output[t_idx], c='goldenrod', ls='-', lw=1, label='ELA')
                         ax.set_ylabel('Elevation (m)')
                     elif field == 'ice_thickness':
-                        ax.plot(x_km, m.H_out[t_idx, iy, :], 'steelblue', lw=1.5, label='Ice thickness')
-                        ax.set_ylabel('Ice thickness (m)')
+                        ax.plot(x_km, m.H_out[t_idx, iy, :], 'steelblue', lw=1.5, label='Mean ice thickness')
+                        ax.set_ylabel('Mean ice thickness (m)')
                     elif field == 'erosion_rate':
                         ax.plot(x_km, m.erosion_rate_out[t_idx, iy, :], 'firebrick', lw=1.5, label='Erosion rate')
                         ax.axhline(m.U, color='black', linestyle='--', lw=1, label='Uplift rate')

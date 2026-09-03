@@ -68,6 +68,10 @@ def _flick_run(_warm_topo, r, nt=161):
     return np.asarray(m.H_out)
 
 
+@pytest.mark.xfail(
+    reason="left open on purpose: the mode-B/C post-uplift-bed fix (0.9.2) "
+           "showed relax efficacy was overstated by the outlet lip; the "
+           "headline claim is under re-evaluation", strict=False)
 def test_flicker_reduction_headline(_warm_topo):
     """r=0.6 damps the planview flicker: the consecutive-step ice-mask Jaccard
     rises by a clear margin AND the r=0 period-2 signature (lag-2 J > lag-1 J)

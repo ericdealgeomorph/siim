@@ -24,8 +24,25 @@ __all__ = [
     "_slider_view", "_profile_slider", "_add_colorbar", "output_path",
     "_compute_glacier_field", "_trace_paths_arrays", "_footprint_ice_surface",
     "_smooth_ice_mask", "_field_ice_mask", "_clean_ice_mask", "_mean_recent_H",
-    "_priority_flood", "_shade_rgb_soft",
+    "_priority_flood", "_shade_rgb_soft", "_ice_ramp", "ICE_RAMP_STOPS",
+    "_channel_closure", "_trunk_ribbons",
 ]
+
+# The glacier ramp of the depth-graded ('veil') ice shading: thin apron ->
+# trunk core. Deliberately avoids both ends of the bed map (gist_earth's navy
+# lowlands and white summits), so ice never reads as terrain.
+ICE_RAMP_STOPS = ('#eaf3fa', '#c5dff0', '#8ec4e3', '#4e9fd0', '#1f6fb0')
+_ICE_RAMP_CACHE = {}
+
+
+def _ice_ramp():
+    """The ``ICE_RAMP_STOPS`` colormap, built lazily (matplotlib stays out of
+    this module's import) and cached — ``animate_landscape`` asks per frame."""
+    if 'cmap' not in _ICE_RAMP_CACHE:
+        from matplotlib.colors import LinearSegmentedColormap
+        _ICE_RAMP_CACHE['cmap'] = LinearSegmentedColormap.from_list(
+            'siim_glacier', list(ICE_RAMP_STOPS))
+    return _ICE_RAMP_CACHE['cmap']
 
 
 # =====================================================================
@@ -205,6 +222,14 @@ def _rasterize_glacier_vertices_HU(H_raster, U_raster,
                 if h_here > H_raster[idx]:
                     H_raster[idx] = h_here
                     U_raster[idx] = Vv
+
+
+# The surface-carrying twins the trunk ribbons rasterize with. The HU kernels
+# are payload-agnostic (they interpolate ONE per-node scalar along the
+# segment and keep the depth-winner's value), so the flat source ice surface
+# rides the same code path as the velocity field, not a copied kernel.
+_rasterize_glacier_segments_HZ = _rasterize_glacier_segments_HU
+_rasterize_glacier_vertices_HZ = _rasterize_glacier_vertices_HU
 
 
 @numba.njit(cache=True)
@@ -768,6 +793,197 @@ def _compute_glacier_field(rec_2d, H_2d, area_2d, Qg_2d,
 
     return SimpleNamespace(H=H_field, U=U_field, Q=Q_field,
                             paths_xy=paths_xy)
+
+
+def _sanitized_receivers(rec_in):
+    """Flat int receiver array with NaNs mapped to SELF — the zarr round-trip
+    artefact at boundary nodes that ``_trace_paths_arrays`` and
+    ``_footprint_ice_surface`` both guard against (``nan_to_num``'s 0 is the
+    corner cell, which would grow a bogus path from every such node)."""
+    rec_flat = np.asarray(rec_in, dtype=float).ravel()
+    return np.where(np.isnan(rec_flat), np.arange(rec_flat.size),
+                    rec_flat).astype(np.int64)
+
+
+def _channel_closure(H_2d, rec_in, seed_mask):
+    """Trunk class: the DOWNSTREAM CLOSURE of ``seed_mask`` along the receivers.
+
+    A cell joins when one of its donors is already in the class, propagated
+    until nothing changes, so every icy cell downstream of a seed belongs and
+    the class runs out to the terminus. A plain width cut does not: at glacial
+    max on the reference run it reached 0 of 64 trunk termini, because the
+    tongue thins below the cut long before it ends. The walk stops at the first
+    ice-free receiver, so the class never leaves the glacier, and it is a
+    hysteresis class — a cell is a trunk because of what drains INTO it.
+
+    ``rec_in`` is the single-receiver output view (``receivers_out[i]``: the D8
+    receiver, or D-inf's largest-weight one). O(N) — each cell is added once.
+    """
+    H_2d = np.asarray(H_2d, dtype=float)
+    H = H_2d.ravel()
+    rec = _sanitized_receivers(rec_in)
+    cls = np.asarray(seed_mask, dtype=bool).ravel().copy()
+    frontier = np.nonzero(cls)[0]
+    while frontier.size:
+        r = rec[frontier]
+        grows = (r != frontier) & (H[r] > 0.0) & ~cls[r]
+        frontier = np.unique(r[grows])
+        cls[frontier] = True
+    return cls.reshape(H_2d.shape)
+
+
+def _trunk_ribbons(rec_2d, H_2d, area_2d, zs_2d, cells, nx, ny, Lx, Ly,
+                   alpha_g, oversample, wrap_y=False, wrap_x=False,
+                   hc_over_H=HC_OVER_H):
+    """Rasterize the trunk class as true-width ribbons (the ``'ribbons'`` ice
+    look): :func:`_compute_glacier_field`'s tracer restricted to ``cells``,
+    drawn at the claimed width ``W = alpha_g*H`` with a floor of 1.5 subgrid
+    pixels — the narrowest band the raster draws gap-free across a diagonal.
+
+    Three departures from ``_compute_glacier_field``'s smoothing, each measured
+    while prototyping:
+
+    - centreline sigma is HALF THE DRAWN WIDTH (not a fixed cell count), so the
+      smoother displaces a centreline by at most about its own half-width and a
+      tributary's end always lands inside the trunk it joins;
+    - the path END is PINNED back onto its node over the last sigma of arc
+      length. ``_variable_sigma_smooth``'s linear-extrapolation padding drifts
+      the endpoint by up to a sigma, which tore junctions open (one prototype
+      network: 13 glaciers rendered as 332 outline pieces before the pin);
+    - on a LOOPED axis the tracer closes its path at the wrap, so the step
+      across the seam is drawn here explicitly, once on each side.
+
+    Returns ``(depth, surface)`` on the oversampled grid: the parabolic column
+    depth across the ribbon (centreline ``hc_over_H*H``, cross-section mean
+    ``H`` — the carve convention) and the FLAT source ice surface
+    ``zs = zb + hc_over_H*H`` carried along the path, so the render shades the
+    glacier's own free surface rather than the bed under it. Ice-free pixels
+    keep depth 0.
+    """
+    H_2d = np.asarray(H_2d, dtype=float)
+    dx_grid = Lx / (nx - 1)
+    dy_grid = Ly / (ny - 1)
+    nx_sub = (nx - 1) * oversample + 1
+    ny_sub = (ny - 1) * oversample + 1
+    dx_sub = Lx / (nx_sub - 1)
+    dy_sub = Ly / (ny_sub - 1)
+    width_floor = 1.5 * max(dx_sub, dy_sub)
+    max_width = min(Lx, Ly) / 2
+    s_step = 0.5 * min(dx_sub, dy_sub)
+
+    # Restricting the tracer to the class: zeroing H outside it makes every
+    # non-class cell a terminus, so a ribbon tapers to a toe exactly where the
+    # class ends (the tracer walks one cell past it, at zero thickness).
+    H_cls = np.where(np.asarray(cells, dtype=bool), H_2d, 0.0)
+    paths, xc, yc, H_flat = _trace_paths_arrays(
+        rec_2d, H_cls, area_2d, nx, ny, Lx, Ly, 0.0)
+    zs = np.asarray(zs_2d, dtype=float).ravel()
+
+    seg = {k: [] for k in ('x1', 'y1', 'x2', 'y2', 'h1', 'h2',
+                           'w1', 'w2', 'z1', 'z2')}
+    vert = {k: [] for k in ('x', 'y', 'h', 'w', 'z')}
+
+    for path in paths:
+        if len(path) < 2:
+            continue
+        idx = np.asarray(path)
+        px, py = xc[idx], yc[idx]
+        ph = np.maximum(H_flat[idx], 0.0)
+        pw = np.minimum(alpha_g * ph, max_width)
+        pz = zs[idx]
+
+        ds = np.sqrt(np.diff(px) ** 2 + np.diff(py) ** 2)
+        s = np.concatenate([[0.0], np.cumsum(ds)])
+        L = s[-1]
+        if L == 0:
+            continue
+        n_dense = max(2, int(np.ceil(L / s_step)) + 1)
+        s_d = np.linspace(0.0, L, n_dense)
+        ds_d = L / (n_dense - 1)
+        px_d = np.interp(s_d, s, px)
+        py_d = np.interp(s_d, s, py)
+        ph_d = np.interp(s_d, s, ph)
+        pw_d = np.interp(s_d, s, pw)
+        pz_d = np.interp(s_d, s, pz)
+
+        sigma = 0.5 * np.maximum(pw_d, width_floor)
+        px_raw, py_raw = px_d, py_d
+        px_d = _variable_sigma_smooth(px_d, sigma, ds_d)
+        py_d = _variable_sigma_smooth(py_d, sigma, ds_d)
+        pin = np.clip((L - s_d) / max(sigma[-1], ds_d), 0.0, 1.0)
+        px_d = pin * px_d + (1.0 - pin) * px_raw
+        py_d = pin * py_d + (1.0 - pin) * py_raw
+
+        pw_d = np.maximum(pw_d, width_floor)
+        ph_d = hc_over_H * ph_d
+
+        for key, arr in (('x', px_d), ('y', py_d), ('h', ph_d),
+                         ('w', pw_d), ('z', pz_d)):
+            vert[key].append(arr)
+            seg[key + '1'].append(arr[:-1])
+            seg[key + '2'].append(arr[1:])
+
+    if wrap_x or wrap_y:
+        # Periodic seam: the tracer CLOSES a path at a wrap (a single segment
+        # from row 0 to row ny-1 would otherwise rasterize as a stripe across
+        # the whole domain), so the wrapped step is never drawn. Draw it here
+        # twice — once with the receiver shifted out past the seam, once with
+        # the source shifted — and let the rasterizer's clipping keep the half
+        # that lands on each side.
+        rec = _sanitized_receivers(rec_2d)
+        src = np.nonzero(H_cls.ravel() > 0.0)[0]
+        rcv = rec[src]
+        off_x = np.zeros(src.size)
+        off_y = np.zeros(src.size)
+        if wrap_x:                    # period nx*dx: column nx-1's right
+            gap = xc[rcv] - xc[src]   # neighbour is column 0, ONE cell away
+            off_x = -np.sign(gap) * (nx * dx_grid) * (np.abs(gap)
+                                                      > 2 * dx_grid)
+        if wrap_y:
+            gap = yc[rcv] - yc[src]
+            off_y = -np.sign(gap) * (ny * dy_grid) * (np.abs(gap)
+                                                      > 2 * dy_grid)
+        crosses = (off_x != 0.0) | (off_y != 0.0)
+        src, rcv = src[crosses], rcv[crosses]
+        off_x, off_y = off_x[crosses], off_y[crosses]
+        if src.size:
+            H_flat_cls = H_cls.ravel()
+            h_s = hc_over_H * H_flat_cls[src]
+            h_r = hc_over_H * H_flat_cls[rcv]
+            w_s = np.maximum(np.minimum(alpha_g * H_flat_cls[src], max_width),
+                             width_floor)
+            w_r = np.maximum(np.minimum(alpha_g * H_flat_cls[rcv], max_width),
+                             width_floor)
+            for sx, sy in ((0.0, 0.0), (-1.0, -1.0)):
+                # (0,0): source in place, receiver shifted out past the seam.
+                # (-1,-1): the same bridge translated back onto the far side.
+                seg['x1'].append(xc[src] + sx * off_x)
+                seg['y1'].append(yc[src] + sy * off_y)
+                seg['x2'].append(xc[rcv] + (sx + 1.0) * off_x)
+                seg['y2'].append(yc[rcv] + (sy + 1.0) * off_y)
+                seg['h1'].append(h_s)
+                seg['h2'].append(h_r)
+                seg['w1'].append(w_s)
+                seg['w2'].append(w_r)
+                seg['z1'].append(zs[src])
+                seg['z2'].append(zs[rcv])
+
+    depth = np.zeros(ny_sub * nx_sub, dtype=float)
+    surface = np.zeros(ny_sub * nx_sub, dtype=float)
+    if seg['x1']:
+        c = {k: np.ascontiguousarray(np.concatenate(v))
+             for k, v in seg.items()}
+        _rasterize_glacier_segments_HZ(
+            depth, surface, c['x1'], c['y1'], c['x2'], c['y2'],
+            c['h1'], c['h2'], c['w1'], c['w2'], c['z1'], c['z2'],
+            nx_sub, ny_sub, dx_sub, dy_sub)
+    if vert['x']:
+        v = {k: np.ascontiguousarray(np.concatenate(vv))
+             for k, vv in vert.items()}
+        _rasterize_glacier_vertices_HZ(
+            depth, surface, v['x'], v['y'], v['h'], v['w'], v['z'],
+            nx_sub, ny_sub, dx_sub, dy_sub)
+    return depth.reshape(ny_sub, nx_sub), surface.reshape(ny_sub, nx_sub)
 
 
 def _footprint_ice_surface(H_in, zb_in, rec_in, alpha_g, dy, dx,

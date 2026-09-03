@@ -126,3 +126,21 @@ def test_clean_ice_mask_seam_aware():
     hole[20:24, -3:] = False
     assert (~_clean_ice_mask(hole, minc, os_)).sum() == 24     # border: kept open
     assert (~_clean_ice_mask(hole, minc, os_, wrap_x=True)).sum() == 0
+
+
+# --- the 1D ice panel names the WIDTH-MEAN thickness ------------------------
+
+def test_ice_thickness_panel_names_the_mean(tmp_path, monkeypatch):
+    """H_out is the width-MEAN thickness the physics consumes, not the channel
+    -floor column depth 1.5*H that landscape() paints; the 1D panel used the
+    same 'Ice thickness (m)' label as the map, so the two read as one quantity
+    (Eric, 2026-09-03)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    monkeypatch.chdir(tmp_path)
+    m = siim1d(_glac1d()); m.run()
+    fig, axes = m.plot.profile(fields='ice_thickness')
+    ax = axes[0] if np.ndim(axes) else axes
+    assert ax.get_ylabel() == 'Mean ice thickness (m)'
+    plt.close(fig)

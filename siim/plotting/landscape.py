@@ -14,36 +14,62 @@ lives in ``_render.py``.
 import numpy as np
 
 from ._render import (
-    _add_colorbar, output_path,
+    _add_colorbar, output_path, _ice_ramp,
     _footprint_ice_surface, _smooth_ice_mask, _field_ice_mask,
     _clean_ice_mask, _mean_recent_H, _compute_glacier_field,
+    _channel_closure, _trunk_ribbons,
     _priority_flood, _shade_rgb_soft,
 )
+
+# The ELA line in the cross-section / hypsometry panels: a forcing datum, not
+# another contour, so it gets its own colour.
+ELA_COLOR = '#c0392b'
+
+
+def _veil_alpha(t):
+    """Veil opacity at normalised column depth ``t``: a LINEAR ramp topping out
+    at ``t = 0.35``.
+
+    The old ``0.18 + 0.82*sqrt(t/0.40)`` front-loading put alpha near 0.5 on a
+    30 m column, so a highland of sub-resolution apron ice read as one
+    half-opaque sheet with the trunks barely darker streaks through it (measured
+    on the reference run at glacial max: trunk-vs-apron RGB distance 0.13,
+    against 0.67 for apron-vs-bare). Linear keeps thin ice subordinate and
+    spends the ramp where the depth gradient carries the information."""
+    return np.clip(0.12 + 0.88 * np.clip(t / 0.35, 0.0, 1.0), 0.0, 1.0)
 
 
 def _resolve_style(style, field, H_threshold, ice_sigma_cells, ice_time_avg,
                    sigma_cells, oversample, hillshade, ice_extent,
-                   show_trimline, area_threshold, contour_interval):
+                   show_margin, area_threshold, contour_interval,
+                   ice_shading=None, trunk_display=None):
     """Resolve every unset (``None``) style-differentiated knob per ``style``;
     an explicit value always wins over the preset.
 
-    ``'smooth'`` (the default) is the cartographic view: bare bed
-    (field 'bedrock'), supersampled (oversample 4) + Gaussian-de-staircased
+    ``'smooth'`` (the default) is the cartographic view: bed AND ice
+    (field 'bedrock+ice' — the ice is the model's headline state, so both
+    presets draw it), supersampled (oversample 4) + Gaussian-de-staircased
     terrain (sigma_cells = oversample), hillshaded, contoured
-    (contour_interval 100 m), ice (when a +ice field is asked for) drawn across
-    the sub-grid glacier width (ice_extent 'footprint') with thin ice
-    thresholded off (H_threshold 100), no area gate (area_threshold 0), and its
-    outline de-staircased (ice_sigma_cells 2 subgrid px).
+    (contour_interval 100 m), ice drawn across the sub-grid glacier width
+    (ice_extent 'footprint') with NOTHING hidden by thickness (H_threshold 0)
+    and no area gate (area_threshold 0), its outline de-staircased
+    (ice_sigma_cells 2 subgrid px) and margin drawn (show_margin True), and
+    shaded as a depth-graded translucent veil (ice_shading 'veil') with the
+    resolved trunk glaciers drawn over it as true-width ribbons
+    (trunk_display 'ribbons').
 
-    ``'raw'`` is the naked model output: bed AND ice by default (field
-    'bedrock+ice' — raw is an inspection view, so it shows the ice), one pixel
-    per model cell (oversample 1), NO terrain or ice smoothing (sigma_cells 0,
-    ice_sigma_cells 0), NO hillshade, NO trimline (show_trimline False), NO
-    contours (contour_interval 0), ice shown as the glaciated channel CELLS
-    themselves (ice_extent 'cells') with every icy cell kept by thickness
-    (H_threshold 0) but small-catchment specks dropped by a
-    contributing-area gate (area_threshold 1e6 m², Eric 2026-07-07). Use it to
-    inspect exactly what the model committed, unretouched.
+    ``'raw'`` is the naked model output: bed AND ice (field 'bedrock+ice'),
+    one pixel per model cell (oversample 1), NO terrain or ice smoothing
+    (sigma_cells 0, ice_sigma_cells 0), NO hillshade, NO margin outline
+    (show_margin False), NO contours (contour_interval 0), FLAT ice
+    (ice_shading 'flat' — one colour, no depth grading to read as structure),
+    NO trunk ribbons (trunk_display 'none'),
+    ice shown as the glaciated channel CELLS themselves (ice_extent 'cells')
+    with every icy cell kept by thickness (H_threshold 0, as in smooth) but
+    small-catchment
+    specks dropped by a contributing-area gate (area_threshold 1e6 m², Eric
+    2026-07-07). Use it to inspect exactly what the model committed,
+    unretouched.
 
     ``ice_time_avg`` resolves to 1 (off) for both — it blends OUTPUT frames,
     which at coarsely-spaced saves double-exposes two glacial epochs; a larger
@@ -56,9 +82,15 @@ def _resolve_style(style, field, H_threshold, ice_sigma_cells, ice_time_avg,
         raise ValueError(f"style must be 'raw' or 'smooth', got {style!r}")
     raw = style == 'raw'
     if field is None:
-        field = 'bedrock+ice' if raw else 'bedrock'
+        # Both presets show ice: resolving smooth to bare 'bedrock' made every
+        # ice knob a silent no-op on the default render (Eric, 2026-09-03).
+        field = 'bedrock+ice'
+    if ice_shading is None:
+        ice_shading = 'flat' if raw else 'veil'
     if H_threshold is None:
-        H_threshold = 0.0 if raw else 100.0
+        # BOTH styles keep every icy cell (Eric, 2026-09-03): the veil already
+        # fades thin ice out, so a thickness gate only DELETES real glacierets.
+        H_threshold = 0.0
     if ice_sigma_cells is None:
         ice_sigma_cells = 0.0 if raw else 2.0
     if ice_time_avg is None:
@@ -71,16 +103,37 @@ def _resolve_style(style, field, H_threshold, ice_sigma_cells, ice_time_avg,
         ice_extent = 'cells' if raw else 'footprint'
     if sigma_cells is None:
         sigma_cells = 0.0 if raw else float(oversample)
-    if show_trimline is None:
-        show_trimline = False if raw else True
+    if show_margin is None:
+        show_margin = False if raw else True
     if area_threshold is None:
         # raw drops small-catchment specks (Eric, 2026-07-07); smooth keeps all.
         area_threshold = 1e6 if raw else 0.0
     if contour_interval is None:
         contour_interval = 0.0 if raw else 100.0
+    if trunk_display is None:
+        # raw draws the cells the model committed and nothing else; the
+        # cartographic view fills the resolved trunks as ribbons.
+        trunk_display = 'none' if raw else 'ribbons'
+    if ice_shading not in ('flat', 'veil'):
+        raise ValueError(
+            f"ice_shading must be 'flat' or 'veil', got {ice_shading!r}")
+    if trunk_display not in ('none', 'ribbons'):
+        raise ValueError(
+            f"trunk_display must be 'none' or 'ribbons', got {trunk_display!r}")
     return (field, H_threshold, ice_sigma_cells, ice_time_avg,
-            sigma_cells, oversample, hillshade, ice_extent, show_trimline,
-            area_threshold, contour_interval)
+            sigma_cells, oversample, hillshade, ice_extent, show_margin,
+            area_threshold, contour_interval, ice_shading, trunk_display)
+
+
+def _run_global_H_max(m):
+    """The RUN-GLOBAL drawn-column depth ``hc_over_H * max H_out`` — the
+    default top of the ice scale.
+
+    The veil and the ice colorbar both read it, so a still and every frame of a
+    movie put the same colour on the same depth (a per-frame max would repaint
+    each frame's thickest trunk the same dark blue). ``_frozen_scale_kwargs``
+    freezes ``H_max`` to exactly this value, so the two paths agree."""
+    return float(m.hc_over_H * np.nanmax(np.asarray(m.H_out)))
 
 
 def _frozen_scale_kwargs(m, landscape_kwargs):
@@ -99,7 +152,7 @@ def _frozen_scale_kwargs(m, landscape_kwargs):
     if kwargs.get('z_max') is None:
         kwargs['z_max'] = float(np.nanmax(np.asarray(m.z_out)))
     if kwargs.get('H_max') is None:
-        kwargs['H_max'] = float(m.hc_over_H * np.nanmax(np.asarray(m.H_out)))
+        kwargs['H_max'] = _run_global_H_max(m)
     return kwargs
 
 
@@ -158,7 +211,8 @@ class LandscapeMixin:
     def landscape(self, field=None, i=-1, style='smooth', oversample=None,
                   channel_threshold=1e5, H_threshold=None, area_threshold=None,
                   z_min=0.0, z_max=None, cmap_bed='gist_earth',
-                  ice_extent=None, ice_color='#e5e8ed',
+                  ice_extent=None, ice_color='#e5e8ed', ice_shading=None,
+                  trunk_display=None, trunk_width_cells=1.0, trunk_alpha=0.85,
                   ice_smoothing='mask', min_ice_cells=0, ice_time_avg=None,
                   ice_cmap=None, H_min=0.0, H_max=None,
                   lake_color='#a8c8e8', lake_min_depth=0.5, lake_min_area=0.0,
@@ -166,7 +220,8 @@ class LandscapeMixin:
                   hillshade=None, azdeg=315, altdeg=45, ve=2.0,
                   contour_interval=None, contour_color='k',
                   contour_lw=0.2, contour_alpha=0.4,
-                  show_trimline=None, trimline_color='#36506b', trimline_lw=0.6,
+                  show_margin=None, margin_color='#1b4f72', margin_lw=1.0,
+                  show_trimline=None, trimline_color=None, trimline_lw=None,
                   cross_section=None, cross_section_color='red', hyp_max=15.0,
                   show_smoothed_paths=False, smoothed_path_color='red',
                   smoothed_path_lw=0.4, fig_width=14, fig=None, ax=None,
@@ -174,35 +229,77 @@ class LandscapeMixin:
                   save=None):
         """Atlas-style render of the TRUE model state.
 
-        ``field`` (``None`` -> smooth ``'bedrock'``, raw ``'bedrock+ice'``):
+        ``field`` (``None`` -> ``'bedrock+ice'`` under BOTH styles):
           - ``'bedrock'`` — the tracked bed ``z - HC_OVER_H*H``.
-          - ``'bedrock+ice'`` — the presented surface with ice filled across the
-            channel width (``ice_extent='footprint'``, the display dual of the
-            width carve; ``'cells'`` shows the raw channel-cell ice). Pass
-            ``ice_cmap`` (e.g. ``'Blues'``) to colour ice by column depth instead
-            of flat ``ice_color``.
+          - ``'bedrock+ice'`` (the default) — the presented surface with ice
+            filled across the channel width (``ice_extent='footprint'``, the
+            display dual of the width carve; ``'cells'`` shows the raw
+            channel-cell ice), shaded per ``ice_shading``. Pass ``ice_cmap``
+            (e.g. ``'Blues'``) to colour ice by column depth with your own
+            colormap instead.
           - ``'bedrock+lakes'`` — bed with priority-flooded lakes.
+
+        ``ice_shading`` (``None`` -> smooth ``'veil'``, raw ``'flat'``) — how
+        ice with no explicit ``ice_cmap`` is painted:
+
+          - ``'veil'`` — a depth-graded TRANSLUCENT glacier ramp alpha-blended
+            over the bed, so thin apron ice lets the terrain read through and
+            the trunk core saturates. Depth is normalised on ``H_max`` (default
+            the RUN-GLOBAL ``hc_over_H * max H_out``, so frames of a movie are
+            directly comparable) and gets its own colorbar.
+          - ``'flat'`` — one opaque ``ice_color`` everywhere ice is drawn.
+
+        ``ice_cmap`` overrides both (opaque, your colormap, per-frame ``H_max``
+        fallback).
+
+        ``trunk_display`` (``None`` -> smooth ``'ribbons'``, raw ``'none'``) —
+        how the TRUNK GLACIERS are drawn. A trunk cell is any icy cell
+        DOWNSTREAM of a cell whose claimed width ``W = alpha_g*H`` already
+        spans ``trunk_width_cells`` grid cells (default 1.0 — the width the
+        grid can just resolve), the class carried along the receivers to the
+        terminus so a thinning tongue stays a trunk down to its toe.
+
+          - ``'ribbons'`` — the class is traced and drawn at its true width
+            (parabolic column depth on the same ramp, its own flat ice surface
+            in the hillshade and the section) at ``trunk_alpha`` opacity, and
+            the veil is built from the ice that is LEFT, so the trunks read as
+            coherent tongues instead of streaks in a uniform apron.
+            ``show_margin`` then outlines the ribbons only.
+          - ``'none'`` — the veil alone over every icy cell (the pre-ribbon
+            render).
+
+        ``trunk_alpha`` is a FLOOR on the ribbon opacity, so deep ice keeps the
+        ramp's own (higher) value; ``ice_shading='flat'`` paints ribbons the
+        single ``ice_color``, like the rest of the ice.
 
         ``style`` — ONE knob for the whole rendering mode. It sets the unset
         (``None``) values of ``field`` / ``H_threshold`` / ``ice_sigma_cells`` /
         ``ice_time_avg`` / ``sigma_cells`` / ``oversample`` / ``hillshade`` /
-        ``ice_extent`` / ``show_trimline`` / ``area_threshold`` /
-        ``contour_interval``; any explicit value overrides the preset:
+        ``ice_extent`` / ``show_margin`` / ``area_threshold`` /
+        ``contour_interval`` / ``ice_shading``; any explicit value overrides the
+        preset:
 
           - ``'smooth'`` (DEFAULT, stills and movies): the cartographic view —
-            supersampled (``oversample=4``) + Gaussian-de-staircased terrain
+            bed AND ice (``field='bedrock+ice'``), supersampled
+            (``oversample=4``) + Gaussian-de-staircased terrain
             (``sigma_cells=oversample``), ``hillshade=True``, contoured
             (``contour_interval=100``), ice drawn across the sub-grid glacier
-            width (``ice_extent='footprint'``) with thin ice thresholded off
-            (``H_threshold=100``) and no area gate (``area_threshold=0``), its
-            outline de-staircased (``ice_sigma_cells=2`` subgrid px). Hides
+            width (``ice_extent='footprint'``) as a depth-graded translucent
+            veil (``ice_shading='veil'``) with the resolved trunks filled as
+            true-width ribbons over it (``trunk_display='ribbons'``), nothing
+            hidden by thickness
+            (``H_threshold=0``) and no area gate (``area_threshold=0``), its
+            outline de-staircased (``ice_sigma_cells=2`` subgrid px) and its
+            margin outlined (``show_margin=True``). Hides
             nothing categorical (``min_ice_cells`` stays off — it can hide real
             small glacierets and is opt-in only).
           - ``'raw'``: the naked model output — one pixel per model cell
             (``oversample=1``), NO terrain or ice smoothing
             (``sigma_cells=0``, ``ice_sigma_cells=0``), NO hillshade, NO
-            trimline (``show_trimline=False``), NO contours
-            (``contour_interval=0``), and ice shown as the glaciated channel
+            margin outline (``show_margin=False``), NO contours
+            (``contour_interval=0``), FLAT single-colour ice
+            (``ice_shading='flat'``), NO trunk ribbons
+            (``trunk_display='none'``), and ice shown as the glaciated channel
             CELLS themselves (``ice_extent='cells'``) — every icy cell kept by
             thickness (``H_threshold=0``) but small-catchment specks dropped by
             a contributing-area gate (``area_threshold=1e6`` m²), rendered
@@ -219,13 +316,15 @@ class LandscapeMixin:
         values >= ~1 native cell glob nearby ice and erase 1-cell threads.
 
         The parameters group as: what-to-draw (``field``, ``i``, ``style``,
-        ``ice_extent``) · ice display (the thresholds/smoothing/cleanup knobs
+        ``ice_extent``, ``trunk_display``) · ice display (the thresholds/
+        smoothing/cleanup knobs
         below) · terrain (``oversample``, ``sigma_cells``, ``hillshade``/
         ``azdeg``/``altdeg``/``ve``, ``contour_*``, ``z_min``/``z_max``,
-        ``cmap_bed``) · overlays (``show_trimline``/``trimline_*``,
+        ``cmap_bed``) · overlays (``show_margin``/``margin_*``,
         ``cross_section``/``hyp_max``, ``show_smoothed_paths``/
-        ``smoothed_path_*``/``channel_threshold``) · colours (``ice_color``/
-        ``ice_cmap``/``H_min``/``H_max``, ``lake_*``) · figure plumbing
+        ``smoothed_path_*``/``channel_threshold``) · colours (``ice_shading``/
+        ``ice_color``/``ice_cmap``/``H_min``/``H_max``,
+        ``trunk_alpha``, ``lake_*``) · figure plumbing
         (``fig_width``, ``fig``/``ax``/``ax_cs``/``ax_hyp``, ``colorbar``,
         ``save``).
 
@@ -245,7 +344,9 @@ class LandscapeMixin:
 
         Ice display is cropped two independent ways (a cell shows ice only if it
         passes both): ``H_threshold`` (m, by column thickness; ``None``
-        resolves per ``style`` — smooth 100, raw 0) and
+        resolves to ``0`` under BOTH styles — nothing is hidden by thickness,
+        since the depth-graded veil already fades thin ice out and a gate only
+        deletes real glacierets; raise it explicitly to crop them) and
         ``area_threshold`` (m², by upstream drainage area — gates which cells
         *seed* the footprint, so it drops small-catchment specks without
         touching cells that lie under a larger glacier's footprint; crops
@@ -254,9 +355,14 @@ class LandscapeMixin:
         drainage area, so it must exceed one cell area
         (``Lx*Ly/((nx-1)*(ny-1))``) to gate anything — a value below that is a
         silent no-op.
-        ``show_trimline`` outlines the glacier margin (the ice-mask 1/2-level).
-        Pass ``ice_cmap`` (e.g. ``'Blues'``) to colour ice by thickness, which
-        adds its own colorbar.
+        ``show_margin`` outlines the CURRENT ice margin (the ice-mask
+        1/2-level — or the trunk ribbons alone under
+        ``trunk_display='ribbons'``) in ``margin_color``/``margin_lw``. (The old
+        ``show_trimline``/``trimline_color``/``trimline_lw`` names are
+        deprecated aliases — they still work, with a ``DeprecationWarning``;
+        the outline is the live margin, not a trimline.) Pass ``ice_cmap``
+        (e.g. ``'Blues'``) to colour ice by thickness with your own colormap;
+        it, like the default veil, adds its own colorbar.
 
         Three display-side anti-flicker knobs damp the per-step ice-mask jitter
         in animations (all opt-in — no preset engages them; see
@@ -296,12 +402,27 @@ class LandscapeMixin:
         from scipy.ndimage import map_coordinates, gaussian_filter
 
         m = self.model
+        # Deprecated 'trimline' spelling: the outline is the CURRENT margin.
+        for old, new, val in (('show_trimline', 'show_margin', show_trimline),
+                              ('trimline_color', 'margin_color', trimline_color),
+                              ('trimline_lw', 'margin_lw', trimline_lw)):
+            if val is not None:
+                import warnings
+                warnings.warn(f"{old} is deprecated, use {new} (the outline is "
+                              "the current ice margin, not a trimline)",
+                              DeprecationWarning, stacklevel=2)
+        if show_trimline is not None and show_margin is None:
+            show_margin = show_trimline
+        if trimline_color is not None:
+            margin_color = trimline_color
+        if trimline_lw is not None:
+            margin_lw = trimline_lw
         (field, H_threshold, ice_sigma_cells, ice_time_avg, sigma_cells,
-         oversample, hillshade, ice_extent, show_trimline, area_threshold,
-         contour_interval) = _resolve_style(
+         oversample, hillshade, ice_extent, show_margin, area_threshold,
+         contour_interval, ice_shading, trunk_display) = _resolve_style(
             style, field, H_threshold, ice_sigma_cells, ice_time_avg,
-            sigma_cells, oversample, hillshade, ice_extent, show_trimline,
-            area_threshold, contour_interval)
+            sigma_cells, oversample, hillshade, ice_extent, show_margin,
+            area_threshold, contour_interval, ice_shading, trunk_display)
         if field not in ('bedrock', 'bedrock+ice', 'bedrock+lakes'):
             raise ValueError("field must be 'bedrock', 'bedrock+ice', or "
                              f"'bedrock+lakes', got {field!r}")
@@ -321,7 +442,7 @@ class LandscapeMixin:
             raise ValueError(
                 "ice_smoothing='field' needs H_threshold > 0: the clipped "
                 f"field min(H, 2*H_threshold) is all zero at {H_threshold!r}, "
-                "so NO ice would be drawn (style='raw' resolves H_threshold "
+                "so NO ice would be drawn (both styles resolve H_threshold "
                 "to 0 — pass an explicit H_threshold with it).")
         if int(ice_time_avg) < 1:
             raise ValueError(f"ice_time_avg must be >= 1, got {ice_time_avg!r}")
@@ -354,11 +475,37 @@ class LandscapeMixin:
         wrap_x = bs[0] == 'looped'
         wrap_y = bs[2] == 'looped'
 
+        # The TRUNK CLASS (trunk_display='ribbons'): the resolved glaciers —
+        # every icy cell downstream of one whose claimed width W = alpha_g*H
+        # already spans trunk_width_cells grid cells. They are drawn below as
+        # traced true-width ribbons, so the cell veil is built from the thin
+        # ice that is LEFT (no cell is drawn twice). A frame whose ice never
+        # reaches the resolution has an EMPTY class and paints the plain veil.
+        ribbons = show_ice and trunk_display == 'ribbons'
+        trunk_cells = None
+        if ribbons:
+            cell = max(m.Lx / (nx - 1), m.Ly / (ny - 1))
+
+            def _trunk_class(H_src):
+                return _channel_closure(
+                    H_src, rec_in, m.alpha_g * np.asarray(H_src)
+                    >= trunk_width_cells * cell)
+
+            def _ribbons(H_src, cells):
+                return _trunk_ribbons(
+                    rec_in, H_src, area_in,
+                    np.asarray(zb_in) + m.hc_over_H * np.asarray(H_src),
+                    cells, nx, ny, m.Lx, m.Ly, m.alpha_g, oversample,
+                    wrap_y=wrap_y, wrap_x=wrap_x, hc_over_H=m.hc_over_H)
+
+            trunk_cells = _trunk_class(H_ice)
+        H_veil = np.where(trunk_cells, 0.0, H_ice) if ribbons else H_ice
+
         if show_ice and ice_extent == 'footprint':
             # Footprint fill (display dual of the width carve): per-cell ice
             # surface from the power-diagram attribution, computed native + up.
             z_fill_nat, ice_nat, depth_nat = _footprint_ice_surface(
-                H_ice, zb_in, rec_in, m.alpha_g,
+                H_veil, zb_in, rec_in, m.alpha_g,
                 m.Ly / (ny - 1), m.Lx / (nx - 1),
                 wrap_y=wrap_y, wrap_x=wrap_x,
                 H_threshold=H_threshold, area_in=area_in,
@@ -371,7 +518,8 @@ class LandscapeMixin:
                 # (the 'cells' extent already reads z_in). Skipped entirely at
                 # ice_time_avg = 1, where the single fill above is frame i.
                 z_fill_nat = _footprint_ice_surface(
-                    H_in, zb_in, rec_in, m.alpha_g,
+                    np.where(trunk_cells, 0.0, H_in) if ribbons else H_in,
+                    zb_in, rec_in, m.alpha_g,
                     m.Ly / (ny - 1), m.Lx / (nx - 1),
                     wrap_y=wrap_y, wrap_x=wrap_x,
                     H_threshold=H_threshold, area_in=area_in,
@@ -396,24 +544,50 @@ class LandscapeMixin:
             H_col = np.where(ice_mask, depth_up, 0.0)
         else:
             z_sub = map_coordinates(z_in, [Y, X], order=3, mode='nearest')
-            H_sub = map_coordinates(H_ice, [Y, X], order=0, mode='nearest')
+            H_sub = map_coordinates(H_veil, [Y, X], order=0, mode='nearest')
             if ice_smoothing == 'field':
                 # Smooth the CLIPPED thickness field, then threshold (anti-flicker
                 # dual of the binary-mask smooth). Area gate: pre-zero H below the
                 # area threshold so the level set still respects it.
-                H_field = H_ice
+                H_field = H_veil
                 if area_threshold > 0:
-                    H_field = np.where(area_in >= area_threshold, H_ice, 0.0)
+                    H_field = np.where(area_in >= area_threshold, H_veil, 0.0)
                 ice_mask = _field_ice_mask(H_field, Y, X, ice_sigma_cells,
                                            H_threshold)
             else:
-                cells_ok = H_ice > H_threshold
+                cells_ok = H_veil > H_threshold
                 if area_threshold > 0:
                     cells_ok = cells_ok & (area_in >= area_threshold)
                 ice_mask = _smooth_ice_mask(cells_ok, Y, X, ice_sigma_cells)
             ice_mask = _clean_ice_mask(ice_mask, min_ice_cells, oversample,
                                        wrap_y=wrap_y, wrap_x=wrap_x)
             H_col = np.where(ice_mask, m.hc_over_H * H_sub, 0.0)
+
+        trunk_mask = None
+        if ribbons:
+            # True-width ribbons over the veil: the sub-cell apron stays a
+            # veil, the resolved trunks become coherent tongues with their own
+            # (flat) ice surface. The ribbon carries BOTH the drawn column
+            # depth and that surface, so the hillshade shades the glacier and
+            # the cross-section reads the same composite the map does.
+            trunk_mask = np.zeros_like(ice_mask)
+            if trunk_cells.any():
+                trunk_depth, trunk_zs = _ribbons(H_ice, trunk_cells)
+                trunk_mask = trunk_depth > 0.0
+                H_col = np.where(trunk_mask, trunk_depth, H_col)
+                if int(ice_time_avg) > 1:
+                    # ...but the ribbon SURFACE is terrain (it goes into the
+                    # composite), and ice_time_avg is an ice-layer knob: take
+                    # it from frame i's own ice, exactly as the footprint fill
+                    # does above. Trunk pixels with no frame-i ribbon fall back
+                    # to the bare bed below.
+                    cells_i = _trunk_class(H_in)
+                    trunk_zs = (_ribbons(H_in, cells_i)[1] if cells_i.any()
+                                else np.zeros_like(trunk_zs))
+                # never below the local bed (a ribbon over rising ground)
+                z_sub = np.where(trunk_mask, np.maximum(trunk_zs, zb_sub),
+                                 z_sub)
+                ice_mask = ice_mask | trunk_mask
 
         paths_xy = None
         if show_smoothed_paths:
@@ -446,6 +620,7 @@ class LandscapeMixin:
 
         ice_cmap_obj = None
         ice_norm = None
+        veil = show_ice and ice_cmap is None and ice_shading == 'veil'
         if show_ice and ice_cmap is not None:
             if H_max is None:
                 # Guard an ice-free frame (all-False mask): .max() on an empty
@@ -458,8 +633,33 @@ class LandscapeMixin:
                 H_max_eff = H_min + 1.0
             ice_cmap_obj = plt.get_cmap(ice_cmap)
             ice_norm = Normalize(vmin=H_min, vmax=H_max_eff)
+        elif veil:
+            # RUN-GLOBAL depth scale, not this frame's max: the veil is meant
+            # to be frame-comparable in a movie (animate freezes H_max to the
+            # very same value, so still and movie agree).
+            H_max_eff = _run_global_H_max(m) if H_max is None else float(H_max)
+            if H_max_eff <= H_min:
+                H_max_eff = H_min + 1.0
+            ice_cmap_obj = _ice_ramp()
+            ice_norm = Normalize(vmin=H_min, vmax=H_max_eff)
 
-        if show_ice and ice_cmap_obj is not None:
+        if veil:
+            # Depth-graded TRANSLUCENT ice: alpha-blend the glacier ramp onto
+            # the bed instead of stamping one opaque colour over it, so thin
+            # apron ice lets the terrain read through while the trunk core
+            # saturates (the ramp is _veil_alpha).
+            t_veil = np.asarray(np.clip(ice_norm(H_col), 0.0, 1.0))
+            a_veil = np.where(ice_mask, _veil_alpha(t_veil), 0.0)
+            if trunk_mask is not None:
+                # The ribbons must read as GLACIERS, not as more veil: paint
+                # them at trunk_alpha, a FLOOR (deep ice is already at least
+                # this opaque on the ramp) — the bed stops showing through the
+                # trunk, so trunk and apron separate at a glance.
+                a_veil = np.where(trunk_mask, np.maximum(a_veil, trunk_alpha),
+                                  a_veil)
+            a_veil = a_veil[..., np.newaxis]
+            rgb = (1.0 - a_veil) * rgb + a_veil * ice_cmap_obj(t_veil)[..., :3]
+        elif show_ice and ice_cmap_obj is not None:
             rgb[ice_mask] = ice_cmap_obj(ice_norm(H_col[ice_mask]))[..., :3]
         elif show_ice:
             rgb[ice_mask] = np.asarray(to_rgb(ice_color))
@@ -545,10 +745,13 @@ class LandscapeMixin:
         # Crisp glacier margin: the 1/2-level of the (smoothed) ice mask — the
         # same outline the fill is thresholded at, drawn as a thin line so the
         # ice extent reads at a glance and a one-cell footprint flip is a small
-        # wobble rather than a colour snap.
-        if show_ice and show_trimline and ice_mask.any():
-            ax.contour(x_axis, y_axis, ice_mask.astype(float), levels=[0.5],
-                       colors=[trimline_color], linewidths=trimline_lw,
+        # wobble rather than a colour snap. Under ribbons it outlines the
+        # RIBBONS only: outlining the veil too would ring every sub-cell
+        # glacieret, and the veil's whole point is to stay subordinate.
+        margin_of = ice_mask if trunk_mask is None else trunk_mask
+        if show_ice and show_margin and margin_of.any():
+            ax.contour(x_axis, y_axis, margin_of.astype(float), levels=[0.5],
+                       colors=[margin_color], linewidths=margin_lw,
                        alpha=0.9, zorder=2.6)
 
         if show_smoothed_paths and paths_xy:
@@ -578,8 +781,19 @@ class LandscapeMixin:
                 cax_bed = divider.append_axes('right', size='4%', pad=0.05)
                 ax.figure.colorbar(sm_bed, cax=cax_bed, label=bed_label)
                 sm_ice = plt.cm.ScalarMappable(cmap=ice_cmap_obj, norm=ice_norm)
-                cax_ice = divider.append_axes('right', size='4%', pad=0.7)
-                ax.figure.colorbar(sm_ice, cax=cax_ice, label='Ice thickness (m)')
+                # pad is in INCHES and must clear the elevation bar's tick
+                # labels + rotated title — a TYPOGRAPHIC width, not a fraction
+                # of the page. Measured on this layout: 0.7 in clears down to
+                # fig_width=5, while a purely relative 0.05*fig_width collides
+                # everywhere below ~14 in. So 0.7 is the FLOOR and the pad only
+                # grows (relatively) on a figure wider than that.
+                cax_ice = divider.append_axes('right', size='4%',
+                                              pad=max(0.7, 0.05 * fig_width))
+                # What the map paints is the local COLUMN depth to the flat ice
+                # surface (hc_over_H * H at the thalweg, more on carved flanks)
+                # — not the width-mean H that map(field='ice') shows.
+                ax.figure.colorbar(sm_ice, cax=cax_ice,
+                                   label='Ice column depth (m)')
             else:
                 _add_colorbar(sm_bed, ax, label=bed_label)
 
@@ -633,8 +847,9 @@ class LandscapeMixin:
                                    (z_grid <= cs_profile.reshape(1, -1))).astype(float)
                     ice_img = np.zeros((n_z, nx_sub, 4))
                     if ice_cmap_obj is not None:
-                        # colour each ice column by its thickness on the SAME
-                        # norm as the map, so the transect matches the plan view
+                        # colour each ice column by its depth on the SAME norm
+                        # as the map (the veil ramp, or an explicit ice_cmap),
+                        # so the transect matches the plan view
                         cs_thick = np.maximum(cs_profile - cs_bedrock, 0.0)
                         col_rgb = ice_cmap_obj(ice_norm(cs_thick))[:, :3]
                         ice_img[..., :3] = col_rgb[np.newaxis, :, :]
@@ -670,8 +885,17 @@ class LandscapeMixin:
                     ax_cs.plot(cs_x, cs_profile, color='black', lw=1.0, zorder=4)
 
                 ax_cs.axhline(0.0, color='black', lw=0.8, zorder=4)
-                ax_cs.axhline(float(m._zELA_output[i]), color='black',
-                              linestyle='--', lw=0.6, zorder=4)
+                # The ELA is the one forcing line in the panel — colour and
+                # name it so it is not read as another contour.
+                zela = float(m._zELA_output[i])
+                ax_cs.axhline(zela, color=ELA_COLOR, linestyle='--', lw=0.9,
+                              zorder=4)
+                ax_cs.annotate('ELA', xy=(0.995, zela),
+                               xycoords=('axes fraction', 'data'),
+                               ha='right', va='bottom', color=ELA_COLOR,
+                               fontsize='small', zorder=4,
+                               bbox=dict(fc='white', ec='none', alpha=0.7,
+                                         pad=0.5))
                 ax_cs.set_xlim(0, m.Lx / 1e3)
                 ax_cs.set_ylim(z_min, z_max)
                 ax_cs.set_xlabel('x (km)')
@@ -679,6 +903,15 @@ class LandscapeMixin:
                 ax_cs.spines['top'].set_visible(False)
                 ax_cs.spines['right'].set_visible(False)
                 fig.canvas.draw()
+                # Vertical exaggeration of the section, from the axes' own
+                # display box vs its data range — the panel is much wider than
+                # tall, so the relief it shows is not to scale.
+                bb = ax_cs.get_window_extent()
+                ve_cs = ((bb.height / max(z_max - z_min, 1e-9))
+                         / (bb.width / m.Lx))
+                ax_cs.annotate(f'VE {ve_cs:.0f}$\\times$', xy=(0.005, 0.94),
+                               xycoords='axes fraction', ha='left', va='top',
+                               fontsize='small', color='#666666', zorder=4)
                 pos_main = ax.get_position()
                 pos_cs = ax_cs.get_position()
                 ax_cs.set_position([pos_main.x0, pos_cs.y0,
@@ -708,12 +941,15 @@ class LandscapeMixin:
                                 color=cmap(norm(centers)), edgecolor='black',
                                 linewidth=0.3)
                     ax_hyp.axhline(0.0, color='black', lw=0.8, zorder=4)
-                    ax_hyp.axhline(float(m._zELA_output[i]), color='black',
-                                   linestyle='--', lw=0.6, zorder=4)
+                    ax_hyp.axhline(float(m._zELA_output[i]), color=ELA_COLOR,
+                                   linestyle='--', lw=0.9, zorder=4)
                     ax_hyp.set_ylim(z_min, z_max)
                     ax_hyp.tick_params(axis='y', labelleft=False)
-                    from matplotlib.ticker import FormatStrFormatter
+                    from matplotlib.ticker import FormatStrFormatter, MaxNLocator
                     ax_hyp.xaxis.set_major_formatter(FormatStrFormatter('%g'))
+                    # At narrow fig_width the default tick set put a 0 hard
+                    # against the section's last x tick — three ticks, no zero.
+                    ax_hyp.xaxis.set_major_locator(MaxNLocator(3, prune='lower'))
                     ax_hyp.set_xlabel('% area')
                     if hyp_max is None:
                         ax_hyp.set_xlim(left=0)
@@ -751,16 +987,19 @@ class LandscapeMixin:
         the arrays the workers need). Frame content is identical either way —
         only the wall clock changes.
 
-        The auto colour scales are FROZEN over the run: ``z_max`` (and, with
-        ``ice_cmap``, the ice norm's ``H_max``) are resolved once across all
-        output frames instead of per frame, so a frame's colours mean the same
-        thing throughout the movie; pass explicit values to override.
+        The auto colour scales are FROZEN over the run: ``z_max`` and the ice
+        norm's ``H_max`` are resolved once across all output frames instead of
+        per frame, so a frame's colours mean the same thing throughout the
+        movie; pass explicit values to override. (``H_max`` freezes to the
+        run-global ``hc_over_H * max H_out``, which is already the still
+        render's default for the depth-graded veil.)
 
         Inherits ``landscape``'s ``style='smooth'`` default (the cartographic
-        view — supersampled + hillshaded terrain, footprint-width ice, thin
-        ice thresholded at ``H_threshold=100``). Pass ``style='raw'`` for the
-        naked model output (one pixel per cell, no hillshade or smoothing, ice
-        cells shown directly), or override individual knobs (explicit values
+        view — supersampled + hillshaded terrain, footprint-width ice drawn as
+        a depth-graded translucent veil, with nothing hidden by thickness —
+        ``H_threshold=0``). Pass ``style='raw'`` for the
+        naked model output (one pixel per cell, no hillshade or smoothing, flat
+        ice cells shown directly), or override individual knobs (explicit values
         always win over the preset). For
         DENSELY-SAMPLED output (frames close in model time), the classic
         anti-flicker movie recipe is ``ice_sigma_cells=3, ice_time_avg=2`` —

@@ -21,25 +21,48 @@ for terrain and `H_min` / `H_max` for ice colour. See {doc}`../api/model1d` and
 ## Smooth and raw landscape views
 
 `landscape` defaults to `style='smooth'`, an atlas-style presentation. With no
-other arguments it shows bare bedrock; terrain is supersampled 4×,
-Gaussian-de-staircased, hillshaded, and contoured. If you request
-`field='bedrock+ice'`, the same preset:
+other arguments it shows bedrock **and** ice (`field='bedrock+ice'`); terrain is
+supersampled 4×, Gaussian-de-staircased, hillshaded, and contoured, and the
+same preset:
 
 - draws ice across the claimed sub-grid valley width (`ice_extent='footprint'`);
-- hides columns with `H <= 100 m` (`H_threshold=100`);
-- smooths the ice outline by two sub-grid pixels; and
+- shades it as a depth-graded translucent veil (`ice_shading='veil'`);
+- fills the resolved trunk glaciers as true-width ribbons over that veil
+  (`trunk_display='ribbons'`);
+- hides nothing by thickness (`H_threshold=0`) — the veil already fades
+  thin ice out, so a gate would only delete real glacierets;
+- smooths the ice outline by two sub-grid pixels, and outlines the current ice
+  margin (`show_margin`, formerly `show_trimline`) — the ribbons only, when
+  they are drawn; and
 - leaves connected-component removal and time averaging off.
 
 This is intentionally a cartographic view, not an unmodified-cell view:
 
 ```python
-m.plot.landscape(field='bedrock+ice')
+m.plot.landscape()
 ```
 
-For inspection use `style='raw'`. It selects `field='bedrock+ice'`, renders one
-pixel per cell, disables terrain/ice smoothing, hillshade, contours, and the
-trimline, shows channel-cell ice (`ice_extent='cells'`), and sets
-`H_threshold=0`. The raw preset still applies an upstream-area gate of
+Pass `field='bedrock'` for the bare bed. The veil normalises column depth on
+`H_max`, which defaults to the run-global `1.5 * max H_out`, so a still and
+every frame of an animation put the same colour on the same depth;
+`ice_shading='flat'` restores a single opaque `ice_color`, and an explicit
+`ice_cmap` overrides both.
+
+A **trunk** cell is any icy cell downstream of one whose claimed width
+`W = alpha_g*H` already spans `trunk_width_cells` grid cells (default `1.0`,
+the width the grid can just resolve), the class carried along the receivers to
+the terminus so a thinning tongue stays a trunk down to its toe; those cells
+are traced and drawn at their true width, at `trunk_alpha` opacity, over a
+veil built from the sub-resolution ice that is left. Pass
+`trunk_display='none'` for the veil alone, or raise `trunk_width_cells` to
+reserve the ribbons for the widest glaciers.
+
+For inspection use `style='raw'`. It selects `field='bedrock+ice'` with flat
+ice (`ice_shading='flat'`), renders one pixel per cell, disables terrain/ice
+smoothing, hillshade, contours, the margin outline and the trunk ribbons
+(`trunk_display='none'`), and shows channel-cell ice (`ice_extent='cells'`).
+Both presets leave `H_threshold=0`; the raw preset
+additionally applies an upstream-area gate of
 `1e6 m²` to suppress small-catchment specks. To display every ice-bearing cell,
 disable that gate explicitly:
 
@@ -59,6 +82,15 @@ m.plot.animate_landscape(field='bedrock+ice',
 `ice_time_avg` changes only the displayed ice layer, not terrain or stored
 state. `min_ice_cells=6` can remove small components, but it can also hide real
 small glaciers and is therefore never enabled by a preset.
+
+### Two ice thicknesses
+
+`H_out` is the width-**mean** ice thickness — the quantity the flux closures,
+sliding laws, erosion laws and `tau = rho*g*H*S` consume, and the one
+`map(field='ice')` and the profile panels plot ("Mean ice thickness"). What
+`landscape` renders is instead the local **column depth** to the flat ice
+surface: `1.5*H` at the channel floor, and deeper on carved flanks, which is
+why its colorbar reads "Ice column depth (m)".
 
 ## 1D arrays
 

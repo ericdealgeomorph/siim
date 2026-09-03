@@ -3,7 +3,47 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.2 — September 2026 (current)
+## 0.9.3 — September 2026 (current)
+
+- **2D ice rendering: ice is on by default, and depth-graded.** `landscape` /
+  `animate_landscape` under `style='smooth'` now resolve `field` to
+  `'bedrock+ice'` (it resolved to bare `'bedrock'`, so the default render hid
+  the ice and every ice keyword was a silent no-op; `field='bedrock'` is
+  unchanged and still reachable). Ice without an explicit `ice_cmap` is painted
+  by the new `ice_shading` knob: `'veil'` (smooth) alpha-blends a glacier ramp
+  over the terrain by column depth, normalised on the RUN-GLOBAL
+  `1.5 * max H_out` so movie frames are comparable, and draws its own
+  colorbar; `'flat'` (raw) keeps the single opaque `ice_color`, so `style='raw'`
+  is unchanged. Labels now distinguish the two thickness quantities: the
+  landscape bar and section band show the local **ice column depth**, while
+  `map(field='ice')` and the 1D/2D profile panels show the width-**mean**
+  `H`. `show_trimline` / `trimline_color` / `trimline_lw` are renamed
+  `show_margin` / `margin_color` / `margin_lw` (the outline is the current
+  margin, not a trimline) with deprecated aliases, and the margin defaults are
+  heavier and darker. `map(field='ice')` masks ice-free ground to a neutral
+  bare tone, sizes its figure from the domain aspect and stamps the output
+  time; the section names its ELA and states the vertical exaggeration; and the
+  two-colorbar/hypsometry layout survives narrow `fig_width`. The smooth
+  preset's `H_threshold` default drops from `100` to `0`, so **nothing is
+  hidden by thickness under either style** — the veil already fades thin ice
+  out, and the gate only deleted real glacierets. `H_threshold` remains fully
+  functional as an explicit crop. On top of that veil the smooth preset now
+  draws the RESOLVED TRUNK GLACIERS as true-width ribbons (`trunk_display`,
+  `'ribbons'` under smooth and `'none'` under raw): a trunk cell is any icy
+  cell downstream of one whose claimed width `W = alpha_g*H` already spans
+  `trunk_width_cells` grid cells (default `1.0`), the class carried along the
+  receivers to the terminus, and those cells are traced and rasterized at
+  their true width — parabolic column depth on the same ramp, their own flat
+  ice surface in the hillshade and the cross-section — at `trunk_alpha`
+  opacity, seam-aware on looped axes. The veil is then built from the
+  sub-resolution ice that is left, and `show_margin` outlines the ribbons
+  only. The veil's opacity ramp changes from `0.18 + 0.82*sqrt(t/0.40)` to the
+  linear `0.12 + 0.88*t/0.35`: the old front-loading made a 30 m column
+  half-opaque, so an apron of sub-cell ice read as one sheet with the trunks
+  barely darker streaks through it (trunk-vs-apron RGB distance 0.13, against
+  0.67 for apron-vs-bare). `trunk_display='none'` renders exactly as before.
+
+## 0.9.2 — September 2026
 
 - **Mode B/C: the kernel now erodes the post-uplift bed.** The in-house driver
   and the Fastscape adapter both handed the mode-B/C kernel the pre-uplift bed

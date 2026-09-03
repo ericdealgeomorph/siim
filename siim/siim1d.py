@@ -1383,8 +1383,10 @@ class siim_plotter:
             ax.set_ylabel("Elevation (m)")
         elif field == "ice_thickness":
             ax.fill_between(x_km, np.zeros_like(x_km), m.H_out[:, i], color="steelblue", alpha=0.2)
-            ax.plot(x_km, m.H_out[:, i], color="navy", label="Ice thickness")
-            ax.set_ylabel("Ice thickness (m)")
+            ax.plot(x_km, m.H_out[:, i], color="navy", label="Mean ice thickness")
+            # H_out is the WIDTH-MEAN thickness (the physics variable), not the
+            # channel-floor column depth hc_over_H * H.
+            ax.set_ylabel("Mean ice thickness (m)")
         elif field == "ice_flux":
             ax.plot(x_km, m.Qg_out[:, i], color="dodgerblue", label="Ice flux $Q_g$")
             ax.set_ylabel("Ice flux (m$^3$/yr)")

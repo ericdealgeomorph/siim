@@ -302,12 +302,14 @@ def test_escarpment_wave_plateau_smoke():
     assert m.z_out[-1].max() > 0, "degenerate topography"
 
 
-def test_plateau_edges_sit_on_their_datums():
+def test_plateau_edges_sit_on_their_datums(both_drivers):
     """The plateau ramp is rescaled so the fixed x-borders start EXACTLY on
     0 / zo - dz. The raw arctan only reaches 0/1 asymptotically (default
     frac/w on 50 km left the low edge at 0.25*zo — a sill above the border's
     water datum that never lowers), and `plateau_topography` hands back the
     matching right-side datum for plain siim2d runs."""
+    if both_drivers == 'xsimlab':
+        pytest.skip("per-side bl is in-house-driver only (scalar adapter input)")
     from siim._core.step import plateau_profile
     from siim.escarpment import plateau_topography
     x = np.linspace(0, 50e3, 21)

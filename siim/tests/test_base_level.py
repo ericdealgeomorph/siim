@@ -458,12 +458,14 @@ def test_bl_per_side_round_trips_through_save_load(tmp_path, both_drivers):
     assert model._bl_sides[1][1] is not None          # the series really rode along
 
 
-def test_bl_per_side_corner_takes_x_side_value():
+def test_bl_per_side_corner_takes_x_side_value(both_drivers):
     """All four sides fixed, four distinct data: every border ring carries its
     own datum and a CORNER — touched by two fixed sides — takes the x-side
     (left/right) value. Checked on the driver's field builder and end-to-end
     through an ice-free run whose borders recover to (and clamp at) the datum
     they were handed."""
+    if both_drivers == 'xsimlab':
+        pytest.skip("per-side bl is in-house-driver only (scalar adapter input)")
     from siim._core.driver import _bl_field
 
     field = _bl_field([(10.0, None), (20.0, None), (30.0, None), (40.0, None)],
