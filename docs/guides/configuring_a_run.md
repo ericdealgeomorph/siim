@@ -1,7 +1,6 @@
 # Configuring a run
 
-Both models take a parameter dict; a handful of keys set the regime, and the
-defaults are the model's native, glacially interesting configuration. This page
+Both models take a parameter dict; a handful of keys set the regime. This page
 explains the choices that interact. See {doc}`parameter_reference` for every
 accepted key, default, unit, and model-specific restriction.
 
@@ -9,11 +8,10 @@ accepted key, default, unit, and model-specific restriction.
 
 `'bedrock+ice_thickness'` tracks **two** state fields — the bedrock and the ice
 thickness — and rebuilds the ice surface each step, so carved overdeepenings
-persist on ice retreat (*bed memory*, the regime where the MISI-style autogenic
-cycling lives). It is the 1D default and the dynamical state beneath the 2D
-mode-C default. The alternative, `'ice_surface'`, tracks a **single** field —
-the ice surface — and heals troughs instantly; use it for simpler steady-profile
-behaviour. (`'A'` / `'B'` are accepted as short aliases for these two modes;
+persist on ice retreat (*bed memory*). It is the 1D default and the dynamical
+state beneath the 2D mode-C default. The alternative, `'ice_surface'`, tracks a
+**single** field — the ice surface — and heals troughs instantly; use it for
+simpler steady-profile behaviour. (`'A'` / `'B'` are accepted as short aliases for these two modes;
 `'C'` is a 2D-only alias for mode B with carving on.) The channel-floor datum
 relating the tracked bed to the ice surface is the `hc_over_H` convention.
 
@@ -33,7 +31,7 @@ combined with carving and rejects `carve_width=True`.
 A carved bedrock run — `mode='bedrock+ice_thickness'` with carving on, i.e. the
 2D default, also spelled `mode='C'` — turns on two routing-side helpers by
 default: `trunk_surface=True` fabricates a converging ice surface so a wide
-trunk's flux is routed onto its centerline (honest cross-section discharge), and
+trunk's flux is routed onto its centerline (cross-section discharge), and
 `routing_relax=0.5` EMA-relaxes the once-per-step routing surface to damp a
 planview ice flicker. Both modify the routing/mass-balance surface rather than
 post-processing stored output. They therefore can change the simulated routing,
@@ -42,13 +40,13 @@ stored state remain raw. Both are opt-out (set them to `False` / `0.0`). Plain
 `mode='B'` (no carve) and `mode='A'` keep them off. An explicit value always
 wins over the mode-dependent default.
 
-*Which mode?* Reach for the mode-C default (`'C'`, or just leave `mode` unset)
-for realistic carved troughs with width and channel capture. Drop to plain
-`mode='B'` when you want bed memory without the width feedback — or on a grid too
-coarse to resolve the carve footprint `R = α_g·H/2` (see
-{doc}`../getting_started/first_2d_run`), where carving is a no-op anyway. Use
-`mode='A'` for the simplest, fastest steady-profile behaviour (troughs heal
-instantly, no bed memory).
+**Choosing a mode.** Use the mode-C default (`'C'`, or leave `mode` unset) for
+carved troughs with width and channel capture. Use plain `mode='B'` for bed
+memory without the width feedback — or on a grid too coarse to resolve the
+carve footprint `R = α_g·H/2` (see {doc}`../getting_started/first_2d_run`),
+where carving is a no-op anyway (`mode='B'` also turns off the mode-C routing
+helpers, which are grid-independent). Use `mode='A'` for the simplest, fastest
+steady-profile behaviour (troughs heal instantly, no bed memory).
 
 ⚠ **zELA re-tune caveat.** Trunk-surface routing evaluates the mass balance on
 the fabricated converging surface, so a mode-C run accumulates over a different
@@ -87,8 +85,8 @@ a change in uplift rate partway through.
 
 Base level is a **water line** `bl` — a movable Dirichlet datum that nothing in
 the model can erode. Like `zELA`, it can be a scalar (default `0`) or a length-`nt`
-time series on the run clock, so you can drive transgression / regression exactly
-the way `ela_sawtooth` drives glacial cycles. A step in `bl` launches a knickpoint
+time series on the run clock, so transgression / regression can be driven the
+same way `ela_sawtooth` drives ELA cycles. A step in `bl` launches a knickpoint
 at the outlet that migrates upstream (the water/rock separation is a proper
 time-dependent Dirichlet condition for the stream-power characteristics).
 
@@ -111,7 +109,7 @@ no calving.
 **Outputs are the true state.** State and outputs report the actual `(zb, H)`
 everywhere: a drowned or relict border bed shows through *below* `bl` (bed
 memory), and the ocean / lakes are a display layer only (rendered at `max(zs, bl)`,
-never stored as a floor). If you set `bl` and see sub-datum beds, that is correct.
+never stored as a floor). Sub-datum beds under a nonzero `bl` are expected.
 `border_bed_uplift` sets the border rock's uplift forcing — the `U` in the icy
 border budget and the ice-free recovery rate (defaults to the tectonic `U`),
 orthogonal to the water forcing `bl`.
@@ -138,5 +136,5 @@ A holds its borders at their initial elevation and ignores `bl` entirely
 (a known gap, not a per-side limitation), so a dict passed to a mode-A run is
 accepted and does nothing. The analytical steady-state reference stays graded
 to zero and is not offset-corrected per side, so `rms_vs_analytical` and the
-analytical overlay are not meaningful across outlets at different data (the
+analytical overlay are not meaningful across outlets at different datums (the
 constructor warns; `self.bl` is then only the fixed-side mean, a label).

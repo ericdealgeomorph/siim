@@ -453,7 +453,7 @@ class siim:
 
             # hillslope diffusivity
             "D": 1e-3,
-            # boundary conditions: [left, right, top, bottom]
+            # boundary conditions: [left, right, bottom, top]
             # each is 'fixed_value', 'core', or 'looped'.
             # Default = left/right fixed base level, top/bottom periodic. OQ-1(b)
             # (2026-07-13, ratified): the shipped default is the EXPLICIT looped
@@ -1203,12 +1203,13 @@ class siim:
         calling the SAME step functions the adapter shells call — the standalone
         default path (in-house routing, flexure and diffusion; no stack import).
         Packs the identical ``ds_out`` via :mod:`siim._core.outputs`. ``hooks``
-        is dropped here (OQ-2): a RuntimeHook has no meaning off the xsimlab
+        is rejected here (OQ-2): a RuntimeHook has no meaning off the xsimlab
         orchestrator."""
         if hooks is not None:
             raise ValueError(
                 "hooks= is only supported by driver='xsimlab'; the standalone "
-                "in-house driver drops the xsimlab RuntimeHooks kwarg (OQ-2).")
+                "in-house driver does not support the xsimlab RuntimeHooks "
+                "kwarg (OQ-2).")
         cfg = self._build_driver_config()
         # Fully framework-free numba D8 / D-inf producer (S4).
         from ._core.router import InhouseRouter

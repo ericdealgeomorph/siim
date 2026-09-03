@@ -379,9 +379,8 @@ class AARResult:
     (A_a divided by the swath catchment area). Ice cannot be wider than its
     valley, so eta_bar <= 1 physically; a value above 1 means the ice-width
     closure (alpha_g * kH) and the Hack closure (kh) are mutually
-    inconsistent for these parameters and the set should be rejected
-    (model paper, ``sec:aar`` / ``eq:floor``) — ``aar`` warns when this
-    happens.
+    inconsistent for these parameters and the set should be rejected —
+    ``aar`` warns when this happens.
     """
     surface: str           # 'powerlaw' | 'gsurface'
     aar: float             # A_c / (A_c + A_a)

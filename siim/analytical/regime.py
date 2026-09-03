@@ -1,7 +1,7 @@
 r"""Nondimensional regime map for the coupled glacial-fluvial steady state.
 
 The steady state of the coupled profile is controlled by two dimensionless
-numbers (theory paper, *Coupled glacial-fluvial steady state*): the fluvial
+numbers: the fluvial
 and glacial erosion numbers :math:`N_f` and :math:`N_g`. This module works in
 the derived coordinates used for regime diagrams,
 

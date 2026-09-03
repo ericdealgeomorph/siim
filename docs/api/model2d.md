@@ -44,7 +44,7 @@ documented in {doc}`fastscape`.
    :show-inheritance:
 ```
 
-### Deluxe landscape — `siim.plotting.landscape`
+### Landscape rendering — `siim.plotting.landscape`
 
 ```{eval-rst}
 .. automodule:: siim.plotting.landscape

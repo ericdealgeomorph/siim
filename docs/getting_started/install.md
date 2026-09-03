@@ -50,8 +50,8 @@ explicit user value is never overwritten.
 fastscape/xsimlab `@xs.process` classes, and `run(driver='xsimlab')` drives
 the 2D model through xsimlab orchestration. This is **optional** — the
 standalone 2D model needs none of it — and it is the one component that still
-wants conda. `python -m pip install 'siim-lem[fastscape]'` can deliver `fastscape` and
-`xarray-simlab` from PyPI (note PyPI's fastscape is a stale 0.1.0), but
+requires conda. `python -m pip install 'siim-lem[fastscape]'` can deliver `fastscape` and
+`xarray-simlab` from PyPI (PyPI's fastscape is a stale 0.1.0), but
 **fastscapelib-fortran** — the Fortran backend fastscape's stock processes
 call at run time — has no PyPI wheel. The validated adapter environment is
 `environment.yml`, which carries the `numpy<2` / `xarray<2026.5` / `zarr<3`

@@ -5,15 +5,13 @@ parameters — uplift, erodibility, sliding law and mass balance are absorbed
 into ks and cs.
 
 ``GeneralProfile`` solves the full coupled steady state for arbitrary
-exponents (d, sigma, phi, theta, k) — theory paper, *Coupled glacial-fluvial
-steady state*; model paper, ``app:glacier``. It computes the elevation
+exponents (d, sigma, phi, theta, k). It computes the elevation
 profile z(x), ice thickness H(x), reports the regime
 (fluvial / mixed / glacial), and detects bistability by finding all roots of
 the continuous zELA(Lt) closure.
 
 ``MarginalCoulombProfile`` solves the exact phi = theta = 1/2, d = 2 special
-case in closed (arcosh) form — theory paper, *Special solution: critical
-Coulomb*. That marginal case (d*phi = 1) is
+case in closed (arcosh) form. That marginal case (d*phi = 1) is
 precisely where the general beta-function machinery is logarithmically
 divergent, so this class doubles as the closed-form cross-check of
 ``GeneralProfile``: the two must agree in that limit.
@@ -521,8 +519,7 @@ class GeneralProfile:
 
     @property
     def Nf(self):
-        r"""Fluvial erosion number (theory paper, *Coupled glacial-fluvial
-        steady state*; the defining equation is unlabeled in the draft).
+        r"""Fluvial erosion number.
 
         .. math::
 
@@ -536,8 +533,7 @@ class GeneralProfile:
 
     @property
     def Ng(self):
-        r"""Glacial erosion number (theory paper, *Coupled glacial-fluvial
-        steady state*; the defining equation is unlabeled in the draft).
+        r"""Glacial erosion number.
 
         .. math::
 
@@ -811,18 +807,16 @@ class GeneralProfile:
            a = \frac{d\gamma + 1}{k},\quad b = \gamma + 1.
 
         Both reduce to a single number once u_ELA is fixed by the surface
-        closure (see ``AARResult``). Model paper: ``sec:aar`` (equations
-        ``eq:aar``, ``eq:Aa``, ``eq:Ac``).
+        closure (see ``AARResult``).
 
         Parameters
         ----------
         surface : {'gsurface', 'powerlaw', 'both'}
             Which ELA-crossing closure to use. Default 'gsurface' (the exact
-            in-model G(xo) crossing — the form the model paper's AAR section
-            ``sec:aar`` prescribes). 'powerlaw' reads the crossing from the power-law
-            accumulation ansatz (u_ELA^k = lam); per the paper, that ansatz
-            "serves only to close the accumulation integral and misplaces the
-            crossing", so treat it as a comparison tool, not a result. 'both'
+            in-model G(xo) crossing). 'powerlaw' reads the crossing from the
+            power-law accumulation ansatz (u_ELA^k = lam); the ansatz serves
+            only to close the accumulation integral and misplaces the
+            crossing, so treat it as a comparison tool, not a result. 'both'
             returns a dict keyed by both labels.
         solution : Solution, optional
             Which steady state to use. Defaults to ``primary``.
@@ -1048,8 +1042,7 @@ class MarginalCoulombProfile:
     @property
     def kappa_c(self):
         r"""Critical steepness ratio
-        :math:`\kappa_c = (k + d\sigma)/k = 1/(1-\lambda)` (theory paper,
-        *Coupled glacial-fluvial steady state*)."""
+        :math:`\kappa_c = (k + d\sigma)/k = 1/(1-\lambda)`."""
         return (self.k + self.d * self.sigma) / self.k
 
     @property

@@ -38,7 +38,7 @@ except ImportError as e:
     raise ImportError(
         "siim.fastscape is the OPTIONAL fastscape/xsimlab adapter — the "
         "standalone 2D model (siim.siim2d) needs none of it. To use the "
-        "adapter: `pip install siim[fastscape]` provides fastscape + xsimlab "
+        "adapter: `pip install siim-lem[fastscape]` provides fastscape + xsimlab "
         "from PyPI, but fastscapelib-fortran (the fortran backend fastscape's "
         "stock processes call at run time) has no PyPI wheel — use the conda "
         "env instead: `conda env create -f environment.yml`."

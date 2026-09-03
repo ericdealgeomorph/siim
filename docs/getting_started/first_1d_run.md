@@ -12,9 +12,8 @@ kernelspec:
 # Your first 1D run
 
 The 1D model (`siim.siim1d`) evolves a single glacial–fluvial long profile. It
-is fast and dependency-light (numpy / scipy / numba / matplotlib), which makes
-it the quickest way to see siim work — this page is executed when the docs are
-built.
+is fast and dependency-light (numpy / scipy / numba / matplotlib). This page is
+executed when the docs are built.
 
 Construct a model from a parameter dict and run it:
 
@@ -22,7 +21,7 @@ Construct a model from a parameter dict and run it:
 %matplotlib inline
 from siim.siim1d import siim as siim1d
 
-m = siim1d({'zELA': 700, 'sliding_law': 'eff-exp', 'progress_bar': False})
+m = siim1d({'zELA': 1400, 'sliding_law': 'eff-exp', 'progress_bar': False})
 m.run()
 ```
 
@@ -30,15 +29,19 @@ m.run()
 `sliding_law` selects the ice-flow law (`'eff-exp'`, `'power'`, or
 `'coulomb'`). The model runs in its default `'bedrock+ice_thickness'` mode.
 
-Plot the long profile — the bed, the ice surface, and the analytical reference
-the model embeds:
+Plot the long profile:
 
 ```{code-cell} python
 fig, axes = m.plot.profile()
 fig
 ```
 
-That is the whole loop: build from a dict, `run()`, then read the result off
+The plot shows the final frame: the bed, the ice surface, the ELA, and the
+analytical steady-state reference the model embeds. A glacier occupies the
+upper profile; below the terminus the profile is fluvial, graded to base level
+at the outlet, and water fills closed overdeepenings carved into the bed.
+
+The workflow is: construct from a dict, `run()`, then read the result off
 `m.plot` or the output arrays. The 1D model keeps its run in memory and does not
 provide the 2D model's pickle-based `save`/`load` helper. Plot methods return
 Matplotlib figures; methods with a `save` option write requested files beneath

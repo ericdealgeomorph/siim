@@ -52,7 +52,8 @@ A **trunk** cell is any icy cell downstream of one whose claimed width
 `W = alpha_g*H` already spans `trunk_width_cells` grid cells (default `1.0`,
 the width the grid can just resolve), the class carried along the receivers to
 the terminus so a thinning tongue stays a trunk down to its toe; those cells
-are traced and drawn at their true width, at `trunk_alpha` opacity, over a
+are traced and drawn at their true width, at a minimum opacity of
+`trunk_alpha` (deep ice keeps the depth ramp's own higher value), over a
 veil built from the sub-resolution ice that is left. Pass
 `trunk_display='none'` for the veil alone, or raise `trunk_width_cells` to
 reserve the ribbons for the widest glaciers.
