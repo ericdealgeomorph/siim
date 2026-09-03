@@ -24,7 +24,7 @@ Three front ends share one set of physics and constants (`siim.constants`):
 siim's glacial physics is also available as an **optional** fastscape adapter
 (`siim.fastscape`), for composing the physics into your own fastscape/xsimlab
 model — see {doc}`guides/fastscape_processes`. It needs the fastscape stack
-(`pip install siim[fastscape]`, conda for the Fortran backend); the standalone
+(`pip install siim-lem[fastscape]`, conda for the Fortran backend); the standalone
 2D model above does not.
 
 The model and theory papers document the governing equations. The current code

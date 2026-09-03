@@ -3,7 +3,14 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.3 — September 2026 (current)
+## 0.9.4 — September 2026 (current)
+
+- **PyPI distribution name: `siim-lem`.** PyPI's name-similarity guard refused
+  the bare name `siim`, so the package installs as `pip install siim-lem`
+  (the `[fastscape]` extra rides along unchanged). The import name is
+  untouched: `import siim`. Nothing else changes from 0.9.3.
+
+## 0.9.3 — September 2026
 
 - **2D ice rendering: ice is on by default, and depth-graded.** `landscape` /
   `animate_landscape` under `style='smooth'` now resolve `field` to

@@ -6,7 +6,7 @@ model without siim's `siim2d` wrapper.
 
 This is the **optional adapter** — the standalone 2D model (`siim.siim2d`)
 runs its own in-house time loop and needs none of it (see {doc}`../getting_started/install`).
-These snippets require the fastscape stack: `pip install siim[fastscape]`
+These snippets require the fastscape stack: `pip install siim-lem[fastscape]`
 gives you `fastscape` + `xsimlab`, but the Fortran backend
 (`fastscapelib-fortran`) that fastscape's stock processes call at run time is
 conda-only (`conda env create -f environment.yml`). Missing `fastscape` or

@@ -17,7 +17,7 @@ standalone models.
 ## Install
 
 ```bash
-pip install siim
+pip install siim-lem
 ```
 
 `siim` runs the full 1D and 2D models standalone on NumPy 2. An optional adapter
