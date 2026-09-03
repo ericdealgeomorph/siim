@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "siim-lem"
-version = "0.9.4"
+version = "0.9.5"
 description = "Sliding Ice Incision Model (siim): coupled glacial-fluvial landscape evolution."
 readme = "README.md"
 authors = [

@@ -3,7 +3,23 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.4 — September 2026 (current)
+## 0.9.5 — September 2026 (current)
+
+- **Documentation overhaul.** The public docs were rewritten as plain
+  reference documentation (independently reviewed, and verified line-by-line
+  against the code): interpretive discussion removed, the `first_1d_run`
+  example re-parameterized (`zELA` 700 → 1400) so the profile stays above the
+  base-level datum with the glacier confined to the upper reach, the
+  coarse-grid mode-C/mode-B comparison stated precisely (the mode-C routing
+  helpers never self-gate on grid resolution), `trunk_alpha` documented as an
+  opacity floor, the fastscape `carve` sentinel documented, and the
+  `siim._core` API index completed.
+- **Fixed the adapter's install hint.** The `ImportError` raised by
+  `import siim.fastscape` without the fastscape stack still recommended
+  `pip install siim[fastscape]`; it now names the actual distribution,
+  `pip install siim-lem[fastscape]`. No behavior changes.
+
+## 0.9.4 — September 2026
 
 - **PyPI distribution name: `siim-lem`.** PyPI's name-similarity guard refused
   the bare name `siim`, so the package installs as `pip install siim-lem`

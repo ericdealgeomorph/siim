@@ -17,7 +17,12 @@
    siim._core.eroders
    siim._core.carve
    siim._core.diffusion
+   siim._core.hillslope
+   siim._core.flexure
    siim._core.routing
+   siim._core.step
+   siim._core.driver
+   siim._core.outputs
    siim.siim1d
    siim.siim2d
    siim.fastscape
