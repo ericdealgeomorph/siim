@@ -3,7 +3,7 @@
 Hosts the one notebook slider viewer (``_slider_view``), the colorbar helper,
 and the numba glacier-field rendering backend — rasterizers, soft hillshade,
 glacier-path tracing, priority-flood lakes, variable-sigma smoothing, the
-glacier-field builder, and the footprint ice-surface / smoothed-mask helpers —
+diagnostic path overlay, and the footprint ice-surface / smoothed-mask helpers —
 relocated here from the old ``siim2d_plotting`` module. See
 ``docs/guides/outputs_and_io.md`` for the public plotting contract.
 
@@ -13,7 +13,6 @@ lazy inside the viewer/colorbar so the slider path imports light.
 
 import numpy as np
 import numba
-from types import SimpleNamespace
 from scipy.ndimage import map_coordinates, gaussian_filter
 
 from .._output import output_path
@@ -22,7 +21,7 @@ from .._core.carve import _carve_offsets, _power_dt_2d, _power_dt_2d_periodic
 
 __all__ = [
     "_slider_view", "_profile_slider", "_add_colorbar", "output_path",
-    "_compute_glacier_field", "_trace_paths_arrays", "_footprint_ice_surface",
+    "_smoothed_glacier_paths", "_trace_paths_arrays", "_footprint_ice_surface",
     "_smooth_ice_mask", "_field_ice_mask", "_clean_ice_mask", "_mean_recent_H",
     "_priority_flood", "_shade_rgb_soft", "_ice_ramp", "ICE_RAMP_STOPS",
     "_channel_closure", "_trunk_ribbons",
@@ -50,108 +49,21 @@ def _ice_ramp():
 # =====================================================================
 
 @numba.njit(cache=True)
-def _rasterize_glacier_segments(H_raster, seg_x1, seg_y1, seg_x2, seg_y2,
-                                seg_h1, seg_h2, seg_w1, seg_w2,
-                                nx, ny, dx_grid, dy_grid):
-    """Rasterize parabolic glacier cross-sections onto H_raster, keeping the
-    max H at each grid node. (Bedrock imprints are computed downstream as
-    ``z_upsampled − H_raster`` rather than in a separate kernel.)
-    """
-    n_seg = seg_x1.shape[0]
-    for s in range(n_seg):
-        x1, y1, h1, w1 = seg_x1[s], seg_y1[s], seg_h1[s], seg_w1[s]
-        x2, y2, h2, w2 = seg_x2[s], seg_y2[s], seg_h2[s], seg_w2[s]
-        half_w_max = max(w1, w2) / 2.0
-
-        seg_dx = x2 - x1
-        seg_dy = y2 - y1
-        seg_len = np.sqrt(seg_dx * seg_dx + seg_dy * seg_dy)
-        if seg_len == 0:
-            continue
-        tx = seg_dx / seg_len
-        ty = seg_dy / seg_len
-
-        margin = half_w_max + max(dx_grid, dy_grid)
-        r_min = max(0, int((min(y1, y2) - margin) / dy_grid))
-        r_max = min(ny - 1, int((max(y1, y2) + margin) / dy_grid) + 1)
-        c_min = max(0, int((min(x1, x2) - margin) / dx_grid))
-        c_max = min(nx - 1, int((max(x1, x2) + margin) / dx_grid) + 1)
-
-        for r in range(r_min, r_max + 1):
-            gy = r * dy_grid
-            for c in range(c_min, c_max + 1):
-                gx = c * dx_grid
-                dx_p = gx - x1
-                dy_p = gy - y1
-                along = dx_p * tx + dy_p * ty
-                if along < 0 or along > seg_len:
-                    continue
-                perp = abs(-dx_p * ty + dy_p * tx)
-                t = along / seg_len
-                half_w = (w1 * (1 - t) + w2 * t) / 2.0
-                if half_w <= 0 or perp > half_w:
-                    continue
-                h_interp = h1 * (1 - t) + h2 * t
-                h_here = h_interp * (1 - (perp / half_w) ** 2)
-                idx = r * nx + c
-                if h_here > H_raster[idx]:
-                    H_raster[idx] = h_here
-
-
-@numba.njit(cache=True)
-def _rasterize_glacier_vertices(H_raster, vx, vy, vh, vw,
-                                nx, ny, dx_grid, dy_grid):
-    """Rasterize parabolic disks at path vertices. Fills bend-gaps on the
-    outside of sharp turns and rounds off glacier heads and termini where
-    the per-segment rectangular coverage leaves slivers uncovered.
-    """
-    n_v = vx.shape[0]
-    for s in range(n_v):
-        xv, yv, hv, wv = vx[s], vy[s], vh[s], vw[s]
-        half_w = wv / 2.0
-        if half_w <= 0 or hv <= 0:
-            continue
-        margin = half_w + max(dx_grid, dy_grid)
-        r_min = max(0, int((yv - margin) / dy_grid))
-        r_max = min(ny - 1, int((yv + margin) / dy_grid) + 1)
-        c_min = max(0, int((xv - margin) / dx_grid))
-        c_max = min(nx - 1, int((xv + margin) / dx_grid) + 1)
-        for r in range(r_min, r_max + 1):
-            gy = r * dy_grid
-            for c in range(c_min, c_max + 1):
-                gx = c * dx_grid
-                dxp = gx - xv
-                dyp = gy - yv
-                d = np.sqrt(dxp * dxp + dyp * dyp)
-                if d >= half_w:
-                    continue
-                h_here = hv * (1 - (d / half_w) ** 2)
-                idx = r * nx + c
-                if h_here > H_raster[idx]:
-                    H_raster[idx] = h_here
-
-
-@numba.njit(cache=True)
-def _rasterize_glacier_segments_HU(H_raster, U_raster,
+def _rasterize_glacier_segments_payload(H_raster, payload_raster,
                                    seg_x1, seg_y1, seg_x2, seg_y2,
                                    seg_h1, seg_h2, seg_w1, seg_w2,
-                                   seg_V1, seg_V2,
+                                   seg_payload1, seg_payload2,
                                    nx, ny, dx_grid, dy_grid):
-    """Rasterize parabolic depth (H) and cross-section-average velocity (V).
+    """Rasterize parabolic depth and a scalar carried along the centerline.
 
-    H_raster gets the local parabolic depth at each cell, max-on-h composited
-    across overlapping segments. U_raster gets the cross-section-average ice
-    velocity V interpolated linearly along the segment — uniform across the
-    cross-section. V at each path node is computed upstream via mass
-    conservation V = Q_g / (α_g · H̄²), so this is independent of sliding-
-    law parameters and free of the (τ/τ_c)³ pole that the local-h sliding-law
-    formula has.
+    The deepest overlapping segment wins. Its interpolated payload is uniform
+    across that section; trunk rendering supplies surface elevation here.
     """
     n_seg = seg_x1.shape[0]
     for s in range(n_seg):
         x1, y1, h1, w1 = seg_x1[s], seg_y1[s], seg_h1[s], seg_w1[s]
         x2, y2, h2, w2 = seg_x2[s], seg_y2[s], seg_h2[s], seg_w2[s]
-        V1, V2 = seg_V1[s], seg_V2[s]
+        value1, value2 = seg_payload1[s], seg_payload2[s]
         half_w_max = max(w1, w2) / 2.0
 
         seg_dx = x2 - x1
@@ -187,19 +99,19 @@ def _rasterize_glacier_segments_HU(H_raster, U_raster,
                 idx = r * nx + c
                 if h_here > H_raster[idx]:
                     H_raster[idx] = h_here
-                    U_raster[idx] = V1 * (1 - t) + V2 * t
+                    payload_raster[idx] = value1 * (1 - t) + value2 * t
 
 
 @numba.njit(cache=True)
-def _rasterize_glacier_vertices_HU(H_raster, U_raster,
-                                   vx, vy, vh, vw, vV,
+def _rasterize_glacier_vertices_payload(H_raster, payload_raster,
+                                   vx, vy, vh, vw, payload,
                                    nx, ny, dx_grid, dy_grid):
-    """Per-vertex disk variant of _rasterize_glacier_segments_HU.
-    Uses the vertex's V directly within its parabolic disk.
+    """Per-vertex disk variant of _rasterize_glacier_segments_payload.
+    Uses the vertex's payload directly within its parabolic disk.
     """
     n_v = vx.shape[0]
     for s in range(n_v):
-        xv, yv, hv, wv, Vv = vx[s], vy[s], vh[s], vw[s], vV[s]
+        xv, yv, hv, wv, value = vx[s], vy[s], vh[s], vw[s], payload[s]
         half_w = wv / 2.0
         if half_w <= 0 or hv <= 0:
             continue
@@ -221,15 +133,9 @@ def _rasterize_glacier_vertices_HU(H_raster, U_raster,
                 idx = r * nx + c
                 if h_here > H_raster[idx]:
                     H_raster[idx] = h_here
-                    U_raster[idx] = Vv
+                    payload_raster[idx] = value
 
 
-# The surface-carrying twins the trunk ribbons rasterize with. The HU kernels
-# are payload-agnostic (they interpolate ONE per-node scalar along the
-# segment and keep the depth-winner's value), so the flat source ice surface
-# rides the same code path as the velocity field, not a copied kernel.
-_rasterize_glacier_segments_HZ = _rasterize_glacier_segments_HU
-_rasterize_glacier_vertices_HZ = _rasterize_glacier_vertices_HU
 
 
 @numba.njit(cache=True)
@@ -605,194 +511,35 @@ def _variable_sigma_smooth(values, sigmas, ds):
     return out
 
 
-def _compute_glacier_field(rec_2d, H_2d, area_2d, Qg_2d,
-                           nx, ny, Lx, Ly, alpha_g,
-                           channel_threshold, oversample, sigma_along_cells,
-                           blur_sigma_sub, field, hc_over_H=HC_OVER_H):
-    """Build (H_field, U_field, Q_field) for one time slice. The sole caller is
-    ``landscape(show_smoothed_paths=True)``, which passes ``field='depth'``
-    (``Qg_2d=None``); the ``'velocity'`` / ``'flux'`` modes are a kept
-    future surface (e.g. an ice-cmap-by-velocity option), currently unreached.
-
-    ``hc_over_H`` (the centerline/mean channel-depth ratio) is the run's value
-    threaded from ``m.hc_over_H``; it defaults to the import-bound
-    ``constants.HC_OVER_H`` for standalone use.
-    """
-    from scipy.ndimage import gaussian_filter1d
-
-    if field not in ('depth', 'velocity', 'flux'):
-        raise ValueError(
-            f"field must be 'depth', 'velocity', or 'flux', got {field!r}")
-    want_velocity = field in ('velocity', 'flux')
-
-    dx_grid = Lx / (nx - 1)
-    dy_grid = Ly / (ny - 1)
+def _smoothed_glacier_paths(rec_2d, H_2d, area_2d, nx, ny, Lx, Ly,
+                             alpha_g, channel_threshold, oversample):
+    """Return the optional diagnostic overlay; no depth/velocity/flux rasters."""
     nx_sub = (nx - 1) * oversample + 1
     ny_sub = (ny - 1) * oversample + 1
-    dx_sub = Lx / (nx_sub - 1)
-    dy_sub = Ly / (ny_sub - 1)
-
-    paths, xc, yc, H = _trace_paths_arrays(
+    step = 0.5 * min(Lx / (nx_sub - 1), Ly / (ny_sub - 1))
+    paths, xc, yc, thickness = _trace_paths_arrays(
         rec_2d, H_2d, area_2d, nx, ny, Lx, Ly, channel_threshold)
-    Qg_flat = Qg_2d.flatten() if want_velocity else None
-
-    # Per-path chunks; concatenated to flat arrays once before rasterizing.
-    seg_chunks = {k: [] for k in
-                  ('x1', 'y1', 'x2', 'y2', 'h1', 'h2', 'w1', 'w2')}
-    if want_velocity:
-        seg_chunks['V1'] = []
-        seg_chunks['V2'] = []
-    v_chunks = {k: [] for k in ('x', 'y', 'h', 'w')}
-    if want_velocity:
-        v_chunks['V'] = []
-
-    sigma_s = sigma_along_cells * max(dx_grid, dy_grid)
-    s_step = 0.5 * min(dx_sub, dy_sub)
-    max_width = min(Lx, Ly) / 2
-    H_floor = 0.5
-
     paths_xy = []
-
     for path in paths:
         if len(path) < 2:
             continue
         idx = np.asarray(path)
-        px = xc[idx]
-        py = yc[idx]
-        ph = np.maximum(H[idx], 0.0)
-        pw = np.minimum(ph * alpha_g, max_width)
-        pQ = np.maximum(Qg_flat[idx], 0.0) if want_velocity else None
-
-        ds = np.sqrt(np.diff(px)**2 + np.diff(py)**2)
-        s = np.concatenate([[0.0], np.cumsum(ds)])
-        L = s[-1]
-        if L == 0:
+        px, py = xc[idx], yc[idx]
+        width = np.minimum(np.maximum(thickness[idx], 0) * alpha_g, min(Lx, Ly) / 2)
+        distance = np.concatenate(([0.0], np.cumsum(np.sqrt(np.diff(px) ** 2 + np.diff(py) ** 2))))
+        length = distance[-1]
+        if length == 0:
             continue
-
-        n_dense = max(2, int(np.ceil(L / s_step)) + 1)
-        s_dense = np.linspace(0, L, n_dense)
-        px_d = np.interp(s_dense, s, px)
-        py_d = np.interp(s_dense, s, py)
-        ph_d = np.interp(s_dense, s, ph)
-        pw_d = np.interp(s_dense, s, pw)
-        pQ_d = np.interp(s_dense, s, pQ) if want_velocity else None
-
-        ds_dense = L / (n_dense - 1)
-
-        if sigma_s > 0:
-            sigma_samples = sigma_s / ds_dense
-            if sigma_samples > 0.1:
-                px_d = gaussian_filter1d(px_d, sigma_samples, mode='nearest')
-                py_d = gaussian_filter1d(py_d, sigma_samples, mode='nearest')
-                ph_d = gaussian_filter1d(ph_d, sigma_samples, mode='nearest')
-                pw_d = gaussian_filter1d(pw_d, sigma_samples, mode='nearest')
-                if want_velocity:
-                    pQ_d = gaussian_filter1d(pQ_d, sigma_samples, mode='nearest')
-
-        # Variable-σ smoothing of POSITIONS and WIDTH only. The native path
-        # zigzags by ±1 cell per D8-receiver step; at kilometer channel
-        # widths, adjacent dense-segment wedges at differing angles
-        # tessellate badly, producing jagged ice outlines and asymmetric
-        # cross-flow z assignments. Smoothing σ scales with the LOCAL
-        # channel width (σ = half-width), so narrow heads get little
-        # smoothing and wide trunks get a lot. ph_d, pQ_d are NOT
-        # smoothed here: those values are keyed to the arc-length parameter
-        # s_dense, so they continue to reflect the original-path H/Q at
-        # each native node even though the geometric (x, y) is now smoothed.
-        sigmas_pos = 0.5 * pw_d
-        if sigmas_pos.size and float(sigmas_pos.max()) > 0:
-            px_d = _variable_sigma_smooth(px_d, sigmas_pos, ds_dense)
-            py_d = _variable_sigma_smooth(py_d, sigmas_pos, ds_dense)
-            # pw_d intentionally not smoothed: at paths terminating on a
-            # visited trunk node, pw has a step jump from trib_W to
-            # trunk_W in the last segment. Linear-extrap padding
-            # continues that slope past the endpoint, projecting pw
-            # values even larger than trunk_W; the wide variable-σ
-            # window then pulls upstream pw values upward and inflates
-            # the rasterized wedge into a kilometer-scale blob at every
-            # confluence. pw varies smoothly along the path already
-            # (H is a smooth field), so no smoothing is needed here.
-
-        paths_xy.append((px_d.copy(), py_d.copy()))
-
-        # centerline depth of the parabolic cross-section (= the model's
-        # zs - zb under the channel-floor datum: the rendered valley floor
-        # IS the tracked bed)
-        ph_max = hc_over_H * ph_d
-
-        if want_velocity:
-            safe = ph_d > H_floor
-            vV = np.zeros_like(ph_d)
-            vV[safe] = pQ_d[safe] / (alpha_g * ph_d[safe] ** 2)
-
-        def _seg(a): return a[:-1], a[1:]
-
-        sx1, sx2 = _seg(px_d);   seg_chunks['x1'].append(sx1); seg_chunks['x2'].append(sx2)
-        sy1, sy2 = _seg(py_d);   seg_chunks['y1'].append(sy1); seg_chunks['y2'].append(sy2)
-        sh1, sh2 = _seg(ph_max); seg_chunks['h1'].append(sh1); seg_chunks['h2'].append(sh2)
-        sw1, sw2 = _seg(pw_d);   seg_chunks['w1'].append(sw1); seg_chunks['w2'].append(sw2)
-        if want_velocity:
-            sv1, sv2 = _seg(vV); seg_chunks['V1'].append(sv1); seg_chunks['V2'].append(sv2)
-
-        v_chunks['x'].append(px_d)
-        v_chunks['y'].append(py_d)
-        v_chunks['h'].append(ph_max)
-        v_chunks['w'].append(pw_d)
-        if want_velocity:
-            v_chunks['V'].append(vV)
-
-    H_field = np.zeros(ny_sub * nx_sub, dtype=float)
-    U_field = np.zeros(ny_sub * nx_sub, dtype=float) if want_velocity else None
-
-    def _cat(name): return np.concatenate(seg_chunks[name]) if seg_chunks[name] else None
-    def _vcat(name): return np.concatenate(v_chunks[name]) if v_chunks[name] else None
-
-    seg_x1 = _cat('x1')
-    if seg_x1 is not None and seg_x1.size:
-        seg_y1, seg_x2, seg_y2 = _cat('y1'), _cat('x2'), _cat('y2')
-        seg_h1, seg_h2 = _cat('h1'), _cat('h2')
-        seg_w1, seg_w2 = _cat('w1'), _cat('w2')
-        if want_velocity:
-            _rasterize_glacier_segments_HU(
-                H_field, U_field, seg_x1, seg_y1, seg_x2, seg_y2,
-                seg_h1, seg_h2, seg_w1, seg_w2,
-                _cat('V1'), _cat('V2'),
-                nx_sub, ny_sub, dx_sub, dy_sub,
-            )
-        else:
-            _rasterize_glacier_segments(
-                H_field, seg_x1, seg_y1, seg_x2, seg_y2,
-                seg_h1, seg_h2, seg_w1, seg_w2,
-                nx_sub, ny_sub, dx_sub, dy_sub,
-            )
-
-    v_x = _vcat('x')
-    if v_x is not None and v_x.size:
-        v_y, v_h, v_w = _vcat('y'), _vcat('h'), _vcat('w')
-        if want_velocity:
-            _rasterize_glacier_vertices_HU(
-                H_field, U_field, v_x, v_y, v_h, v_w, _vcat('V'),
-                nx_sub, ny_sub, dx_sub, dy_sub,
-            )
-        else:
-            _rasterize_glacier_vertices(
-                H_field, v_x, v_y, v_h, v_w,
-                nx_sub, ny_sub, dx_sub, dy_sub,
-            )
-
-    H_field = H_field.reshape(ny_sub, nx_sub)
-    if want_velocity:
-        U_field = U_field.reshape(ny_sub, nx_sub)
-
-    if blur_sigma_sub > 0:
-        H_field = gaussian_filter(H_field, sigma=blur_sigma_sub, mode='nearest')
-        if want_velocity:
-            U_field = gaussian_filter(U_field, sigma=blur_sigma_sub, mode='nearest')
-
-    Q_field = H_field * U_field if field == 'flux' else None
-
-    return SimpleNamespace(H=H_field, U=U_field, Q=Q_field,
-                            paths_xy=paths_xy)
+        count = max(2, int(np.ceil(length / step)) + 1)
+        dense = np.linspace(0, length, count)
+        x = np.interp(dense, distance, px)
+        y = np.interp(dense, distance, py)
+        sigma = 0.5 * np.interp(dense, distance, width)
+        if sigma.size and float(sigma.max()) > 0:
+            x = _variable_sigma_smooth(x, sigma, length / (count - 1))
+            y = _variable_sigma_smooth(y, sigma, length / (count - 1))
+        paths_xy.append((x, y))
+    return paths_xy
 
 
 def _sanitized_receivers(rec_in):
@@ -836,11 +583,11 @@ def _trunk_ribbons(rec_2d, H_2d, area_2d, zs_2d, cells, nx, ny, Lx, Ly,
                    alpha_g, oversample, wrap_y=False, wrap_x=False,
                    hc_over_H=HC_OVER_H):
     """Rasterize the trunk class as true-width ribbons (the ``'ribbons'`` ice
-    look): :func:`_compute_glacier_field`'s tracer restricted to ``cells``,
+    look): :func:`_smoothed_glacier_paths`'s tracer restricted to ``cells``,
     drawn at the claimed width ``W = alpha_g*H`` with a floor of 1.5 subgrid
     pixels — the narrowest band the raster draws gap-free across a diagonal.
 
-    Three departures from ``_compute_glacier_field``'s smoothing, each measured
+    Three departures from ``_smoothed_glacier_paths``'s smoothing, each measured
     while prototyping:
 
     - centreline sigma is HALF THE DRAWN WIDTH (not a fixed cell count), so the
@@ -973,14 +720,14 @@ def _trunk_ribbons(rec_2d, H_2d, area_2d, zs_2d, cells, nx, ny, Lx, Ly,
     if seg['x1']:
         c = {k: np.ascontiguousarray(np.concatenate(v))
              for k, v in seg.items()}
-        _rasterize_glacier_segments_HZ(
+        _rasterize_glacier_segments_payload(
             depth, surface, c['x1'], c['y1'], c['x2'], c['y2'],
             c['h1'], c['h2'], c['w1'], c['w2'], c['z1'], c['z2'],
             nx_sub, ny_sub, dx_sub, dy_sub)
     if vert['x']:
         v = {k: np.ascontiguousarray(np.concatenate(vv))
              for k, vv in vert.items()}
-        _rasterize_glacier_vertices_HZ(
+        _rasterize_glacier_vertices_payload(
             depth, surface, v['x'], v['y'], v['h'], v['w'], v['z'],
             nx_sub, ny_sub, dx_sub, dy_sub)
     return depth.reshape(ny_sub, nx_sub), surface.reshape(ny_sub, nx_sub)
@@ -1197,7 +944,13 @@ def _mean_recent_H(H_out, i, k):
 
 
 def _add_colorbar(mappable, ax, label='', location='right', size='4%', pad=0.05):
-    """Colorbar matched to the axes height (make_axes_locatable)."""
+    """Use the figure layout engine, or a matched-height axes divider."""
+    # AxesDivider positions its colorbar after constrained layout has solved
+    # the figure, so labels can land outside the canvas. Let that layout engine
+    # own the bar; plain/custom landscape layouts still use the matched divider.
+    if ax.figure.get_constrained_layout():
+        return ax.figure.colorbar(mappable, ax=ax, label=label, location=location,
+                                   fraction=float(size.rstrip('%')) / 100, pad=pad)
     from mpl_toolkits.axes_grid1 import make_axes_locatable
     cax = make_axes_locatable(ax).append_axes(location, size=size, pad=pad)
     return ax.figure.colorbar(mappable, cax=cax, label=label)
@@ -1245,14 +998,12 @@ def _slider_view(make_draw, sliders, *, figsize, fmt=None):
         raise RuntimeError(
             "the interactive viewer needs ipympl (`pip install ipympl`); use the "
             "frame (`profile`/`map`) or `animate_*` methods otherwise") from e
+    fig = None
     try:
         with plt.ioff():
             fig = plt.figure(figsize=figsize, layout='constrained')
-        for attr in ('header_visible', 'footer_visible', 'toolbar_visible'):
-            try: setattr(fig.canvas, attr, False)   # trim ipympl chrome
-            except Exception: pass
-        try: fig.canvas.resizable = False           # no resize handle
-        except Exception: pass
+        for attr in ('header_visible', 'footer_visible', 'toolbar_visible', 'resizable'):
+            setattr(fig.canvas, attr, False)       # trim ipympl chrome and resize handle
 
         draw = make_draw(fig)
 
@@ -1261,7 +1012,7 @@ def _slider_view(make_draw, sliders, *, figsize, fmt=None):
             v = start if (start is None or start >= 0) else n + start
             sl.append(widgets.IntSlider(
                 min=0, max=n - 1, value=v or 0, step=1, description=label,
-                continuous_update=True, readout=False,
+                continuous_update=False, readout=False,
                 layout=widgets.Layout(width='98%')))
         tag = widgets.Label()
 
@@ -1278,6 +1029,10 @@ def _slider_view(make_draw, sliders, *, figsize, fmt=None):
         children = list(sl) + ([tag] if fmt is not None else []) + [fig.canvas]
         display(widgets.VBox(children))
         Gcf.figs.pop(fig.canvas.manager.num, None)  # detach: no static re-render
+    except BaseException:
+        if fig is not None:
+            plt.close(fig)
+        raise
     finally:
         matplotlib.use(prev_backend)                # restore the notebook default
     # No return: returning the slider would make the cell auto-display a duplicate.
@@ -1320,9 +1075,15 @@ def _profile_slider(frame, n_frames, n_panels, times, *, fig_width=12,
                 if cur is not None:
                     cur.remove()
                 if legend:
-                    ax.legend(*static[k], loc=legend_loc)
-            axes[0].set_title(f"{times[idx] / 1e3:.0f} kyr", loc='right')
+                    ax.legend(*static[k], loc=legend_loc, frameon=False, fontsize=8)
         return draw
 
     return _slider_view(make_draw, [(n_frames, 'Snapshot', start)],
                         figsize=figsize)
+
+
+def _node_extent(Lx, Ly, nx, ny):
+    """Raster edges in km that put pixel centers on the model's nodes."""
+    dx, dy = Lx / (nx - 1), Ly / (ny - 1)
+    return [-dx / 2e3, (Lx + dx / 2) / 1e3,
+            -dy / 2e3, (Ly + dy / 2) / 1e3]

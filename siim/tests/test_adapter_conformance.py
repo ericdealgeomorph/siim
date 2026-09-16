@@ -22,7 +22,7 @@ pytest.importorskip('fastscape')
 pytest.importorskip('xsimlab')
 pytestmark = pytest.mark.adapter
 
-from siim.siim2d import siim as siim2d     # noqa: E402
+from siim.siim2d import siim as siim2d
 
 # A plain mode-B config (the facade's explicit-default semantics: no carve, no
 # trunk surface, routing_relax 0 — siim2d's mode-C magic is pinned OFF so both

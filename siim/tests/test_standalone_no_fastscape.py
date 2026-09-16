@@ -31,8 +31,8 @@ def test_import_siim2d_without_stack():
     """``import siim.siim2d`` (and escarpment + the adapter-free plotting layer)
     succeeds with the stack absent — every stack import in the standalone path
     is either gone or lazy."""
-    import siim.siim2d          # noqa: F401
-    import siim.escarpment      # noqa: F401
+    import siim.siim2d
+    import siim.escarpment      # noqa: F401 - importing successfully is the assertion.
 
 
 def test_full_modeC_run_without_stack():
@@ -55,4 +55,4 @@ def test_full_modeC_run_without_stack():
 
     # the adapter raises its directed ImportError, not a bare ModuleNotFound
     with pytest.raises(ImportError, match="(?i)optional fastscape/xsimlab adapter"):
-        import siim.fastscape   # noqa: F401
+        import siim.fastscape   # noqa: F401 - the import must raise the directed adapter error.

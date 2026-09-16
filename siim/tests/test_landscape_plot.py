@@ -19,17 +19,17 @@ import warnings
 
 import matplotlib
 matplotlib.use('Agg')            # headless; no display needed
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np               # noqa: E402
+import matplotlib.pyplot as plt
+import numpy as np
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from siim.siim2d import siim as siim2d  # noqa: E402
-from siim.plotting._render import _priority_flood  # noqa: E402
-from siim.plotting.landscape import _frozen_scale_kwargs  # noqa: E402
-import pytest  # noqa: E402
+from siim.siim2d import siim as siim2d
+from siim.plotting._render import _priority_flood
+from siim.plotting.landscape import _frozen_scale_kwargs
+import pytest
 
 LAKE_RGB = np.asarray(matplotlib.colors.to_rgb('#a8c8e8'))   # lake_color default
 ICE_RGB = np.asarray(matplotlib.colors.to_rgb('#e5e8ed'))    # ice_color default

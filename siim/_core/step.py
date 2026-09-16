@@ -51,6 +51,7 @@ from .solvers import (
     LAW_EFFEXP, LAW_POWER, LAW_COULOMB,
     _modeb_closure,
 )
+from .hillslope import _fixed_flags
 from .carve import (
     _power_dt_2d, _power_dt_2d_periodic, _carve_offsets, _carve_subgrid_width,
 )
@@ -741,7 +742,12 @@ def glacial_flexure_step(elevation, denudation, surface_upward, ice_thickness,
     solve is INJECTED as ``flexure_solve(elev_post, elev_eq, nx, ny, xl, yl,
     lithos, asthen, Te, ibc)`` (fortran ``fs.flexure`` at S1, in-house FFT
     later — keeps this module framework-free). Returns ``(rebound, col_new)``;
-    the caller keeps ``col_new`` as the cross-step ``_col_prev``."""
+    the caller keeps ``col_new`` as the cross-step ``_col_prev``.
+
+    The returned ``rebound`` is exactly 0 on every ``'fixed_value'`` border row
+    and column (read off ``ibc``, so the in-house driver and the xsimlab adapter
+    share it) — those nodes already get no block uplift and no erosion, so
+    letting them subside was the one place their value was not actually fixed."""
     ny, nx = shape
     yl, xl = length
 
@@ -775,6 +781,15 @@ def glacial_flexure_step(elevation, denudation, surface_upward, ice_thickness,
         ibc,
     )
     rebound = (elevation_post - elevation_pre).reshape(shape)
+    # A 'fixed_value' border is a base-level node: block uplift is already
+    # masked off it (uplift_mask) and only mode B moves it (border_bed_uplift),
+    # so it gets no rebound either -- otherwise the edge share of the
+    # subsidence sinks it into a trench that becomes the base level.
+    _all = slice(None)
+    for fixed, border in zip(_fixed_flags(ibc),
+                             ((0, _all), (-1, _all), (_all, 0), (_all, -1))):
+        if fixed:
+            rebound[border] = 0.0
     col_new = col.copy()
     return rebound, col_new
 

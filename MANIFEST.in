@@ -15,6 +15,7 @@ prune tools
 prune .github
 
 exclude CLAUDE.md
+exclude gate.json
 exclude for_thea.zip
 
 global-exclude .DS_Store

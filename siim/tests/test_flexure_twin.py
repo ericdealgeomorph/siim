@@ -5,8 +5,8 @@ three-way sanity check against fortran ``fs.flexure``.
 Why Kelvin, not fortran, is the gate (OQ-6 ratified FIX; Map 3 §1). The two
 solvers are structurally different: the fortran resamples the domain onto the
 central quarter of a power-of-two grid (~4x coarser, a Nunn & Aires 1988
-anti-wraparound device) and its sine-transform pins the far field to zero; the
-in-house solves on the native grid with the true wavenumbers. So they CANNOT
+anti-wraparound device); the in-house solves on the native grid with the true
+wavenumbers (both sine bases pin the far field to zero). So they CANNOT
 agree to the ~1e-6 the S2 brief's fortran-vs-in-house line asked for -- measured
 in-house-vs-fortran relRMS is ~5-15% on a square grid, which is entirely the
 fortran's own discretization error: the in-house tracks the analytic Kelvin
@@ -23,32 +23,39 @@ Sign: siim's flexure treats +ve load as UNLOADING (material removed -> upward
 rebound), so an unloading point force uses -kei (central deflection up,
 w(0) = F l^2 / (8 D) > 0).
 
-GAUGE CONVENTION (part of the ratified gate definition; Eric 2026-07-13 --
-Kelvin oracle + k=0 zeroing, both ratified). The in-house solve zeroes the k=0
-bin (far-field-neutral: the domain-mean load is rigidity-supported by the
-surrounding plate), so it returns BOX-MEAN-FREE deflection fields by
-construction. The infinite-plate Kelvin field instead carries the Airy integral
-``int w dA = F / (rho_a g)`` (its gauge: w -> 0 at infinity); over the padded
-box the two conventions differ by EXACTLY the uniform constant
-``c = F_total(padded) / (A_pad rho_a g)`` (measured 1.75e-9 m for the point
-load; ``w_withDC - w_zeroDC`` uniform to std 1.1e-24 -- pure gauge, zero shape
-change). The gates therefore compare the fields in the SAME gauge: both minus
-their annulus mean (:func:`_rel_rms_gauge`, equivalent to subtracting the
-closed-form ``c`` from the oracle). This is a comparison-protocol alignment
-forced by the far-field-neutral decision, NOT a tolerance loosening: the
-tolerances are unchanged, the shape oracle keeps its full strength (2.0e-5
-achieved), and the mean degree of freedom -- the one a gauge-invariant
-comparison no longer sees -- is pinned MORE strictly by
-:func:`test_flexure_mean_load_rigidity_supported` (exactly 0.0 mean response).
-Shape + mean together fully constrain the field.
+GAUGE CONVENTION. The in-house solve pins ``w = 0`` at the padded-box edges
+(sine basis; decision 2026-09-11, superseding the 2026-07-13 k=0 zeroing),
+while the infinite-plate Kelvin field carries the Airy integral
+``int w dA = F / (rho_a g)`` in its own gauge (w -> 0 at infinity). The gates
+therefore compare the fields in the SAME gauge: both minus their annulus mean
+(:func:`_rel_rms_gauge`). That alignment is KEPT, not forced -- on the 161^2
+all-free config of :func:`test_flexure_three_way_beats_fortran` (adapter-marked,
+so ``-m 'not adapter'`` does not run it) the sine basis agrees with Kelvin to
+relRMS 5.1e-5 in the RAW gauge and 5.3e-5 gauge-matched, the latter being the
+``in-house vs Kelvin`` number that test prints. Removing the mean therefore
+neither loosens the gate nor props it up; it stays because a uniform offset
+between two gauge conventions carries no shape information.
+CAVEAT: because both fields lose their annulus mean, these two Kelvin gates are
+by construction blind to a spurious UNIFORM offset -- the very failure mode the
+k=0 zeroing had. They are SHAPE gates, at full strength (2.0e-5 on the 201^2
+square gate). The offset degree of freedom is pinned separately instead, in BOTH
+regimes: :func:`test_flexure_mean_load_rigidity_supported` (a small domain's
+uniform load is rigidity-supported, not Airy-compensated) and
+:func:`test_flexure_large_domain_local_airy_zero_far_field` (on a domain
+``>> alpha`` a localized load compensates locally at Airy with a zero far
+field). Shape + offset together fully constrain the field.
 
 The Kelvin gates are pure (numpy/scipy); the fortran three-way is conda-only.
 """
+import itertools
+
 import numpy as np
 import pytest
 from scipy.special import kei
 
 from siim._core.flexure import flexure, _YOUNG, _POISSON, _G
+from siim._core.step import glacial_flexure_step, uplift_mask
+from siim.siim2d import _ibc_from_border_status
 
 
 def _D(Te):
@@ -99,9 +106,9 @@ def _annulus(nx, ny, xl, yl, i0, j0, l):
 
 def _rel_rms_gauge(a, b, mask):
     """Gauge-invariant relative RMS: both fields minus their annulus mean, so a
-    uniform offset between the two gauge conventions (box-mean-free in-house vs
-    w->0-at-infinity Kelvin; the constant ``c`` of the module docstring) cancels
-    and only the deflection SHAPE is compared."""
+    uniform offset between the two gauge conventions (zero-at-the-padded-box-edge
+    in-house vs w->0-at-infinity Kelvin; module docstring) cancels and only the
+    deflection SHAPE is compared."""
     ag = a[mask] - a[mask].mean()
     bg = b[mask] - b[mask].mean()
     return float(np.sqrt(np.mean((ag - bg) ** 2)) / np.sqrt(np.mean(bg ** 2)))
@@ -159,15 +166,18 @@ def test_flexure_matches_kelvin_anisotropic(shape):
     assert rr < 1e-3, f"in-house vs Kelvin (anisotropic) relRMS={rr:.3e} (achieved ~1.5e-4)"
 
 
+@pytest.mark.pin
 def test_flexure_mean_load_rigidity_supported():
-    """k=0 (domain-mean) suppression (decision, Eric 2026-07-13): a UNIFORM
-    unloading of a small domain (L << alpha) must NOT Airy-rebound -- the mean
-    load is rigidity-supported by the surrounding plate (the periodic rfft2
-    would otherwise tile the plate with loaded copies and lift the whole domain
-    by ~rhos/rhoa per metre unloaded). siim's regime: 20 km domain vs
-    alpha ~ 78 km at Te = 20 km. The fortran DST + zero-pad basis has this
-    far-field-neutral behaviour structurally; the in-house matches it by
-    zeroing the [0, 0] bin."""
+    """Small-domain regime (L << alpha): a UNIFORM unloading must NOT
+    Airy-rebound -- the mean load is rigidity-supported by the surrounding
+    plate. siim's regime: 20 km domain vs alpha ~ 55 km at Te = 20 km. The
+    fortran DST + zero-pad basis has this far-field-neutral behaviour
+    structurally, and the in-house sine basis (decision 2026-09-11) has it
+    structurally too: ``w`` is pinned to 0 at the padded-box edges, so a uniform
+    load on a box far smaller than alpha is carried by plate rigidity (measured
+    0.005 of Airy). The retired periodic rfft2 solve had to zero the [0, 0] bin
+    explicitly to get here -- and that fix is what broke the large-domain
+    regime (:func:`test_flexure_large_domain_local_airy_zero_far_field`)."""
     nx = ny = 31
     xl = yl = 2.0e4
     Te, rhoa, rhos = 20e3, 3200.0, 2800.0
@@ -179,9 +189,112 @@ def test_flexure_mean_load_rigidity_supported():
     print(f"\n[flexure mean-load {nx}x{ny} L={xl/1e3:.0f}km Te={Te/1e3:.0f}km] "
           f"Airy={airy:.3f} m  mean|w|={mean_abs:.3e} m  max|w|={max_abs:.3e} m  "
           f"suppression={mean_abs/airy:.3e}")
-    assert mean_abs < 0.15 * airy, \
+    # gate: 0.15 -> 0.02 (decision 2026-09-16): the pad RATIO sets this response,
+    # and 0.15 passed a 4x box silently.
+    assert mean_abs < 0.02 * airy, \
         f"mean load must be rigidity-supported, not Airy-compensated: " \
         f"mean|w|={mean_abs:.3e} vs Airy={airy:.3f}"
+
+
+@pytest.mark.pin
+def test_flexure_large_domain_local_airy_zero_far_field():
+    """Large-domain regime (L >> alpha), the mirror of the small-domain pin: a
+    localized load on a 2500 x 250 km domain must compensate LOCALLY at Airy and
+    leave the far field untouched. Thea's Grand Canyon warm-up, at 10 km cells:
+    a Gaussian uplift band in x, top row and right column fixed (ibc = 1100).
+    The retired k=0 zeroing failed BOTH halves here -- it subtracted the Airy
+    mean of the band (only 0.91 of Airy under it) and re-emitted it as a uniform
+    uplift of the whole box: +3.43 m per step on THIS grid, +3.55 m on Thea's
+    1 km cells, which compounded into the 290 -> 1460 m rise of an untouched
+    plateau over 50 Myr of 100 kyr steps."""
+    nx, ny = 251, 26
+    xl, yl = 2500e3, 250e3
+    Te, rhoa, rhos = 20e3, 3200.0, 2800.0
+    dh_peak = 38.6
+    x = np.linspace(0, xl, nx)
+    # uplift band: a Gaussian in x, zeroed on the fixed top row and right column
+    dh = np.broadcast_to(dh_peak * np.exp(-((x - 525e3) / 200e3) ** 2), (ny, nx)).copy()
+    dh[0, :] = 0.0
+    dh[:, -1] = 0.0
+    # driven the way the caller stacks the seam (step.glacial_flexure_step),
+    # not via _inhouse_deflection: this test's physics is an ELEVATION
+    # increment, and the helper's pressure argument would only undo the
+    # -dh*rhos*g conversion (agreement measured at 1.4e-14 m, so the choice is
+    # legibility, not coverage).
+    elev_eq = np.zeros(ny * nx)
+    elev_post = elev_eq + dh.ravel()
+    flexure(elev_post, elev_eq, nx, ny, xl, yl,
+            np.full(ny * nx, rhos), rhoa, Te, ibc=1100)
+    w = (elev_post - elev_eq - dh.ravel()).reshape(ny, nx)
+
+    jm = ny // 2
+    ipk = int(np.argmax(dh[jm]))
+    airy = -rhos / rhoa * dh_peak       # -33.8 m: local Airy under the band
+    w_band = w[jm, ipk]
+    far = float(np.max(np.abs(w[:, x >= 1800e3])))
+    print(f"\n[flexure large-domain {nx}x{ny} L={xl/1e3:.0f}km Te={Te/1e3:.0f}km] "
+          f"w_band={w_band:.3f} m  Airy={airy:.3f} m  ratio={w_band/airy:.4f}  "
+          f"far|w|(x>=1800km)={far:.3e} m  far/peak={far/abs(w_band):.3e}")
+    assert abs(w_band - airy) / abs(airy) < 0.03, \
+        f"localized load on L >> alpha must compensate at Airy: {w_band:.3f} vs {airy:.3f}"
+    assert far < 1e-3 * abs(w_band), \
+        f"far field must stay untouched: max|w|={far:.3e} m at x >= 1800 km"
+
+
+@pytest.mark.pin
+def test_flexure_rebound_zeroed_on_fixed_borders():
+    """A ``fixed_value`` border gets NO flexural rebound. It already gets no
+    block uplift (``uplift_mask``) and does not erode, so handing it the edge
+    share of the subsidence sank it into a trench that then became the base
+    level for everything draining to it: on Thea's setup (2500 x 250 km, 10 km
+    cells, 10 Myr) the fixed y=0 row fell 287 -> 55 m while the interior rose
+    292 -> 543 m. Stock fastscape has the same inconsistency (BlockUplift masks,
+    Flexure does not) and siim inherited it.
+
+    Also pins the ibc digit mapping itself against ``uplift_mask`` over all 16
+    border combinations, rather than trusting the comment in
+    :func:`siim._core.step.glacial_flexure_step`."""
+    nx, ny = 251, 26
+    xl, yl = 2500e3, 250e3
+    Te, rhoa, rhos = 20e3, 3200.0, 2800.0
+    dh_peak = 38.6
+    x = np.linspace(0, xl, nx)
+    band = dh_peak * np.exp(-((x - 525e3) / 200e3) ** 2)
+    zero = np.zeros((ny, nx))
+
+    def rebound_for(border_status, dh=band):
+        """Uplift ``dh`` through the real step seam, already masked off the
+        fixed edges the way the caller's block uplift leaves it. No ice."""
+        dh = np.broadcast_to(dh, (ny, nx)) * uplift_mask(border_status, (ny, nx))
+        rebound, _ = glacial_flexure_step(
+            zero, zero, dh, zero, 5.0, (xl / (nx - 1)) * (yl / (ny - 1)),
+            rhos, rhoa, Te, _ibc_from_border_status(border_status), (ny, nx),
+            (yl, xl), zero, False, flexure)
+        return rebound
+
+    # (a)+(b): Thea's topology -- row 0 and column -1 fixed (ibc 1100)
+    w = rebound_for(['core', 'fixed_value', 'fixed_value', 'core'])
+    jm, ipk = ny // 2, int(np.argmax(band))
+    airy = -rhos / rhoa * dh_peak
+    print(f"\n[flexure fixed-border rebound {nx}x{ny} ibc=1100] "
+          f"row0 max|w|={np.abs(w[0]).max():.3e} m  "
+          f"col-1 max|w|={np.abs(w[:, -1]).max():.3e} m  "
+          f"mid-row under band={w[jm, ipk]:.3f} m  Airy={airy:.3f} m  "
+          f"ratio={w[jm, ipk]/airy:.4f}")
+    assert np.all(w[0] == 0.0), "fixed row 0 must get no rebound"
+    assert np.all(w[:, -1] == 0.0), "fixed column -1 must get no rebound"
+    assert abs(w[jm, ipk] - airy) / abs(airy) < 0.03, \
+        f"interior must still compensate at Airy: {w[jm, ipk]:.3f} vs {airy:.3f}"
+
+    # (c): the ibc-derived mask IS uplift_mask, for all 16 border combinations.
+    # Compared through the real rebound field, so this pins the implementation
+    # and not a restatement of its digit rule. A UNIFORM load keeps every
+    # non-fixed node's rebound near Airy, far from roundoff, so ``!= 0`` is a
+    # mask and not a coin toss on the band's far field.
+    for combo in itertools.product(('fixed_value', 'core'), repeat=4):
+        got = (rebound_for(combo, dh=dh_peak) != 0.0).astype(float)
+        assert np.array_equal(got, uplift_mask(combo, (ny, nx))), \
+            f"rebound mask != uplift_mask for {combo} (ibc={_ibc_from_border_status(combo)})"
 
 
 @pytest.mark.adapter

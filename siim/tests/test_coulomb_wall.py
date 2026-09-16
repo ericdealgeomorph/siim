@@ -20,8 +20,8 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from siim import constants as C           # noqa: E402
-from siim._core.solvers import _modeb_closure_coulomb  # noqa: E402
+from siim import constants as C
+from siim._core.solvers import _modeb_closure_coulomb
 
 # The finder's regime: coulomb defaults with alpha_g=10 (the default until
 # 2026-07-02) pinned explicitly so the brentq-oracle numbers stay valid.

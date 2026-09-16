@@ -19,10 +19,10 @@ class siim_plotter(MapMixin, ProfileMixin, LandscapeMixin,
                    BasinsMixin, DiagnosticsMixin):
     """Plotting facade bound to a run model instance (``m.plot``).
 
-    This is the 2D facade (``siim2d.py`` binds it). ``siim1d.py`` carries a
-    separate class of the same name — the 1D plotter (``profile`` /
-    ``view_profile`` / ``limit_cycle`` …); the two share only the ``_render``
-    helpers. Merging them into this package is a deferred post-1.0 cleanup.
+    The 1D facade remains in ``siim1d.py``. Both inherit the same public
+    profile methods and share field metadata, visual styles and serial movie
+    handling. The 1D limit-cycle and phase-portrait helpers are private
+    research tools, outside the public plotting API.
     """
 
     def __init__(self, model):

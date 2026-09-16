@@ -10,15 +10,15 @@ import sys
 
 import matplotlib
 matplotlib.use('Agg')            # headless
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np               # noqa: E402
-import pytest                    # noqa: E402
+import matplotlib.pyplot as plt
+import numpy as np
+import pytest
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from siim.plotting._render import (  # noqa: E402
+from siim.plotting._render import (
     _smooth_ice_mask, _field_ice_mask, _clean_ice_mask, _mean_recent_H)
 
 

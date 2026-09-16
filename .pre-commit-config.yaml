@@ -2,8 +2,11 @@
 # One-time activation per repo:  pre-commit install
 # Manual full sweep:             pre-commit run --all-files
 
+default_stages: [pre-commit]
+default_install_hook_types: [pre-commit, pre-merge-commit, commit-msg]
+
 # Leave data, manuscripts, notebooks, and archived/reference files untouched.
-exclude: '\.ipynb$|/fixtures/|/baselines/|/figs/|^paper_drafts/|_memory/archive/|golden.*\.json$'
+exclude: '\.ipynb$|/fixtures/|/baselines/|/figs/|^paper_drafts/|_memory/decisions/0000-legacy-log\.md$|golden.*\.json$'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -19,5 +22,29 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.19
     hooks:
-      - id: ruff                  # lint via ruff.toml (select = F); --fix applies safe fixes
+      - id: ruff                  # correctness rules in ruff.toml; --fix applies safe fixes
         args: [--fix]
+  - repo: local
+    hooks:
+      - id: memcheck
+        name: memory tree check
+        entry: bash -c 'f="$HOME/.agents/memcheck/memcheck.py"; [ -f "$f" ] && exec /usr/bin/python3 "$f" check; exit 0'
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: gate
+        name: gate structural check
+        entry: bash -c 'if [ -f "$HOME/.agents/gate/gate.py" ]; then exec /usr/bin/python3 "$HOME/.agents/gate/gate.py" precommit; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true
+        stages: [pre-commit, pre-merge-commit]
+      - id: gate-message
+        name: gate commit message check
+        entry: bash -c 'if [ -f "$HOME/.agents/gate/gate.py" ]; then exec /usr/bin/python3 "$HOME/.agents/gate/gate.py" commit-msg "$@"; fi' --
+        language: system
+        pass_filenames: true
+        always_run: true
+        verbose: true
+        stages: [commit-msg]

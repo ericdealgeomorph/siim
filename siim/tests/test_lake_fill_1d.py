@@ -15,9 +15,9 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from siim._core.skeleton import _lake_fill_1d           # noqa: E402
-from siim.siim1d import siim as siim1d                  # noqa: E402
-from siim.forcing import ela_sawtooth                   # noqa: E402
+from siim._core.skeleton import _lake_fill_1d
+from siim.siim1d import siim as siim1d
+from siim.forcing import ela_sawtooth
 
 
 def _ref_fill(zb, didx_l, didx_r, nx):

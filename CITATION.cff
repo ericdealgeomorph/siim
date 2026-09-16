@@ -7,8 +7,8 @@ authors:
   - family-names: Deal
     given-names: Eric
     # orcid: "https://orcid.org/0000-0000-0000-0000"   # add yours
-version: 0.9.6
-date-released: "2026-09-03"
+version: 0.9.7
+date-released: "2026-09-16"
 license: MIT
 repository-code: "https://github.com/ericdealgeomorph/siim"
 url: "https://github.com/ericdealgeomorph/siim"

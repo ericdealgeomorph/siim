@@ -12,7 +12,9 @@ contract.
 
 import numpy as np
 
-from ._render import _slider_view, _add_colorbar, output_path
+from ._render import _slider_view, _add_colorbar, _node_extent
+from ._style import time_label
+from ._animation import movie_path, save_animation
 
 # field name -> (model attribute holding the (time, y, x) array, cmap, label)
 # 'ice' is H_out: the WIDTH-MEAN thickness the physics consumes, NOT the local
@@ -48,7 +50,7 @@ class MapMixin:
 
     def _field_extent(self):
         m = self.model
-        return [0.0, m.Lx / 1e3, 0.0, m.Ly / 1e3]
+        return _node_extent(m.Lx, m.Ly, m.grid_nx, m.grid_ny)
 
     def _field_figsize(self, fig_width):
         """Figure sized from the DOMAIN aspect: with ``aspect='equal'`` a
@@ -68,8 +70,7 @@ class MapMixin:
         import matplotlib.pyplot as plt
         cmap_obj = plt.get_cmap(cmap)
         if field in _MASKED_FIELDS:
-            cmap_obj = cmap_obj.copy()
-            cmap_obj.set_bad(BARE_GROUND_COLOR)
+            cmap_obj = cmap_obj.with_extremes(bad=BARE_GROUND_COLOR)
         return cmap_obj
 
     @staticmethod
@@ -80,84 +81,68 @@ class MapMixin:
         vmax = float(np.nanmax(arr)) if field_max is None else field_max
         return vmin, vmax
 
-    # --- public triad -----------------------------------------------------
-    def map(self, field='bedrock', i=-1, field_min=None, field_max=None,
-            cmap=None, ax=None, fig_width=6):
-        """Raster of a stored 2D ``field`` at output step ``i`` (default last).
-
-        ``field`` is a key of ``FIELD_REGISTRY`` (``'bedrock'``, ``'ice'``).
-        ``field_min`` / ``field_max`` override the global (all-frame) color
-        limits. ``'ice'`` draws ``H_out``, the WIDTH-MEAN thickness — not the
-        local column depth ``landscape`` paints — with the ice-free ground
-        masked to a neutral bare tone. Returns the Axes.
-        """
+    def _setup_map(self, field, field_min, field_max, cmap, ax, fig_width):
         import matplotlib.pyplot as plt
         arr, default_cmap, label = self._field_data(field)
         vmin, vmax = self._auto_clim(arr, field_min, field_max)
         if ax is None:
-            _, ax = plt.subplots(figsize=self._field_figsize(fig_width))
-        im = ax.imshow(self._mask_field(arr[i], field), origin='lower',
-                       extent=self._field_extent(),
+            _, ax = plt.subplots(figsize=self._field_figsize(fig_width), layout='constrained')
+        im = ax.imshow(self._mask_field(arr[0], field), origin='lower',
+                       extent=self._field_extent(), interpolation='nearest',
                        cmap=self._field_cmap(field, cmap or default_cmap),
                        vmin=vmin, vmax=vmax, aspect='equal')
+        ax.set_xlim(0, self.model.Lx / 1e3)
+        ax.set_ylim(0, self.model.Ly / 1e3)
         ax.set_xlabel('x (km)')
         ax.set_ylabel('y (km)')
-        ax.set_title(f"{np.asarray(self.model.output_times)[i]:.3g} yr",
-                     loc='right')
+        ax.tick_params(labelsize=9)
         _add_colorbar(im, ax, label=label)
-        return ax
+        return arr, im
+
+    def _update_map(self, im, arr, field, idx):
+        im.set_data(self._mask_field(arr[idx], field))
+        title = im.axes.set_title(time_label(self.model.output_times[idx]),
+                                  loc='right', fontsize=10)
+        return im, title
+
+    def map(self, field='bedrock', i=-1, field_min=None, field_max=None,
+            cmap=None, ax=None, fig_width=6):
+        """Stored node-valued raster at snapshot i; returns the Axes.
+
+        Ice is width-mean thickness, with ice-free ground masked. Color limits
+        cover all outputs unless field_min/field_max are supplied.
+        """
+        field = field.lower()
+        arr, im = self._setup_map(field, field_min, field_max, cmap, ax, fig_width)
+        self._update_map(im, arr, field, i)
+        return im.axes
 
     def view_map(self, field='bedrock', field_min=None, field_max=None,
                  cmap=None, fig_width=6):
-        """Interactive slider over output steps (see ``map``).
-
-        Uses ipympl for a smooth live canvas (managed locally, so your other
-        plots stay on the default backend).
-        """
-        times = np.asarray(self.model.output_times)
+        """Notebook slider; update the same raster and colorbar in place."""
+        field = field.lower()
 
         def make_draw(fig):
+            arr, im = self._setup_map(field, field_min, field_max, cmap,
+                                       fig.add_subplot(111), fig_width)
+
             def draw(idx):
-                fig.clear()                       # drop the previous colorbar axes
-                ax = fig.add_subplot(111)
-                self.map(field=field, i=idx, field_min=field_min,
-                         field_max=field_max, cmap=cmap, ax=ax)
-                ax.set_title(f"{times[idx]:.3g} yr", loc='right')
+                self._update_map(im, arr, field, idx)
             return draw
 
-        return _slider_view(make_draw, [(len(times), 'Snapshot', -1)],
-                            figsize=(fig_width, fig_width))
+        return _slider_view(make_draw, [(len(self.model.output_times), 'Snapshot', -1)],
+                            figsize=self._field_figsize(fig_width))
 
     def animate_map(self, field='bedrock', path=None, run_id=None,
                     field_min=None, field_max=None, cmap=None,
                     fps=20, interval=42, fig_width=6):
-        """MP4 over output steps (see ``map``). Written under
-        ``model_outputs/movies/``; returns the path."""
-        import matplotlib.pyplot as plt
-        import matplotlib.animation as anm
-        arr, default_cmap, label = self._field_data(field)
-        vmin, vmax = self._auto_clim(arr, field_min, field_max)
-        times = np.asarray(self.model.output_times)
-
-        fig, ax = plt.subplots(figsize=self._field_figsize(fig_width))
-        im = ax.imshow(self._mask_field(arr[0], field), origin='lower',
-                       extent=self._field_extent(),
-                       cmap=self._field_cmap(field, cmap or default_cmap),
-                       vmin=vmin, vmax=vmax, aspect='equal')
-        ax.set_xlabel('x (km)')
-        ax.set_ylabel('y (km)')
-        _add_colorbar(im, ax, label=label)
-        ttl = ax.set_title('')
+        """MP4 of map(). Explicit fps wins; fps=None uses interval (ms/frame)."""
+        field = field.lower()
+        arr, im = self._setup_map(field, field_min, field_max, cmap, None, fig_width)
 
         def update(idx):
-            im.set_data(self._mask_field(arr[idx], field))
-            ttl.set_text(f"t = {times[idx]:.3g} yr")
-            return im, ttl
+            return self._update_map(im, arr, field, idx)
 
-        ani = anm.FuncAnimation(fig, update, frames=range(len(arr)),
-                                interval=interval, blit=False)
-        name = f"{run_id}_map_{field}" if run_id else (path or f"map_{field}")
-        out = output_path(name, 'movies')
-        ani.save(filename=out + ".mp4", writer="ffmpeg", fps=fps, dpi=150)
-        plt.close(fig)
-        return out + ".mp4"
+        return save_animation(im.figure, update, len(arr),
+                              movie_path(path, run_id, f'map_{field}'),
+                              fps=fps, interval=interval)

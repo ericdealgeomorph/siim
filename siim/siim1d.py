@@ -1,5 +1,5 @@
 import warnings
-import matplotlib.animation as anm, matplotlib.pyplot as plt, numpy as np, tqdm, numba
+import matplotlib.pyplot as plt, numpy as np, tqdm, numba
 from types import SimpleNamespace
 
 from .constants import (GRAVITY, KT, RHO_ICE, Co_power, derive_coulomb,
@@ -1230,7 +1230,12 @@ class siim:
 
 
 # Plotting class
-class siim_plotter:
+from .plotting._profiles import (ProfileMethods, PROFILE_FIELDS, profile_data,
+                                 data_limits, draw_panel, field_limits)
+from .plotting._style import COLORS, style_axes
+
+
+class siim_plotter(ProfileMethods):
     """Handles all visualization for the siim model.
     Accesses model state via self.model reference."""
 
@@ -1255,23 +1260,27 @@ class siim_plotter:
         if flag == -1:
             return
         if ax is None:
-            fig, ax = plt.subplots(1, 1, figsize=(15, 5))
+            fig, ax = plt.subplots(1, 1, figsize=(8, 3.04), layout='constrained')
 
         # Plot on the analytical's own grid (m.x and m.analytical.x can have
         # different nx when the user does not pass an explicit nx).
         x_km = m.analytical.x / 1e3
         ax.fill_between(x_km, np.zeros_like(x_km), analytical_bed,
-                        color='gray', alpha=alpha_zb)
-        ax.plot(x_km, analytical_bed, "k-", lw=0.5)
+                        color=COLORS['bed'], alpha=alpha_zb)
+        ax.plot(x_km, analytical_bed, '--', color=COLORS['bed'], lw=1, label='Analytical bedrock')
         if flag in (2, 3, 4, 5):
             ax.fill_between(x_km, analytical_bed, analytical_surface,
-                            color='blue', alpha=alpha_ice, edgecolor=None)
-            ax.plot(x_km, analytical_surface, "b--", lw=1)
+                            color=COLORS['ice_fill'], alpha=alpha_ice, edgecolor=None)
+            ax.plot(x_km, analytical_surface, '--', color=COLORS['ice'], lw=1.1, label='Analytical ice surface')
         if bistable and flag in (4, 5) and m.analytical.surface_alt is not None:
             ax.plot(x_km, m.analytical.surface_alt, "--",
                     color="gray", alpha=0.5, lw=1, label="Analytical fluvial alt")
-        ax.set_ylim(0, 1.3 * np.max(analytical_surface))
+        ax.set_ylim(*field_limits('elevation', analytical_bed, analytical_surface))
         ax.set_xlim(0, m.analytical.L / 1e3)
+        ax.set_xlabel('Distance (km)')
+        ax.set_ylabel('Elevation (m)')
+        style_axes(ax)
+        return ax
 
     def _water_display_1d(self, i):
         """Reconstruct the water DISPLAY layer for output frame ``i`` (the
@@ -1304,280 +1313,78 @@ class siim_plotter:
         wet = z_fill > zs_true + 1e-2
         return zs_true, z_fill, wet
 
-    def _draw_field(self, ax, i, field="elevation", analytical=True,
-                    bistable=True, legend=True):
-        """Draw a single field snapshot onto ax — the per-panel renderer for
-        profile / view_profile / animate_profile.
+    _PROFILE_FIELDS = tuple(PROFILE_FIELDS)
+    _PROFILE_MOVIE = 'profile_1d'
 
-        ``analytical`` toggles the analytical overlay; ``bistable`` (default
-        True) additionally overlays the fluvial alt SS in light gray when the
-        analytical is in a bistable regime (flags 4, 5). ``legend=False``
-        suppresses the per-panel legend."""
-        import warnings
+    def _profile_source(self, ref=-1, basin_rank=0):
         m = self.model
-        x_km = m.x / 1e3
-        analytical_alt = None
-        if analytical:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                analytical_surface, analytical_bed = m.analytical._analytical_profiles()
-            show_analytical_bed = analytical_bed is not None and (
-                analytical_surface is None
-                or not np.allclose(analytical_bed, analytical_surface, equal_nan=True)
-            )
-            if bistable and m.analytical.glacier_flag in (4, 5):
-                analytical_alt = m.analytical.surface_alt
-        else:
-            analytical_surface = analytical_bed = None
-            show_analytical_bed = False
+        if not hasattr(m, 'z_out') or not m.z_out.size:
+            raise ValueError('No simulation output; run the model first.')
+        values = {spec.attribute: np.asarray(getattr(m, spec.attribute + '_out')).T
+                  for spec in PROFILE_FIELDS.values()}
+        return profile_data(
+            **values, zb=m.zb_out.T, x=m.x / 1e3, times=m.output_times,
+            ela=m.zELA_out, uplift=m.U_matrix[:, m.output_steps].T,
+            water_level=m.bl_run[m.output_steps],
+            tau_c=m.tau_c if m.sliding_law == 'coulomb' else None, context='',
+        )
 
-        if field == "elevation":
-            zb_i = m.zb_out[:, i]
-            z_i = m.z_out[:, i]
-            ice = m.H_out[:, i] > 0.0
-            ax.fill_between(x_km, zb_i, z_i, where=ice, color="blue", alpha=0.15)
-            # Water DISPLAY layer (ponds + sea): reconstructed here because it is
-            # not stored state — the floor at the base-level datum bl and the
-            # lake fill live only in the model's working view (see
-            # _water_display_1d). Paint zs_true..z_fill on wet segments, skipping
-            # ICE-dammed ones (terrain ponding against a glacier surface).
-            zs_true, z_fill, wet = self._water_display_1d(i)
-            if wet.any():
-                hw = 0.5 * abs(x_km[1] - x_km[0])
-                labeled = False
-                w = np.flatnonzero(wet)
-                seg_starts = w[np.r_[True, np.diff(w) > 1]]
-                seg_ends = w[np.r_[np.diff(w) > 1, True]]
-                for a, b in zip(seg_starts, seg_ends):
-                    # downstream (toward-outlet) dam cell; skip ice-dammed
-                    dam = a - 1 if b <= m.didx_l else (b + 1 if a >= m.didx_r else -1)
-                    if 0 <= dam < self.model.nx and ice[dam]:
-                        continue
-                    lbl = None if labeled else "Water"
-                    if b > a:
-                        ax.fill_between(x_km[a:b+1], zs_true[a:b+1],
-                                        z_fill[a:b+1], color="skyblue",
-                                        alpha=0.5, label=lbl)
-                    else:   # single-cell pond: explicit half-cell rectangle
-                        ax.fill_between([x_km[a] - hw, x_km[a] + hw],
-                                        [zs_true[a], zs_true[a]],
-                                        [z_fill[a], z_fill[a]],
-                                        color="skyblue", alpha=0.5, label=lbl)
-                    labeled = True
-            if show_analytical_bed:
-                ax.plot(x_km, analytical_bed, "--", color="dimgray", alpha=0.6, lw=1.0,
-                        label="Analytical steady state soln (bedrock)", zorder=0)
-            if analytical_surface is not None:
-                ax.plot(x_km, analytical_surface, "--", color="teal", alpha=0.6, lw=1.1,
-                        label="Analytical steady state soln (surface)", zorder=0)
-                ax.axhline(m.zELA, color="goldenrod", linestyle="--", lw=1, label="Analytical ELA")
-            if analytical_alt is not None:
-                ax.plot(x_km, analytical_alt, "--", color="gray", alpha=0.4, lw=1.0,
-                        label="Analytical fluvial alt", zorder=0)
-            ax.axhline(m.zELA_out[i], color="goldenrod", linestyle="-", lw=1, label="ELA")
-            ax.plot(x_km, zb_i, color="dimgray", label="Bedrock")
-            # ice surface drawn only where there is ice — a bare (or water)
-            # cell shows just its bed, so no spurious cliff connects the
-            # waterline to a retreating toe
-            ax.plot(x_km, np.where(ice, z_i, np.nan), color="navy", label="Ice surface")
-            ax.set_ylabel("Elevation (m)")
-        elif field == "ice_thickness":
-            ax.fill_between(x_km, np.zeros_like(x_km), m.H_out[:, i], color="steelblue", alpha=0.2)
-            ax.plot(x_km, m.H_out[:, i], color="navy", label="Mean ice thickness")
-            # H_out is the WIDTH-MEAN thickness (the physics variable), not the
-            # channel-floor column depth hc_over_H * H.
-            ax.set_ylabel("Mean ice thickness (m)")
-        elif field == "ice_flux":
-            ax.plot(x_km, m.Qg_out[:, i], color="dodgerblue", label="Ice flux $Q_g$")
-            ax.set_ylabel("Ice flux (m$^3$/yr)")
-        elif field == "water_flux":
-            ax.plot(x_km, m.Qf_out[:, i], color="orangered", label="Water flux $Q_f$")
-            ax.set_ylabel("Water flux (m$^3$/yr)")
-        elif field == "erosion_rate":
-            ax.plot(x_km, m.erosion_rate_out[:, i], color="crimson", label="Erosion rate")
-            ax.plot(x_km, m.U_matrix[:, m.output_steps[i]], color="black", linestyle="--", label="Uplift rate")
-            ax.set_yscale("log")
-            ax.set_ylabel("Erosion rate (m/yr)")
-        elif field == "shear_stress":
-            ax.plot(x_km, m.tau_out[:, i] / 1e3, color="purple",
-                    label=r"Basal shear stress $\tau = \rho g H S$")
-            if m.sliding_law == "coulomb":
-                ax.axhline(m.tau_c / 1e3, color="black", linestyle="--", lw=1, label=r"$\tau_c$")
-            ax.set_ylabel("Basal shear stress (kPa)")
-        elif field == "sliding_velocity":
-            ax.plot(x_km, m.ub_out[:, i], color="darkgreen", label=r"Sliding velocity $u_b$")
-            ax.set_ylabel("Sliding velocity (m/yr)")
-
-        ax.set_xlabel("Distance (km)")
-        if legend:
-            ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.2)
-
-    _valid_fields = {"elevation", "ice_flux", "water_flux", "ice_thickness", "erosion_rate", "shear_stress", "sliding_velocity"}
+    def _analytical_overlay(self, bistable):
+        m = self.model
+        surface, bed = m.analytical._analytical_profiles()
+        if surface is None or bed is None:
+            return None
+        return profile_data(
+            x=m.analytical.x / 1e3, surface=surface, bed=bed, ela=m.zELA,
+            surface_alt=(m.analytical.surface_alt
+                         if bistable and m.analytical.glacier_flag in (4, 5) else None),
+            H=m.analytical._analytical_ice_thickness(),
+            Qg=m.analytical._analytical_ice_flux(),
+            Qf=m.analytical._analytical_water_flux(),
+        )
 
     def _compute_field_ylims(self, fields):
-        """Compute stable y-axis limits for each field across all output steps."""
+        return data_limits(self._profile_source(), fields)
+
+    def _draw_profile_extra(self, ax, data, i, field):
+        if field != 'elevation':
+            return
         m = self.model
-        fmap = {'elevation': ('zb_out', 'z_out'), 'ice_thickness': ('H_out', 'H_out'),
-                'erosion_rate': ('erosion_rate_out', 'erosion_rate_out'),
-                'ice_flux': ('Qg_out', 'Qg_out'), 'water_flux': ('Qf_out', 'Qf_out'),
-                'shear_stress': ('tau_out', 'tau_out'),
-                'sliding_velocity': ('ub_out', 'ub_out')}
-        ylims = {}
-        for field in fields:
-            if field == 'ice_thickness':
-                # Scale with the data like the 2D plotter (m31): a 500 m floor,
-                # but grow for thick ice (dome/overdeepening regimes) instead of
-                # silently clipping.
-                hi = float(np.nanmax(m.H_out)) if m.H_out.size else 0.0
-                ylims[field] = (0, max(500.0, hi * 1.05))
-                continue
-            lo_attr, hi_attr = fmap[field]
-            lo = getattr(m, lo_attr)
-            hi = getattr(m, hi_attr)
-            ymin = float(np.nanmin(lo))
-            ymax = float(np.nanmax(hi))
-            if field == 'elevation':
-                ymin = 0.0
-            elif field == 'erosion_rate':
-                ymin = ymax / 100
-            elif ymin > 0:
-                ymin = 0.0
-            pad = (ymax - ymin) * 0.05 if ymax > ymin else 1.0
-            ylims[field] = (ymin, ymax + pad)
-        return ylims
+        x_km = data.x
+        ice = data.H[i] > 0
+        zs_true, z_fill, wet = self._water_display_1d(i)
+        if wet.any():
+            hw = 0.5 * abs(x_km[1] - x_km[0])
+            labeled = False
+            w = np.flatnonzero(wet)
+            seg_starts = w[np.r_[True, np.diff(w) > 1]]
+            seg_ends = w[np.r_[np.diff(w) > 1, True]]
+            for a, b in zip(seg_starts, seg_ends):
+                # downstream (toward-outlet) dam cell; skip ice-dammed
+                dam = a - 1 if b <= m.didx_l else (b + 1 if a >= m.didx_r else -1)
+                if 0 <= dam < self.model.nx and ice[dam]:
+                    continue
+                lbl = None if labeled else "Water"
+                if b > a:
+                    ax.fill_between(x_km[a:b+1], zs_true[a:b+1],
+                                    z_fill[a:b+1], color=COLORS["water"],
+                                    alpha=0.5, label=lbl)
+                else:   # single-cell pond: explicit half-cell rectangle
+                    ax.fill_between([x_km[a] - hw, x_km[a] + hw],
+                                    [zs_true[a], zs_true[a]],
+                                    [z_fill[a], z_fill[a]],
+                                    color=COLORS["water"], alpha=0.5, label=lbl)
+                labeled = True
 
-    _PROFILE_FIELDS = ('elevation', 'ice_thickness', 'erosion_rate', 'ice_flux',
-                       'water_flux', 'shear_stress', 'sliding_velocity')
-
-    def _profile_fields(self, fields, field_min, field_max):
-        """Normalize ``fields`` (str / list / {field: (min,max)|None}) into
-        ``{field: (lo, hi)}`` with resolved, all-step-stable limits.
-        ``field_min``/``field_max`` are the single-field shorthand."""
-        if fields is None:
-            fields = 'elevation'
-        if isinstance(fields, str):
-            norm = {fields.lower(): None}
-        elif isinstance(fields, dict):
-            norm = {k.lower(): v for k, v in fields.items()}
-        else:
-            norm = {f.lower(): None for f in fields}
-        bad = [f for f in norm if f not in self._PROFILE_FIELDS]
-        if bad:
-            raise ValueError(f"unknown profile field(s) {bad}; allowed: "
-                             f"{list(self._PROFILE_FIELDS)}")
-        if len(norm) != 1 and (field_min is not None or field_max is not None):
-            raise ValueError("field_min/field_max apply to a single field; use "
-                             "the {field: (min, max)} dict form for per-field limits")
-        auto = self._compute_field_ylims(list(norm))
-        single = len(norm) == 1
-        resolved = {}
-        for field, override in norm.items():
-            lo_a, hi_a = auto[field]
-            omin = omax = None
-            if override is not None:
-                omin, omax = override
-            if single:
-                omin = field_min if field_min is not None else omin
-                omax = field_max if field_max is not None else omax
-            resolved[field] = (omin if omin is not None else lo_a,
-                               omax if omax is not None else hi_a)
-        return resolved
-
-    def profile(self, fields='elevation', i=-1, field_min=None, field_max=None,
-                basin_rank=0, ref=-1, analytical=True, bistable=True, ax=None):
-        """1D profile at output step ``i`` vs the analytical SS. Same call shape
-        as the 2D ``profile`` — ``basin_rank``/``ref`` are accepted but no-ops in
-        1D (there is one profile). ``fields`` is a str, list, or
-        ``{field: (min,max)|None}`` dict; 7 fields incl. shear_stress /
-        sliding_velocity. Returns ``(fig, axes)``."""
-        resolved = self._profile_fields(fields, field_min, field_max)
-        m = self.model
-        x_km = m.x / 1e3
-        nf = len(resolved)
-        if ax is not None:
-            if nf != 1:
-                raise ValueError("ax= is only valid for a single field")
-            fig, axes = ax.figure, np.array([ax])
-        else:
-            fig, axes = plt.subplots(nf, 1, figsize=(15, 3 * nf), sharex=True,
-                                     squeeze=False, facecolor="white")
-            axes = axes[:, 0]
-        for ax_k, (field, (lo, hi)) in zip(axes, resolved.items()):
-            self._draw_field(ax_k, i, field=field, analytical=analytical,
-                             bistable=bistable)
-            ax_k.set_xlim(x_km[0], x_km[-1])
-            ax_k.set_ylim(lo, hi)
-        if ax is None:
-            fig.tight_layout()
-        return fig, axes
-
-    def view_profile(self, fields='elevation', field_min=None, field_max=None,
-                     basin_rank=0, ref=-1, analytical=True, bistable=True,
-                     fig_width=12, aspect=0.27, legend=False):
-        """Interactive slider over output steps (see ``profile``).
-
-        Uses ipympl for a smooth live canvas (managed locally, so your other
-        plots stay on the default backend). ``fig_width`` (inches) sets the
-        on-screen size and ``aspect`` the per-panel height/width ratio;
-        ``legend`` shows a static legend (off by default).
-        """
-        from .plotting._render import _profile_slider
-        m = self.model
-        if not hasattr(m, "z_out") or m.z_out.size == 0:
-            raise ValueError("No simulation output; run the model first.")
-        resolved = self._profile_fields(fields, field_min, field_max)
-        x_km = m.x / 1e3
-        times = np.asarray(m.output_times)
-
-        def frame(axes, idx):
-            for ax, (field, (lo, hi)) in zip(axes, resolved.items()):
-                ax.clear()
-                self._draw_field(ax, idx, field=field, analytical=analytical,
-                                 bistable=bistable)
-                ax.set_xlim(x_km[0], x_km[-1])
-                ax.set_ylim(lo, hi)
-
-        return _profile_slider(frame, len(times), len(resolved), times,
-                               fig_width=fig_width, aspect=aspect, legend=legend)
-
-    def animate_profile(self, fields='elevation', path=None, run_id=None,
-                        field_min=None, field_max=None, basin_rank=0, ref=-1,
-                        analytical=True, bistable=True, fps=20, interval=42):
-        """MP4 over output steps (see ``profile``). Returns the path."""
-        m = self.model
-        if not hasattr(m, "z_out") or m.z_out.size == 0:
-            raise ValueError("No simulation output; run the model first.")
-        resolved = self._profile_fields(fields, field_min, field_max)
-        nf = len(resolved)
-        x_km = m.x / 1e3
-        times = m.output_times
-        nframes = m.z_out.shape[1]
-        fig, axes = plt.subplots(nf, 1, figsize=(15, 3 * nf), sharex=True,
-                                 squeeze=False, facecolor="white")
-        axes = axes[:, 0]
-        pbar = tqdm.tqdm(total=nframes, desc="Rendering frames")
-
-        def update(idx):
-            for ax, (field, (lo, hi)) in zip(axes, resolved.items()):
-                ax.clear()
-                self._draw_field(ax, idx, field=field, analytical=analytical,
-                                 bistable=bistable)
-                ax.set_xlim(x_km[0], x_km[-1])
-                ax.set_ylim(lo, hi)
-            fig.suptitle(f"t = {times[idx] / 1e3:.1f} kyr")
-            pbar.update(1)
-            return axes
-
-        update(0)
-        fig.tight_layout()
-        name = f"{run_id}_1d" if run_id else (path or "profile_1d")
-        out = output_path(name, 'movies')
-        ani = anm.FuncAnimation(fig, update, frames=range(nframes), interval=interval)
-        ani.save(filename=out + ".mp4", writer="ffmpeg", fps=fps, dpi=150)
-        pbar.close()
-        plt.close(fig)
-        return out + ".mp4"
+    def _draw_field(self, ax, i, field='elevation', analytical=True,
+                    bistable=True, legend=True):
+        """Single-panel adapter used by the limit-cycle plots."""
+        data = self._profile_source()
+        reference = self._analytical_overlay(bistable) if analytical else None
+        draw_panel(ax, field, data, i, reference)
+        self._draw_profile_extra(ax, data, i, field)
+        ax.set_xlabel('Distance (km)')
+        style_axes(ax, legend=legend)
 
     def _pick_side(self, side=None):
         """Terminus side to analyse: the given index, or (None) the side with
@@ -1634,41 +1441,24 @@ class siim_plotter:
                     period=float(t[i1] - t[i0]), amplitude=amp, n_settle=n_settle)
 
     def _cycle_field_ylim(self, field, sample_idx, z_max=None):
-        """Shared y-limits for a field across the cycle snapshot frames, so the
-        n panels are directly comparable. Mirrors how ``plot`` draws each field
-        (kPa for shear stress, log decades for erosion rate, fixed 0–500 for
-        ice thickness); returns None to leave the axis auto-scaled."""
-        m = self.model
-        if field == "ice_thickness":
-            return (0.0, 500.0)
-        if field == "elevation":
-            top = z_max if z_max is not None else 1.05 * float(np.nanmax(m.z_out[:, sample_idx]))
-            return (0.0, top)
-        if field == "erosion_rate":
-            # include the uplift reference line in the log range.
-            ero = m.erosion_rate_out[:, sample_idx].ravel()
-            up = m.U_matrix[:, m.output_steps[sample_idx]].ravel()
-            pos = np.concatenate([ero, up])
-            pos = pos[pos > 0]
-            if pos.size == 0:
-                return None
-            ymax = float(np.nanmax(pos))
-            ymin = max(float(np.nanmin(pos)), ymax / 1e4)  # cap at 4 decades
-            return (ymin, ymax * 1.5)
-        attr = {"ice_flux": "Qg_out", "water_flux": "Qf_out",
-                "shear_stress": "tau_out", "sliding_velocity": "ub_out"}.get(field)
-        if attr is None:
-            return None
-        ymax = float(np.nanmax(getattr(m, attr)[:, sample_idx]))
-        if field == "shear_stress":
-            ymax /= 1e3  # plotted in kPa
-        return (0.0, ymax * 1.05) if ymax > 0 else None
+        """Use the shared unit/limit policy for the selected cycle snapshots."""
+        data = self._profile_source()
+        arrays = [getattr(data, PROFILE_FIELDS[field].attribute)[sample_idx]]
+        if field == 'elevation':
+            arrays.extend([data.zb[sample_idx], data.ela[sample_idx],
+                           data.water_level[sample_idx]])
+        elif field == 'erosion_rate':
+            arrays.append(data.uplift[sample_idx])
+        elif field == 'shear_stress':
+            arrays.append(data.tau_c)
+        lo, hi = field_limits(field, *arrays)
+        return lo, z_max if field == 'elevation' and z_max is not None else hi
 
-    def limit_cycle(self, side=None, n=10, field="elevation", n_settle=None,
+    def _limit_cycle(self, side=None, n=10, field="elevation", n_settle=None,
                     prominence_frac=0.15, figsize=None, ncols=5, z_max=None,
                     analytical=None, bistable=True, mark_lt=True, legend=False,
                     save=False, path="limit_cycle", run_id=None):
-        """Plot the terminus-position limit cycle.
+        """Private research plot of the terminus-position limit cycle.
 
         Top panel: terminus position ``Lt`` vs time, with detected maxima
         marked and the last (most settled) full cycle shaded. Below: a grid of
@@ -1817,12 +1607,12 @@ class siim_plotter:
         "bed": (r"Normalized mean bed, $\langle z_b \rangle / z_{\mathrm{ELA}}$", True),
     }
 
-    def limit_cycle_phase(self, side=None, xaxis="length", yaxis="imbalance",
+    def _limit_cycle_phase(self, side=None, xaxis="length", yaxis="imbalance",
                           ax=None, figsize=(7, 6), cmap="viridis", lw=1.5,
                           alpha=0.8, n_settle=0, logx=False, analytical=True,
                           colorbar=True, save=False, path="limit_cycle_phase",
                           run_id=None):
-        """Phase-portrait of the terminus limit cycle.
+        """Private research phase portrait of the terminus limit cycle.
 
         Plots the glacier's trajectory through state space over the whole run,
         colored by time. The ``xaxis``/``yaxis`` quantities are each one of::

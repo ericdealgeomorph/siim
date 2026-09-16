@@ -16,7 +16,7 @@ import pytest
 fs = pytest.importorskip('fastscapelib_fortran')
 pytestmark = pytest.mark.adapter
 
-from siim._core.hillslope import diffuse       # noqa: E402
+from siim._core.hillslope import diffuse
 
 
 def _ibc(left, right, top, bottom):

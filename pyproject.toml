@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "siim-lem"
-version = "0.9.6"
+version = "0.9.7"
 description = "Sliding Ice Incision Model (siim): coupled glacial-fluvial landscape evolution."
 readme = "README.md"
 authors = [
@@ -96,6 +96,9 @@ markers = [
     # environment.yml). CI: test-adapter runs `-m adapter` under micromamba,
     # test-standalone runs `-m 'not adapter'` on a plain pip env.
     "adapter: needs the optional fastscape/xsimlab adapter (conda env)",
+    # An invariant that must not regress; the matching one-liner (with its why)
+    # lives in _memory/design/conventions.md.
+    "pin: invariant that must not regress",
 ]
 filterwarnings = [
     # Third-party (xsimlab) deprecation noise — not siim's to fix. No category

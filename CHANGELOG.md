@@ -3,7 +3,59 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.6 — September 2026 (current)
+## 0.9.7 — September 2026 (current)
+
+### Behavioural changes
+
+- **Flexure now solves in a sine basis** (`w = 0` at the padded-box edges,
+  the basis fastscape's `flexure2D.f90` uses) instead of a periodic FFT with the
+  domain-mean mode zeroed. Every `flexure=True` run changes. On small domains
+  (`L` much less than the flexural parameter, siim's valley case) the difference
+  is ~1e-2 m: a uniform load stays rigidity-supported as before. On domains much
+  larger than the flexural parameter the old solve subtracted the Airy mean of a
+  localized load and re-emitted it as a uniform uplift of the entire domain —
+  on a 2500 x 250 km grid with `e_thickness=20e3` and a migrating uplift wave
+  that was +3.5 m per 100 kyr step, raising an untouched far plateau from 290 m
+  to 1460 m over 50 Myr. Localized loads now compensate locally at Airy and the
+  far field stays put. The transform is scipy's type-2 sine transform with the
+  per-run transfer grid cached: same fidelity as type 1 and as the fortran
+  (measured), 2-3.5x faster per solve and faster than the fortran itself; it
+  moves flexure numbers at the 1e-3 relative level, so the flexure-on reference
+  battery regenerates once on Linux CI after this release.
+
+- **`fixed_value` borders no longer receive flexural rebound.** Block uplift was
+  already masked off on those rows and columns and they do not erode, but the
+  plate solve still handed them their share of the subsidence, so a fixed edge
+  beside an uplifting interior sank into a trench that then acted as the base
+  level for everything draining to it (on a 2500 x 250 km run the fixed row fell
+  287 m to 55 m while the interior rose 292 m to 543 m over 10 Myr). Stock
+  fastscape has the same inconsistency between `BlockUplift` and `Flexure`.
+  Affects `flexure=True` runs with at least one `fixed_value` edge, including
+  the default topology's two fixed columns; all-looped and all-core domains are
+  unchanged.
+
+- Landscape movies render serially when system RAM cannot be measured, keeping
+  the memory guard effective on platforms without usable `sysconf` results.
+  Interactive viewers now report unexpected canvas-setting errors instead of
+  silently continuing; failed figures are closed and the notebook's plotting
+  backend is restored.
+
+- The 1D `plot.limit_cycle` and `plot.limit_cycle_phase` research helpers are
+  now private (`_limit_cycle`, `_limit_cycle_phase`); their drawing behavior is
+  retained. Public basin and steady-state summaries support `plot=False` and
+  are quiet by default; use `verbose=True` for printed Hack's-law, basin-history
+  or steady-state summaries. Basin histories use `ref` consistently with
+  profiles; `i_ref` remains a deprecated keyword alias. See the
+  [plotting guide](docs/guides/outputs_and_io.md#basin-and-steady-state-summaries).
+
+### Other
+
+- Plotting review fixes: static profiles preserve existing artists on supplied
+  axes, and 1D profiles/viewers/movies retain their original coordinate
+  direction. Landscape component cleanup now runs once on the combined ice
+  layers; ribbon-source thresholds preserve the veil's field-smoothing input.
+
+## 0.9.6 — September 2026
 
 - **2D base-level warning moved to its point of use.** A nonzero or per-side
   `bl` no longer warns at model construction; the note that the analytical

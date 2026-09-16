@@ -18,10 +18,110 @@ All take an output index `i` (default `-1`, the last frame). `map` and
 for terrain and `H_min` / `H_max` for ice colour. See {doc}`../api/model1d` and
 {doc}`../api/model2d` for the method signatures.
 
+### Shared profile behavior
+
+The 1D and 2D `profile`, `view_profile` and `animate_profile` methods use the
+same parser and renderer. Field names are case-insensitive. Pass a name, a
+list of names, or `{name: (minimum, maximum)}`; either bound may be `None`.
+Automatic bounds cover finite data and analytical/forcing references across
+all output snapshots, retain negative elevations, and use the displayed units
+(including kPa for shear stress). Logarithmic erosion plots mask nonpositive
+values; an all-zero frame is labeled explicitly. Manual limits must be finite,
+ordered and positive on a log axis.
+
+```python
+fig, axes = m.plot.profile(
+    fields={'elevation': None, 'ice_thickness': (0, 800)},
+    fig_width=8, aspect=0.38, legend=True,
+)
+```
+
+`fig_width` is inches; `aspect` is each panel's height/width. Profiles default
+to 8-inch figures with legends outside the data panel. The viewer defaults to
+no legend. Bedrock, ice, water and ELA share colors; analytical references are
+dashed and current ELA is solid. Basin comparisons instead use a fixed palette
+to identify basins across maps and histories, with fainter lines for bedrock.
+All snapshots use the same year/kyr/Myr time format.
+
+`i` selects the displayed snapshot. In 2D, `ref` selects the channel extraction
+frame and `basin_rank` selects its basin; the analytical overlay belongs to
+that channel even after other extractions. The uplift curve follows that
+channel's spatial forcing at the displayed output time. In 1D, `ref` and
+`basin_rank` are accepted for call compatibility and have no effect. Only 1D
+currently exposes `shear_stress` and `sliding_velocity`.
+
+Static `profile(ax=...)` calls add to the supplied axes, preserving existing
+measurement lines, annotations and tick formatters. Viewer and movie updates
+clear their own panels between frames. Profile coordinates retain the model's
+ordering: 1D runs from `m.x[0]` to `m.x[-1]` (normally `L` down to zero), while
+2D extracted channels run from the divide toward the outlet. Cross sections
+retain their ascending raster x coordinate.
+
+### Basin and steady-state summaries
+
+`largest_basins`, `largest_basins_history`, `sediment_history`, `hacks_law`
+and `steady_state` support `plot=False` to calculate their results without
+creating a figure. Calculations, drawing and text formatting have separate
+internal helpers. Calls are quiet by default; pass `verbose=True` to
+`hacks_law`, `largest_basins_history` or `steady_state` for a printed summary.
+
+```python
+history = m.plot.largest_basins_history(ref=-1, n_samples=20, plot=False)
+sediment = m.plot.sediment_history(ref=-1, quantity='flux', plot=False)
+ss_step = m.plot.steady_state(plot=False)
+```
+
+`ref` has the same meaning throughout the plotting API: it selects the output
+frame used to extract a reference channel or choose basin outlets. Histories
+keep those outlet identities across the run. The old `i_ref` keyword remains
+accepted by both history methods, with a `DeprecationWarning`; use `ref` in
+new calls. Positional reference arguments retain their meaning. Pass one
+spelling; the legacy alias can override the default `ref=-1`.
+
+`hacks_law(i=..., ref=..., basin_rank=...)` displays area at `i` on the channel
+selected and fitted at `ref`. Its default reference remains the final output.
+For `largest_basins(i=...)`, the ranking and snapshot both come from `i`.
+The historical `t_start` and `t_end` names in `largest_basins_history` denote
+**inclusive output-step indices**, not years; negative indices count backward
+from the final output. Empty/reversed windows and nonpositive sample counts
+are rejected.
+
+Existing results are preserved: basin methods return metric namespaces, and
+`steady_state` returns the first matching output index (or -1). `hacks_law`
+returns an Axes when plotting; with `plot=False` it returns fit parameters
+(`k_h`, `d`, `xo`, `L`, in SI units), scatter arrays (`distance_km`, `area_km2`)
+and fitted-curve arrays (`fit_distance_km`, `fit_area_km2`). Basin history results
+also expose `xt_over_L` and `zo_over_zELA`. Data times stay in years even when
+displayed axes use kyr or Myr.
+
+Public summary plots share fonts, semantic colors and readable time units.
+They use constrained layouts and `fig_width` in inches. Supply `ax` to compose
+them into your own figure: a pair for `largest_basins` or `steady_state`, nine
+axes in row order for `largest_basins_history`, and one Axes for `hacks_law`.
+`sediment_history` accepts a single series Axes or a map/series pair. Supplied
+axes must belong to one figure; other axes and figure titles are preserved.
+
+The 1D `_limit_cycle` and `_limit_cycle_phase` methods are private research
+helpers. Their former public names have been removed; their drawing behavior
+is retained, and their appearance is outside the public plotting style contract.
+
+### Movies and viewers
+
+`animate_profile` and `animate_map` retain `fps=20`; explicit `fps` determines
+the encoded rate. Pass `fps=None` to derive it from `interval` in milliseconds
+per frame. `animate_landscape` derives its rate from `interval` (default 42 ms).
+A movie `path` may include `.mp4`; it is added only once. Existing `run_id`
+filename conventions are preserved and take precedence over `path`.
+
+Plotter-created movie figures close even if encoding fails. Supplied landscape
+figures/axes stay open; unrelated axes are preserved. All supplied axes must
+belong to the same figure. Map viewers update one image and colorbar in place.
+Sliders redraw on release to avoid queuing expensive renders while dragging.
+
 ## Smooth and raw landscape views
 
 `landscape` defaults to `style='smooth'`, an atlas-style presentation. With no
-other arguments it shows bedrock **and** ice (`field='bedrock+ice'`); terrain is
+other arguments it uses an 8-inch figure and shows bedrock **and** ice (`field='bedrock+ice'`); terrain is
 supersampled 4×, Gaussian-de-staircased, hillshaded, and contoured, and the
 same preset:
 
@@ -43,7 +143,7 @@ m.plot.landscape()
 ```
 
 Pass `field='bedrock'` for the bare bed. The veil normalises column depth on
-`H_max`, which defaults to the run-global `1.5 * max H_out`, so a still and
+`H_max`, which defaults to the run-global `hc_over_H * max H_out`, so a still and
 every frame of an animation put the same colour on the same depth;
 `ice_shading='flat'` restores a single opaque `ice_color`, and an explicit
 `ice_cmap` overrides both.
@@ -80,6 +180,14 @@ m.plot.animate_landscape(field='bedrock+ice',
                          H_threshold=50, ice_sigma_cells=3, ice_time_avg=2)
 ```
 
+`H_threshold` gates width-mean H in meters; `area_threshold` gates upstream
+area in m². Both apply to footprint and ribbon sources. `min_ice_cells` cleans
+the combined veil/ribbon mask once, so connected parts count as one glacier.
+With `ice_smoothing='field'`, the veil retains thickness near the threshold
+until the smoothed field is thresholded; ribbon-source gating is separate.
+`sigma_cells` and `ice_sigma_cells`
+are subgrid pixels, so their native-grid strength changes with `oversample`.
+
 `ice_time_avg` changes only the displayed ice layer, not terrain or stored
 state. `min_ice_cells=6` can remove small components, but it can also hide real
 small glaciers and is therefore never enabled by a preset.
@@ -90,8 +198,12 @@ small glaciers and is therefore never enabled by a preset.
 sliding laws, erosion laws and `tau = rho*g*H*S` consume, and the one
 `map(field='ice')` and the profile panels plot ("Mean ice thickness"). What
 `landscape` renders is instead the local **column depth** to the flat ice
-surface: `1.5*H` at the channel floor, and deeper on carved flanks, which is
+surface: `hc_over_H*H` at the channel floor (default ratio 1.5), and deeper on carved flanks, which is
 why its colorbar reads "Ice column depth (m)".
+
+Basin histories record unavailable channels/fits as `NaN`; summary statistics
+exclude missing samples and report valid counts in `result.stats[metric]['n']`.
+A single output cannot establish steady state, so `steady_state()` returns -1.
 
 ## 1D arrays
 

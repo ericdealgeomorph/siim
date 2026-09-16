@@ -11,9 +11,9 @@ pytest.importorskip('fastscape')
 pytest.importorskip('xsimlab')
 pytestmark = pytest.mark.adapter
 
-from fastscape.models import basic_model      # noqa: E402
+from fastscape.models import basic_model
 
-import siim.fastscape as F                    # noqa: E402
+import siim.fastscape as F
 
 # The process classes promoted as the intended-stable public surface (modes A
 # and B + auxiliaries). Subset check: adding names is fine, dropping one breaks.

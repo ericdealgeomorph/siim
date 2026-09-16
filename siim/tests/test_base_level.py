@@ -26,8 +26,8 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from siim.siim1d import siim as siim1d            # noqa: E402
-from siim.siim2d import siim as siim2d            # noqa: E402
+from siim.siim1d import siim as siim1d
+from siim.siim2d import siim as siim2d
 
 
 @pytest.fixture(autouse=True)

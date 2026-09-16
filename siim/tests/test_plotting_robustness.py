@@ -17,9 +17,9 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from siim.plotting._render import (_shade_rgb_soft, _priority_flood,        # noqa: E402
+from siim.plotting._render import (_shade_rgb_soft, _priority_flood,
                                    _trace_paths_arrays)
-from siim.siim1d import siim as siim1d                                       # noqa: E402
+from siim.siim1d import siim as siim1d
 
 
 # --- m29: flat / near-flat hillshade matches matplotlib ---------------------

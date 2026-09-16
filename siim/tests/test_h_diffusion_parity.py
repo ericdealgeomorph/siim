@@ -20,11 +20,11 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from siim._core.diffusion import _diffuse_H_2d                       # noqa: E402
-from siim._core.eroders import _nonlinear_erode_2d, _linear_erode_2d  # noqa: E402
-from siim._core.params import GlacialParams                          # noqa: E402
-from siim._core.solvers import LAW_EFFEXP                            # noqa: E402
-from siim._core.skeleton import _glac_fast_solve_modeB_sfr           # noqa: E402
+from siim._core.diffusion import _diffuse_H_2d
+from siim._core.eroders import _nonlinear_erode_2d, _linear_erode_2d
+from siim._core.params import GlacialParams
+from siim._core.solvers import LAW_EFFEXP
+from siim._core.skeleton import _glac_fast_solve_modeB_sfr
 
 
 # --- m13: SFR eff-exp gives no erosion under ice at ce = 0 -------------------

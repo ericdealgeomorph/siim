@@ -11,5 +11,5 @@ target-version = "py312"                                # minimum supported Pyth
 extend-exclude = ["**/archive/**", "**/_archive/**"]    # don't lint frozen code
 
 [lint]
-select = ["F"]
+select = ["F", "E722", "BLE001", "S110", "S112", "RUF100"]   # correctness, swallowed exceptions, stale noqa
 ignore = ["E701", "E702", "E741", "E501", "E401"]

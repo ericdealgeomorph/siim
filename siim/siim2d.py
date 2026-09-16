@@ -6,6 +6,7 @@ import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+# gate: persistence records the producing version from the package's single source.
 from . import __version__ as _SIIM_VERSION
 from . import constants as _constants
 from .constants import (GRAVITY, KT, RHO_ICE, derive_coulomb,
@@ -1416,7 +1417,7 @@ class siim:
             if temp_path is not None:
                 try:
                     temp_path.unlink(missing_ok=True)
-                except OSError:
+                except OSError:  # gate: cleanup failure must not mask the original save error.
                     pass
             raise
         print(f"Saved to {path}")

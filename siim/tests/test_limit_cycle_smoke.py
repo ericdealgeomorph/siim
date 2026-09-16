@@ -1,6 +1,6 @@
 """Smoke test for the 1D limit-cycle plotters (audit m44).
 
-``limit_cycle`` / ``limit_cycle_phase`` (~290 lines, paper-figure-bound) had no
+``_limit_cycle`` / ``_limit_cycle_phase`` (~290 lines, paper-figure-bound) had no
 test coverage. This exercises construction + one call of each on a small forced
 sawtooth-ELA coulomb mode-B run (persistently glaciated, so the terminus series
 oscillates cleanly), asserting each returns a figure — no numerical pins.
@@ -14,12 +14,12 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-import matplotlib                                       # noqa: E402
+import matplotlib
 matplotlib.use('Agg')                                  # headless
-import matplotlib.pyplot as plt                        # noqa: E402
+import matplotlib.pyplot as plt
 
-from siim.siim1d import siim as siim1d                 # noqa: E402
-from siim.forcing import ela_sawtooth                  # noqa: E402
+from siim.siim1d import siim as siim1d
+from siim.forcing import ela_sawtooth
 
 
 def test_m44_limit_cycle_and_phase_smoke():
@@ -39,12 +39,14 @@ def test_m44_limit_cycle_and_phase_smoke():
         progress_bar=False))
     m.run()
 
-    fig, info = m.plot.limit_cycle()
+    assert not hasattr(m.plot, 'limit_cycle')
+    assert not hasattr(m.plot, 'limit_cycle_phase')
+    fig, info = m.plot._limit_cycle()
     assert fig is not None
     assert info['period'] > 0 and info['amplitude'] > 0
     plt.close(fig)
 
-    fig2, res = m.plot.limit_cycle_phase()
+    fig2, res = m.plot._limit_cycle_phase()
     assert fig2 is not None
     assert np.asarray(res['x']).size > 0 and np.asarray(res['y']).size > 0
     plt.close(fig2)
