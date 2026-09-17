@@ -269,10 +269,12 @@ class ProfileMethods:
     def animate_profile(self, fields='elevation', path=None, run_id=None,
                         field_min=None, field_max=None, basin_rank=0, ref=-1,
                         analytical=True, bistable=True, fps=20, interval=42, *,
-                        fig_width=8, aspect=0.38, legend=True):
+                        fig_width=8, aspect=0.38, legend=True, frames=None):
         """MP4 with profile() styling. Explicit fps wins over interval (ms/frame).
 
         Pass fps=None to derive the encoded frame rate from interval.
+        ``frames`` encodes a subset of the saved frames: a slice, a range or a
+        sequence of indices (negatives count from the end).
         """
         data, resolved, reference = self._profile_setup(
             fields, field_min, field_max, basin_rank, ref, analytical, bistable)
@@ -287,7 +289,8 @@ class ProfileMethods:
         default = getattr(self, '_PROFILE_MOVIE', 'profile')
         # Preserve existing run_id names: <id>_1d and <id>_profile.
         target = movie_path(path, run_id, '1d' if run_id and default == 'profile_1d' else default)
-        return save_animation(fig, update, len(data.times), target, fps=fps, interval=interval)
+        return save_animation(fig, update, len(data.times), target, fps=fps,
+                              interval=interval, frames=frames)
 
 
 def profile_data(**values):

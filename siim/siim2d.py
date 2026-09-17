@@ -495,18 +495,20 @@ class siim:
             # unloading only (the pre-GIA behaviour; isolate the ice contribution or
             # reproduce runs saved before the ice load). Only consulted when flexure=True.
             "ice_load": True,
-            # When True, add the SedimentTracker process: routes per-step eroded
-            # volume down the flow graph and outputs per-node throughput
-            # (sediment_flux_out) + its running total (eroded_volume_out). Off by
-            # default — skips the extra accumulation pass when not needed.
+            # Route per-step eroded volume down the flow graph and report it.
+            # False (off — skips the accumulation pass), True / 'basin': the
+            # per-node throughput (sediment_flux_out) + its running total
+            # (eroded_volume_out); 'edge': the volume delivered across each
+            # 'fixed_value' domain edge (sediment_edge_flux_out + its running
+            # total), a (time, side) pair instead of rasters; 'both'.
             "track_sediment": False,
             "lithos_density": 2800,   # lithospheric rock density (kg/m^3); scalar or (ny,nx)
             "asthen_density": 3200,   # asthenospheric density (kg/m^3)
             "e_thickness": 35e3,      # effective elastic plate thickness Te (m)
         }
 
-    #: ``bl`` dict keys, in boundary_status order.
-    _BL_SIDES = ('left', 'right', 'bottom', 'top')
+    #: ``bl`` dict keys, in boundary_status order (the ``side`` output coord).
+    _BL_SIDES = _outputs.SIDES
 
     def _parse_bl_sides(self, bl, boundary_status):
         """Validate a PER-SIDE ``bl`` dict against ``boundary_status`` and return
@@ -903,7 +905,19 @@ class siim:
         # flexural isostasy (true GIA: ice loading + erosional/tectonic unloading)
         self.flexure = bool(params.flexure)
         self.ice_load = bool(params.ice_load)
-        self.track_sediment = bool(params.track_sediment)
+        # track_sediment: False | True/'basin' (per-node rasters) | 'edge'
+        # (per-domain-edge totals) | 'both'. Anything not a string keeps the
+        # old bool() reading first (1, np.True_, a legacy saved flag).
+        track = params.track_sediment
+        if not isinstance(track, str):
+            track = 'basin' if track else False
+        if track not in (False, 'basin', 'edge', 'both'):
+            raise ValueError(
+                "track_sediment must be False, True, 'basin', 'edge' or "
+                f"'both', got {params.track_sediment!r}")
+        self.track_sediment = track
+        self.sediment_basin = track in ('basin', 'both')
+        self.sediment_edge = track in ('edge', 'both')
         self.lithos_density = params.lithos_density
         self.asthen_density = params.asthen_density
         self.e_thickness = params.e_thickness
@@ -1036,7 +1050,8 @@ class siim:
             routing=self.flow_routing,
             router_backend=self.router_backend,
             flexure=self.flexure,
-            sediment=self.track_sediment,
+            # One tracker serves both reports; output_vars picks what is stored.
+            sediment=self.sediment_basin or self.sediment_edge,
             trunk_surface=self.trunk_surface,
             numerics_backend=self.numerics_backend,
         )
@@ -1154,6 +1169,10 @@ class siim:
         if self.trunk_surface:
             # The trunk-surface provider (surf2erode slot) owns the dip knob.
             input_vars['surf2erode__trunk_dip_k'] = self.trunk_dip_k
+        if self.sediment_basin or self.sediment_edge:
+            # The tracker skips the per-node running integral nothing stores
+            # (the driver gates the same add on cfg.sediment).
+            input_vars['sediment__basin'] = self.sediment_basin
         if self.flexure:
             input_vars.update({
                 'flexure__lithos_density': self.lithos_density,
@@ -1175,8 +1194,9 @@ class siim:
             # same active names, each sampled on its ``time`` clock.
             output_vars = {
                 name: 'time'
-                for name, _dtype in _outputs.output_spec(
-                    self.mode, self.flexure, self.track_sediment)
+                for name, _dtype, _dims in _outputs.output_spec(
+                    self.mode, self.flexure, self.sediment_basin,
+                    self.sediment_edge)
             }
 
             ds_in = xs.create_setup(
@@ -1199,6 +1219,9 @@ class siim:
                 with model:
                     self.ds_out = ds_in.xsimlab.run(hooks=hooks, encoding=encoding)
 
+        if 'side' in self.ds_out.dims:      # xsimlab stores the dim, not the labels
+            self.ds_out = self.ds_out.assign_coords(side=list(_outputs.SIDES))
+
     def _run_inhouse(self, hooks):
         """siim's own framework-free time loop (:func:`siim._core.driver.run_loop`)
         calling the SAME step functions the adapter shells call — the standalone
@@ -1220,8 +1243,10 @@ class siim:
         with router as route:
             cfg.route = route
             buffers = _driver.run_loop(cfg)
-        self.ds_out = _outputs.build_dataset(buffers, cfg.t_out, cfg.x, cfg.y,
-                                             self.t)
+        spec = _outputs.output_spec(self.mode, self.flexure, self.sediment_basin,
+                                    self.sediment_edge)
+        self.ds_out = _outputs.build_dataset(buffers, spec, cfg.t_out, cfg.x,
+                                             cfg.y, self.t)
 
     def _driver_initial_surface(self):
         """The initial topography array for the in-house driver (mode-B bed /
@@ -1283,7 +1308,7 @@ class siim:
             # mode / flags
             mode=self.mode, carve=self.carve_width,
             trunk_surface=self.trunk_surface, flexure=self.flexure,
-            sediment=self.track_sediment,
+            sediment=self.sediment_basin, sediment_edge=self.sediment_edge,
             # law record
             law_code=law_code, gp=gp, hc_over_H=float(gp.hc_over_H),
             alpha_g=float(gp.alpha_g), widening_factor=self.widening_factor,
@@ -1367,12 +1392,22 @@ class siim:
             self.denudation_out = self.ds_out['glacial_spl__denudation'].values
         self.lengths_out = self._reconstruct_lengths_out(self.receivers_out)
 
-        if self.track_sediment and 'sediment__cumulative' in self.ds_out:
+        if self.sediment_basin and 'sediment__cumulative' in self.ds_out:
             # (time, y, x): per-node upstream-eroded throughput per step, and its
             # running time-integral. diff eroded_volume_out along axis 0 for
             # per-interval volumes; outlet node = whole-basin cumulative yield.
             self.sediment_flux_out = self.ds_out['sediment__flux'].values
             self.eroded_volume_out = self.ds_out['sediment__cumulative'].values
+
+        if self.sediment_edge and 'sediment__edge_cumulative' in self.ds_out:
+            # (time, side) in _BL_SIDES order [left, right, bottom, top]: the
+            # volume (m^3) delivered across each domain edge per step and its
+            # running time-integral — the border ring of sediment__flux summed
+            # per side, each corner counted once. NaN on a side whose
+            # boundary_status is not 'fixed_value' (no outlet there, which is
+            # not the same as zero export).
+            self.sediment_edge_flux_out = self.ds_out['sediment__edge_flux'].values
+            self.sediment_edge_cumulative_out = self.ds_out['sediment__edge_cumulative'].values
 
         if self.flexure and 'flexure__rebound' in self.ds_out:
             # (time, y, x): per-step flexural deflection applied to the column

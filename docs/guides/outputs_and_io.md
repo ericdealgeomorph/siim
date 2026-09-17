@@ -109,8 +109,11 @@ is retained, and their appearance is outside the public plotting style contract.
 
 `animate_profile` and `animate_map` retain `fps=20`; explicit `fps` determines
 the encoded rate. Pass `fps=None` to derive it from `interval` in milliseconds
-per frame. `animate_landscape` derives its rate from `interval` (default 42 ms).
-A movie `path` may include `.mp4`; it is added only once. Existing `run_id`
+per frame. `animate_landscape` derives its rate from `interval` (default 42 ms)
+unless an explicit `fps` is given, on both its serial and parallel render
+paths. All three accept `frames` — a slice, a range or a sequence of
+saved-frame indices, negatives counting from the end — and encode just those,
+in the order given. A movie `path` may include `.mp4`; it is added only once. Existing `run_id`
 filename conventions are preserved and take precedence over `path`.
 
 Plotter-created movie figures close even if encoding fails. Supplied landscape
@@ -180,6 +183,13 @@ m.plot.animate_landscape(field='bedrock+ice',
                          H_threshold=50, ice_sigma_cells=3, ice_time_avg=2)
 ```
 
+`fps` and `frames` are movie knobs rather than `landscape` ones — encode the
+last twenty saved frames at ten frames per second with:
+
+```python
+m.plot.animate_landscape(fps=10, frames=slice(-20, None))
+```
+
 `H_threshold` gates width-mean H in meters; `area_threshold` gates upstream
 area in m². Both apply to footprint and ribbon sources. `min_ice_cells` cleans
 the combined veil/ribbon mask once, so connected parts count as one glacier.
@@ -191,6 +201,21 @@ are subgrid pixels, so their native-grid strength changes with `oversample`.
 `ice_time_avg` changes only the displayed ice layer, not terrain or stored
 state. `min_ice_cells=6` can remove small components, but it can also hide real
 small glaciers and is therefore never enabled by a preset.
+
+`cross_section` adds the section and hypsometry panels. A `y` in km reads that
+one row and marks it on the map; `'mean'` averages over the rendered rows of
+the section grid instead — the interpolated `oversample` grid, whose two end
+rows carry less ground than the interior ones — so the painted band is the
+average ice column per unit x and vanishes where nothing is iced. The mean
+section also shows the spread behind that mean — the ice surface's 25–75% band
+shaded, the bed's 25th and 75th percentiles as dashed lines — so a flat mean
+over one landscape reads differently from a flat mean over several. An averaged profile has no single y to mark, so the map gets
+no locator line, and it skips the lake layer — a reduced water table is not a
+water table:
+
+```python
+m.plot.landscape(cross_section='mean')
+```
 
 ### Two ice thicknesses
 
@@ -245,8 +270,25 @@ NumPy views of that dataset and have shape `(time, y, x)` unless noted.
 | `basin_out` | `glacial_flow__basin_ids` | basin identifiers |
 | `lengths_out` | reconstructed from receivers/grid | node-to-receiver distance |
 | `rebound_out` | `flexure__rebound` | flexural displacement; present when `flexure=True` |
-| `sediment_flux_out` | `sediment__flux` | sediment throughput; present when `track_sediment=True` |
-| `eroded_volume_out` | `sediment__cumulative` | cumulative eroded volume; present when `track_sediment=True` |
+| `sediment_flux_out` | `sediment__flux` | sediment throughput; present when `track_sediment` reports by basin |
+| `eroded_volume_out` | `sediment__cumulative` | cumulative eroded volume; present when `track_sediment` reports by basin |
+| `sediment_edge_flux_out` | `sediment__edge_flux` | volume leaving the domain across each edge, shaped `(time, side)`; present when `track_sediment` reports by edge |
+| `sediment_edge_cumulative_out` | `sediment__edge_cumulative` | its running total, shaped `(time, side)` |
+
+`track_sediment` chooses what the routed sediment is reported as: `False`
+(off, the default), `True` or `'basin'` (the per-node rasters above),
+`'edge'` (the per-domain-edge totals only) or `'both'`. Any other value is
+rejected.
+
+The two `(time, side)` arrays carry the `side` coordinate
+`['left', 'right', 'bottom', 'top']` — `boundary_status` order, the same keys a
+per-side `bl` dict takes. Each entry is this step's routed `sediment__flux`
+summed over that edge's outlet ring, in m³ per step, with each corner node
+counted exactly once (an outlet left/right edge owns its corners, otherwise the
+bottom/top edge does). Only a `'fixed_value'` edge is an outlet, so a `'core'`
+or `'looped'` edge reads `NaN` rather than zero: nothing can leave there, which
+is not the same as nothing leaving. With every side `'fixed_value'`, the four
+entries sum to the whole domain's denuded volume for that step.
 
 Mode B/C stores the bed as `topography__elevation` and reconstructs the ice
 surface as `z = zb + 1.5*H`. Mode A stores the ice surface as topography and a

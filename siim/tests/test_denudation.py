@@ -153,6 +153,99 @@ def test_sediment_carve_adds_to_yield():
     assert border_flux(on) > border_flux(off), (border_flux(on), border_flux(off))
 
 
+# --- track_sediment='edge': the per-domain-edge sediment report -------------
+
+def _edge_run(**ov):
+    """A short every-step-output run of the glaciated transient, so each output
+    frame is one model step and the per-step budget can be read directly."""
+    m = siim2d(_glac(nt=11, nt_out=11, nx=21, ny=21, **ov))
+    m.run()
+    assert np.maximum(m.denudation_out, 0.0).sum() > 0, "precondition: must erode"
+    return m
+
+
+@pytest.mark.pin
+def test_sediment_edge_closes_the_budget():
+    """With every side 'fixed_value' the whole border ring is self-receiving
+    outlets, so nothing routed stays in the domain: per step, the summed edge
+    export equals the denuded source volume (to accumulation round-off), and
+    the cumulative is the running sum of the per-step export."""
+    m = _edge_run(track_sediment='edge')
+    cell_area = (m.Lx / (m.grid_nx - 1)) * (m.Ly / (m.grid_ny - 1))
+    source = np.maximum(m.denudation_out, 0.0).sum(axis=(1, 2)) * cell_area
+    exported = m.sediment_edge_flux_out.sum(axis=1)          # no NaN: all fixed
+    assert np.isfinite(m.sediment_edge_flux_out).all()
+    rel = np.abs(exported - source) / source
+    assert rel.max() < 1e-12, f"edge export vs source: max rel {rel.max():.3e}"
+    # Running integral: frames 0..nt-2 are steps 0..nt-2 (the last frame repeats
+    # the last step's buffers, Map 2 §2).
+    cum = m.sediment_edge_cumulative_out
+    assert np.array_equal(cum[:-1], np.cumsum(m.sediment_edge_flux_out[:-1], axis=0))
+    assert np.array_equal(cum[-1], cum[-2])
+
+
+@pytest.mark.pin
+def test_sediment_edge_nan_off_fixed_sides():
+    """Default topology (fixed x, looped y): the looped sides carry NaN — no
+    outlet there is not the same as no export — and the two fixed sides sum to
+    the by-hand border-ring sum of the raster, corners counted once."""
+    m = _edge_run(track_sediment='both',
+                  boundary_status=['fixed_value', 'fixed_value',
+                                   'looped', 'looped'])
+    edge = m.sediment_edge_flux_out
+    assert np.isnan(edge[:, 2:]).all()                       # bottom, top
+    assert np.isfinite(edge[:, :2]).all()                    # left, right
+    assert np.isnan(m.sediment_edge_cumulative_out[:, 2:]).all()
+    s = m.sediment_flux_out
+    assert np.array_equal(edge[:, 0], s[:, :, 0].sum(axis=1))
+    assert np.array_equal(edge[:, 1], s[:, :, -1].sum(axis=1))
+    assert m.ds_out['sediment__edge_flux'].dims == ('time', 'side')
+    assert list(m.ds_out.side.values) == ['left', 'right', 'bottom', 'top']
+
+
+@pytest.mark.pin
+def test_sediment_basin_outputs_unchanged():
+    """True, 'basin' and 'both' deliver the identical per-node rasters — the
+    widened kwarg adds outputs, it never perturbs the ones that existed."""
+    a = _edge_run(track_sediment=True)
+    b = _edge_run(track_sediment='basin')
+    c = _edge_run(track_sediment='both')
+    for m in (b, c):
+        assert np.array_equal(a.sediment_flux_out, m.sediment_flux_out)
+        assert np.array_equal(a.eroded_volume_out, m.eroded_volume_out)
+    assert not hasattr(a, 'sediment_edge_flux_out')
+    assert 'sediment__flux' not in _edge_run(track_sediment='edge').ds_out
+
+
+@pytest.mark.pin
+def test_sediment_edge_side_index_2_is_row_zero():
+    """SIDES index 2 is 'bottom' = row 0 (y = 0) — NOT the fastscape ibc digit
+    naming, which calls row 0 'top'. With row 0 the only outlet ('core' on row
+    ny-1, looped x), the whole export lands on 'bottom' and equals the row-0
+    ring sum."""
+    m = _edge_run(track_sediment='both',
+                  boundary_status=['looped', 'looped', 'fixed_value', 'core'])
+    edge = m.sediment_edge_flux_out
+    assert np.isfinite(edge[:, 2]).all()
+    assert np.isnan(edge[:, [0, 1, 3]]).all()
+    assert np.array_equal(edge[:, 2], m.sediment_flux_out[:, 0, :].sum(axis=1))
+
+
+def test_sediment_edge_rejects_unknown_value():
+    with pytest.raises(ValueError, match=r"track_sediment must be False, True"):
+        siim2d(_glac(track_sediment='outlet'))
+
+
+def test_sediment_flag_keeps_bool_reading_of_non_strings():
+    """Only strings are matched against the option set; anything else keeps the
+    pre-0.9.8 ``bool()`` reading, so 1 / 0 / np.True_ (a numpy sweep, or an
+    older saved _user_params) still resolve instead of raising."""
+    assert siim2d(_glac(track_sediment=1)).track_sediment == 'basin'
+    assert siim2d(_glac(track_sediment=np.True_)).track_sediment == 'basin'
+    assert siim2d(_glac(track_sediment=0)).track_sediment is False
+    assert siim2d(_glac(track_sediment=None)).track_sediment is False
+
+
 # (The fortran flexure/diffusion arms died at the 0.9.1 standalone flip — the
 # in-house solve is the only backend; the S2 Kelvin twin remains its oracle.)
 

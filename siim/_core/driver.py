@@ -22,8 +22,9 @@ area / erosion already reflect one solved step.
 Cross-step state OWNED by the driver: the ``ice_thickness`` one-step lag (the
 router/accumulator read ``H(t-1)`` — an ordering artifact reproduced by reading
 H into the routing surface before the kernel overwrites it), the ``_H_eff`` EMA
-carry (``routing_relax``), the flexure ``_col_prev``, the sediment ``_cum``, and
-the ``topography`` state (committed only at finalize).
+carry (``routing_relax``), the flexure ``_col_prev``, the sediment ``_cum`` (and
+its per-domain-edge twin), and the ``topography`` state (committed only at
+finalize).
 
 FIREWALL (Map 1 §2): the relaxed / fabricated routing surface (``zs_route``)
 reaches ONLY the router graph, the mass-balance surface, and the ice-surface
@@ -44,8 +45,8 @@ from .outputs import output_spec, allocate_buffers
 from .step import (
     ema_thickness, routing_surface, _fabricate_trunk_surface,
     accumulate_glacial_flow, run_modeA_step, run_modeB_kernel, carve_bed,
-    accumulate_sediment, glacial_flexure_step, sum_erosion,
-    compose_vertical_motion,
+    accumulate_sediment, edge_sediment, glacial_flexure_step, sum_erosion,
+    compose_vertical_motion, SIDE_SLICES,
 )
 
 
@@ -53,7 +54,7 @@ def _edge_border_mask(border_status, shape):
     """Non-looped domain edges (base-level borders), as the trunk-surface
     fabrication excludes them (TrunkSurfaceToErode.initialize)."""
     ny, nx = shape
-    bs = list(np.broadcast_to(border_status, 4))   # [left, right, top, bottom]
+    bs = list(np.broadcast_to(border_status, 4))   # [left, right, bottom, top]: 2 = row 0
     border = np.zeros((ny, nx), dtype=bool)
     if bs[0] != 'looped': border[:,  0] = True
     if bs[1] != 'looped': border[:, -1] = True
@@ -69,12 +70,6 @@ def _slice_forcing(series, scalar, k):
     return series[k] if series is not None else scalar
 
 
-# Border rings in boundary_status order [left, right, bottom, top] (the
-# side->slice mapping of step.uplift_mask).
-_BL_SIDE_SLICES = ((slice(None), 0), (slice(None), -1),
-                   (0, slice(None)), (-1, slice(None)))
-
-
 def _bl_field(bl_sides, shape, k):
     """Per-node water datum for step ``k`` (PER-SIDE ``bl``): each
     ``fixed_value`` border node carries its own side's datum; interior entries
@@ -87,13 +82,14 @@ def _bl_field(bl_sides, shape, k):
     for s in (2, 3, 0, 1):                      # bottom, top, then left, right
         if bl_sides[s] is not None:
             scalar, series = bl_sides[s]
-            field[_BL_SIDE_SLICES[s]] = _slice_forcing(series, scalar, k)
+            field[SIDE_SLICES[s]] = _slice_forcing(series, scalar, k)
     return field.ravel()
 
 
 def run_loop(cfg):
     """Run the merged in-house time loop; return the packed ``ds_out`` step
-    buffers (a ``{name: (nt_out, ny, nx) ndarray}`` dict per the output spec).
+    buffers (a ``{name: ndarray}`` dict, one array per output-spec row at that
+    row's dims).
     ``cfg`` is the resolved-parameter bundle assembled by
     :meth:`siim.siim2d.siim._run_inhouse` (see that method for the field
     contract)."""
@@ -102,8 +98,9 @@ def run_loop(cfg):
     length = (cfg.yl, cfg.xl)
     hc = cfg.hc_over_H
 
-    spec = output_spec(cfg.mode, cfg.flexure, cfg.sediment)
+    spec = output_spec(cfg.mode, cfg.flexure, cfg.sediment, cfg.sediment_edge)
     buffers = allocate_buffers(spec, cfg.nt_out, ny, nx)
+    track_sediment = cfg.sediment or cfg.sediment_edge   # both need the routed flux
 
     # --- cross-step state owned by the driver ---
     topo = np.array(cfg.initial_surface, dtype=np.float64).reshape(shape).copy()
@@ -111,6 +108,7 @@ def run_loop(cfg):
     H_eff = None                              # routing_relax EMA carry (seed None)
     col_prev = np.zeros(shape) if cfg.flexure else None
     cum = np.zeros(shape) if cfg.sediment else None
+    edge_cum = np.zeros(4) if cfg.sediment_edge else None   # NaN off fixed sides
 
     is_mode_b = cfg.mode == 'B'
     # --- persistent per-run scratch (allocation only; no semantic state) ---
@@ -211,11 +209,15 @@ def run_loop(cfg):
             surface_forcing, surface_forcing, rebound, erosion_total)
 
         # --- sediment (optional) ---
-        if cfg.sediment:
+        if track_sediment:
             flux = accumulate_sediment(
                 denudation, cfg.cell_area, rt.stack, rt.receivers,
                 rt.nb_receivers, rt.weights, shape)
-            cum = cum + flux                       # new array (prior snapshots valid)
+            if cfg.sediment:
+                cum = cum + flux                   # new array (prior snapshots valid)
+            if cfg.sediment_edge:
+                edge_flux = edge_sediment(flux, cfg.border_status)
+                edge_cum = edge_cum + edge_flux
 
         # --- stage this step's output buffers ---
         cur['topography__elevation'] = topo       # PRE-finalize for in-loop frames
@@ -234,6 +236,9 @@ def run_loop(cfg):
         if cfg.sediment:
             cur['sediment__flux'] = flux
             cur['sediment__cumulative'] = cum
+        if cfg.sediment_edge:
+            cur['sediment__edge_flux'] = edge_flux
+            cur['sediment__edge_cumulative'] = edge_cum
         if cfg.flexure:
             cur['flexure__rebound'] = rebound
 

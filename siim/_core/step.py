@@ -214,13 +214,18 @@ def wave_uplift(x, y, shape, mask, dt, t, delta_h, wave_width, wave_velocity,
 # ---------------------------------------------------------------------------
 # 3. Block uplift (BlockUplift.initialize mask + GlacialBlockUplift.run_step)
 # ---------------------------------------------------------------------------
+#: Border ring of each domain edge, indexed in ``border_status`` order
+#: (:data:`siim._core.outputs.SIDES` = left, right, bottom, top): index 2 is
+#: row 0 (y = 0), index 3 is row ny-1.
+SIDE_SLICES = ((slice(None), 0), (slice(None), -1),
+               (0, slice(None)), (-1, slice(None)))
+
+
 def uplift_mask(border_status, shape):
     """Binary uplift mask: 0 on 'fixed_value' border rings, 1 elsewhere. Body of
     fastscape ``BlockUplift.initialize`` (the mask half)."""
     mask = np.ones(shape)
-    _all = slice(None)
-    slices = [(_all, 0), (_all, -1), (0, _all), (-1, _all)]
-    for status, border in zip(border_status, slices):
+    for status, border in zip(border_status, SIDE_SLICES):
         if status == "fixed_value":
             mask[border] = 0.0
     return mask
@@ -726,6 +731,34 @@ def accumulate_sediment(denudation, cell_area, stack, receivers, nb_receivers,
     else:                     # SFR
         _flow_accumulate_sd(field, stack, receivers)
     return field.reshape(shape)
+
+
+def edge_sediment(flux, border_status):
+    """Sum the routed per-node ``flux`` (the ``(ny, nx)`` field
+    :func:`accumulate_sediment` returns) over each domain-edge outlet ring —
+    the volume (m^3) leaving the domain across that edge this step.
+
+    Returns a length-4 array in ``border_status`` order
+    (``siim.siim2d.siim._BL_SIDES`` = left, right, bottom, top), NaN on any
+    side that is not ``'fixed_value'``: only fixed-value rings are
+    self-receiving outlets (:func:`siim._core.routing.d8_interior_mask`), so a
+    'core' or 'looped' edge has no sediment to deliver, which is not the same
+    as delivering none. Each corner node is counted exactly ONCE, by the same
+    rule ``siim._core.driver._bl_field`` uses for the water datum: an outlet
+    x-side (left/right) owns it, else the y-side.
+
+    Shared by the in-house driver and ``SedimentTracker.run_step`` so the two
+    front ends report the identical sums."""
+    fixed = [b == 'fixed_value' for b in np.broadcast_to(border_status, 4)]
+    f = np.asarray(flux)
+    # The y-side rings give up a corner to whichever x-side is an outlet.
+    trim = slice(1 if fixed[0] else 0, -1 if fixed[1] else None)
+    out = np.full(4, np.nan)
+    for s in range(4):
+        if fixed[s]:
+            ring = f[SIDE_SLICES[s]]
+            out[s] = (ring if s < 2 else ring[trim]).sum()
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -144,6 +144,44 @@ def test_animate_parallel_renders_mp4(tmp_path, monkeypatch):
     assert out.endswith('.mp4') and os.path.getsize(out) > 10_000
 
 
+@pytest.mark.pin
+def test_animate_parallel_renders_only_the_selected_frames(tmp_path, monkeypatch):
+    """``frames`` reaches the parallel path too: the workers render just the
+    selected saved frames, numbered CONTIGUOUSLY (ffmpeg reads a %05d
+    sequence), and an explicit fps becomes the encoder's -framerate."""
+    import os
+    import subprocess
+    import matplotlib.animation as anm
+    import pytest
+    if not anm.FFMpegWriter.isAvailable():
+        pytest.skip("ffmpeg not available")
+    from siim.siim2d import siim as siim2d
+    monkeypatch.chdir(tmp_path)
+    m = siim2d(dict(U=1e-3, zELA=300, T=1e5, nt=11, nt_out=8,
+                    nx=31, ny=31, Lx=3e4, Ly=3e4, seed=7,
+                    initial_max_elevation=800, progress_bar=False,
+                    boundary_status=['fixed_value'] * 4))
+    m.run()
+    assert len(m.output_times) == 8, "test setup: need 8 frames to subsample 4"
+
+    seen = {}
+    real_run = subprocess.run
+
+    def spy_run(cmd, **kwargs):
+        pattern = cmd[cmd.index('-i') + 1]
+        seen['pngs'] = sorted(f for f in os.listdir(os.path.dirname(pattern))
+                              if f.endswith('.png'))
+        seen['framerate'] = cmd[cmd.index('-framerate') + 1]
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', spy_run)
+    out = m.plot.animate_landscape(path='sel_anim', n_workers=2, style='raw',
+                                   frames=slice(None, None, 2), fps=3)
+    assert seen['pngs'] == [f'frame_{k:05d}.png' for k in range(4)]
+    assert seen['framerate'] == '3'
+    assert out.endswith('.mp4') and os.path.getsize(out) > 0
+
+
 # --- the 2026-09-02 display-layer sweep -------------------------------------
 
 @pytest.fixture(scope='module')
@@ -282,6 +320,45 @@ def test_animate_freezes_the_auto_colour_scales(_iced_model, tmp_path,
                                  field='bedrock+ice', ice_cmap='Blues')
     assert seen and all(kw['z_max'] == kwargs['z_max']
                         and kw['H_max'] == kwargs['H_max'] for kw in seen)
+    plt.close('all')
+
+
+def test_animate_freezes_the_scales_over_the_selected_frames(_iced_model, tmp_path,
+                                                             monkeypatch):
+    """The freeze must follow ``frames``: resolved over the whole run, a movie
+    of a late window is scaled to relief (and ice) it never shows."""
+    import matplotlib.animation as anm
+    m = _iced_model
+    mdl = m.plot.model
+    z, H = np.asarray(mdl.z_out), np.asarray(mdl.H_out)
+    windows = ([0, 1], [2, 3])
+    expect = [(float(np.nanmax(z[w])), float(mdl.hc_over_H * np.nanmax(H[w])))
+              for w in windows]
+    assert expect[0] != expect[1], \
+        "test setup: the two windows must not share their scales"
+
+    seen = []
+    plotter = type(m.plot)
+    original = plotter.landscape
+
+    def spy(self, **kw):
+        seen.append((kw.get('z_max'), kw.get('H_max')))
+        return original(self, **kw)
+
+    monkeypatch.setattr(plotter, 'landscape', spy)
+    monkeypatch.setattr(anm.FuncAnimation, 'save', lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    got = []
+    for window in windows:
+        seen.clear()
+        with warnings.catch_warnings():       # the no-op save() never renders
+            warnings.simplefilter('ignore', UserWarning)
+            m.plot.animate_landscape(path=f'window{window[0]}', n_workers=1,
+                                     frames=window, field='bedrock+ice',
+                                     oversample=1, hillshade=False)
+        assert seen, "no frame was rendered for this window"
+        got.append(seen[0])
+    assert got == expect
     plt.close('all')
 
 
@@ -437,3 +514,146 @@ def test_section_names_its_ela_and_states_the_exaggeration(_iced_model):
     assert ela_lines, "no dashed ELA line in the section"
     assert matplotlib.colors.to_hex(ela_lines[0].get_color()) == ELA_COLOR
     plt.close(fig)
+
+
+# --- averaged cross-sections (0.9.8) ----------------------------------------
+
+def _band_bounds(band):
+    """The lower/upper edge of a fill_between band, per unique x (the polygon
+    carries both edges, endpoints doubled)."""
+    verts = band.get_paths()[0].vertices
+    xs = np.round(verts[:, 0], 9)
+    edges = [(verts[xs == x, 1].min(), verts[xs == x, 1].max())
+             for x in np.unique(xs)]
+    return np.asarray([lo for lo, _ in edges]), np.asarray([hi for _, hi in edges])
+
+
+def _quartile_lines(ax_cs, n):
+    """The mean section's dashed bed-quartile lines (the ELA dash spans two
+    points, so the column count separates them)."""
+    return [ln for ln in ax_cs.lines
+            if ln.get_linestyle() == '--' and len(ln.get_ydata()) == n]
+
+
+# gate: 'median' removed by decision 2026-09-17 (mean + IQR only)
+def test_averaged_cross_section_reduces_every_row(_basin_model):
+    """cross_section='mean' replaces the single row with the mean over the
+    rendered rows: at oversample=1 the surface line is that mean of the stored
+    bed (this run is ice-free, so the composite IS the bed), the map carries no
+    locator line, and no ice is painted."""
+    m = _basin_model
+    fig, ax = m.plot.landscape(field='bedrock+ice', i=-1, oversample=1,
+                               cross_section='mean', hillshade=False,
+                               contour_interval=0)
+    nx_sub = _map_rgb(ax).shape[1]
+    profile = _section_lines(_section_axes(fig), nx_sub)[-1]
+    np.testing.assert_allclose(profile, np.mean(np.asarray(m.zb_out[-1]), axis=0),
+                               atol=1e-6)
+    assert len(ax.lines) == 0, "an averaged section has no single y to mark"
+    # Same zero-alpha check as the phantom-ice guard: the section's ice layer
+    # is the only zorder-2 image.
+    ice_imgs = [im for a in fig.axes for im in a.get_images()
+                if im.get_zorder() == 2]
+    assert ice_imgs, "cross-section ice layer not found"
+    painted = sum(float(np.asarray(im.get_array())[..., 3].sum())
+                  for im in ice_imgs)
+    assert painted == 0.0, f"ice painted on an ice-free average (alpha {painted})"
+    plt.close(fig)
+
+    # control: a y in km still gets its locator line
+    fig, ax = m.plot.landscape(field='bedrock+ice', i=-1, oversample=1,
+                               cross_section=15.0, hillshade=False,
+                               contour_interval=0)
+    assert len(ax.lines) == 1
+    plt.close(fig)
+
+
+# gate: bed IQR is now two dashed lines, decision 2026-09-17
+def test_mean_cross_section_shades_the_interquartile_range(_iced_model):
+    """A mean alone cannot say whether the rows it averaged agree, so the
+    section shows their spread: the ice surface's 25-75% band shaded, the bed's
+    quartiles dashed (a second fill read as more ice, not as topography). On a
+    bare bed at oversample=1 the composite IS the stored bed, so the dashed
+    pair is exactly the stored rows' quartiles."""
+    from matplotlib.collections import PolyCollection
+    from matplotlib.colors import to_rgba
+    from siim.plotting._style import COLORS
+    m = _iced_model
+    fig, ax = m.plot.landscape(field='bedrock', i=-1, oversample=1,
+                               cross_section='mean', hillshade=False,
+                               contour_interval=0)
+    nx_sub = _map_rgb(ax).shape[1]
+    ax_cs = _section_axes(fig)
+    # gate: bed IQR is now two dashed lines, decision 2026-09-17
+    assert not [c for c in ax_cs.collections if isinstance(c, PolyCollection)], \
+        "a bare bed has no ice surface to shade"
+    want = np.percentile(np.asarray(m.zb_out[-1]), [25, 75], axis=0)
+    assert (want[1] - want[0]).min() > 1.0, "test setup: the rows barely spread"
+    dashed = _quartile_lines(ax_cs, nx_sub)
+    assert len(dashed) == 2, "the bed quartiles are two dashed lines"
+    np.testing.assert_allclose([ln.get_ydata() for ln in dashed], want, atol=1e-6)
+    assert all(ln.get_color() == 'black' for ln in dashed)
+    note = '\n'.join(t.get_text() for t in ax_cs.texts)
+    assert 'shaded: surface IQR' in note and 'dashed: bed quartiles' in note
+    plt.close(fig)
+
+    # with ice drawn, the surface carries the only band
+    fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, oversample=1,
+                              cross_section='mean', hillshade=False,
+                              contour_interval=0)
+    ax_cs = _section_axes(fig)
+    bands = [c for c in ax_cs.collections if isinstance(c, PolyCollection)]
+    assert len(bands) == 1
+    np.testing.assert_allclose(bands[0].get_facecolor()[0],
+                               to_rgba(COLORS['ice'], 0.22), atol=1e-9)
+    dashed = _quartile_lines(ax_cs, nx_sub)
+    assert len(dashed) == 2
+    # the section's ice fill is OPAQUE (zorder 2): anything under it is invisible
+    assert bands[0].get_zorder() > 2
+    assert min(ln.get_zorder() for ln in dashed) > bands[0].get_zorder()
+    assert (_band_bounds(bands[0])[1] > np.asarray(dashed[1].get_ydata())).any(), \
+        "the iced surface band must rise above the bed's upper quartile"
+    plt.close(fig)
+
+    # a single row is one landscape: no band, no quartile lines, no note
+    fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, oversample=1,
+                              cross_section=15.0, hillshade=False,
+                              contour_interval=0)
+    ax_cs = _section_axes(fig)
+    assert not [c for c in ax_cs.collections if isinstance(c, PolyCollection)]
+    assert not _quartile_lines(ax_cs, nx_sub)
+    assert not [t for t in ax_cs.texts if 'quartile' in t.get_text()]
+    plt.close(fig)
+
+
+@pytest.mark.parametrize('bad', ['bogus', 'median'])
+def test_cross_section_rejects_an_unknown_statistic(_basin_model, bad):
+    """Any other string is a typo, not a y — caught with the other argument
+    checks, before the map exists, so a typo leaks no figure."""
+    before = plt.get_fignums()
+    with pytest.raises(ValueError, match="'mean'"):
+        _basin_model.plot.landscape(field='bedrock', i=-1, cross_section=bad)
+    assert plt.get_fignums() == before, "the rejected render left a figure open"
+    plt.close('all')
+
+
+def test_animate_landscape_accepts_an_averaged_section(_basin_model, monkeypatch,
+                                                       tmp_path):
+    """The string is frame-independent and picklable, so movies inherit the
+    averaged profile through the usual landscape_kwargs pass-through."""
+    m = _basin_model
+    drawn = []
+
+    def save(movie, *args, **kwargs):
+        movie._draw_was_started = True
+        for idx in movie.new_frame_seq():
+            movie._func(idx)
+            drawn.append(idx)
+
+    monkeypatch.setattr('matplotlib.animation.Animation.save', save)
+    out = m.plot.animate_landscape(path=str(tmp_path / 'averaged.mp4'),
+                                   n_workers=1, style='raw',
+                                   cross_section='mean')
+    assert out.endswith('averaged.mp4')
+    assert drawn == list(range(len(m.output_times)))
+    plt.close('all')

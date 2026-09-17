@@ -67,19 +67,25 @@ physics stays on the true surface.
 
 ## Climate and uplift forcing
 
-`zELA` (equilibrium-line altitude) and the uplift rate can be constant scalars
-or time series. `siim.forcing` builds the common time-varying forcings:
+`zELA` (equilibrium-line altitude), the precipitation `P` and the uplift rate
+can be constant scalars or length-`nt` time series on the run clock.
+`siim.forcing` builds the common time-varying forcings:
 
 ```python
-from siim.forcing import ela_sawtooth, uplift_step
+from siim.forcing import ela_sawtooth, uplift_step, interp_forcing
 
 _, zELA = ela_sawtooth(T, nt, ela_high=1500, ela_low=300, period=100e3)
 _, U = uplift_step(T, nt, U_init=1e-3, U_final=2e-3, step_frac=0.5)
+_, P = interp_forcing(T, nt, times=[0, T], values=[1.0, 0.3])   # drying ramp (m/yr)
 ```
 
-Pass the resulting series as the `zELA` / uplift parameters for a model run of
-length `T` over `nt` steps — `ela_sawtooth` drives glacial cycles, `uplift_step`
-a change in uplift rate partway through.
+Pass the resulting series as the `zELA` / `P` / uplift parameters for a model
+run of length `T` over `nt` steps — `ela_sawtooth` drives glacial cycles,
+`uplift_step` a change in uplift rate partway through, and `interp_forcing`
+interpolates any piecewise-linear history (here precipitation falling from
+1.0 to 0.3 m/yr). A `P` series drives both the runoff and the mass balance; a
+constant series reproduces the scalar run exactly, and the analytical reference
+uses its time mean.
 
 ## Base level and the coastline — `bl`
 

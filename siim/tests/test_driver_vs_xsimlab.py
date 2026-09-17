@@ -56,8 +56,11 @@ def _assert_pair(params, cls=siim2d):
     fields = list(_FIELDS)
     if params.get('flexure'):
         fields.append('rebound_out')
-    if params.get('track_sediment'):
+    track = params.get('track_sediment')
+    if track in (True, 'basin', 'both'):
         fields += ['sediment_flux_out', 'eroded_volume_out']
+    if track in ('edge', 'both'):
+        fields += ['sediment_edge_flux_out', 'sediment_edge_cumulative_out']
     for name in fields:
         xa, xb = getattr(a, name), getattr(b, name)
         assert xa.shape == xb.shape, f"{name}: shape {xa.shape} vs {xb.shape}"
@@ -93,6 +96,15 @@ def test_driver_bl_step_sediment(routing):
     bl[_NT // 2:] = -60.0
     _assert_pair(dict(_BASE, mode='B', flow_routing=routing, bl=bl,
                       track_sediment=True))
+
+
+@pytest.mark.adapter
+def test_driver_sediment_edge():
+    """track_sediment='both': the per-domain-edge sums (the shared
+    ``edge_sediment`` reduction over the routed flux) match bitwise alongside
+    the rasters. All four sides fixed so no NaN side enters np.array_equal."""
+    _assert_pair(dict(_BASE, mode='B', track_sediment='both',
+                      boundary_status=['fixed_value'] * 4))
 
 
 @pytest.mark.adapter

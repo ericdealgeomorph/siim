@@ -52,7 +52,7 @@ from .._core.step import (
     ema_thickness, routing_surface, _fabricate_trunk_surface,
     accumulate_glacial_flow, run_modeA_step, _solve_border_H_modeA,
     run_modeB_kernel, carve_bed, route_dinf, route_d8, accumulate_sediment,
-    glacial_flexure_step,
+    edge_sediment, glacial_flexure_step,
 )
 
 
@@ -678,7 +678,7 @@ class TrunkSurfaceToErode(GlacialSurfaceToErode):
 @xs.process
 class SedimentTracker:
     """Optional sediment-throughput tracker (added only when siim's
-    ``track_sediment`` is True — zero cost otherwise).
+    ``track_sediment`` is on — zero cost otherwise).
 
     Routes each step's denuded rock volume — ``max(denudation, 0) * cell_area`` —
     down the flow graph in one accumulation pass, giving per node the total
@@ -688,6 +688,14 @@ class SedimentTracker:
     Difference ``cumulative`` along the time axis to recover per-interval volumes;
     the outlet node's ``cumulative`` is the whole-basin yield.
 
+    ``edge_flux`` / ``edge_cumulative`` report the same routed flux summed over
+    each domain-edge outlet ring instead (dims ``('side',)``, the
+    ``border_status`` order left/right/bottom/top, NaN off ``'fixed_value'``
+    sides) — one shared sum (:func:`siim._core.step.edge_sediment`) with the
+    in-house driver. Both reports ride the one accumulation pass; siim's
+    ``track_sediment`` value picks which are stored, and clears ``basin`` when
+    only the edge totals are wanted so the per-node running integral is skipped.
+
     Reads the erosion process's ``denudation`` (via ``GlacialSPLBase``: the true
     rock removed — delta-zb incl. sub-grid carve in mode B, delta-zs in mode A;
     per-step, already includes dt) so it runs after the erosion step and reuses
@@ -696,26 +704,38 @@ class SedimentTracker:
     denudation   = xs.foreign(GlacialSPLBase, 'denudation',  intent='in')
     cell_area    = xs.foreign(RasterGrid2D, 'cell_area')
     shape        = xs.foreign(RasterGrid2D, 'shape')
+    border_status = xs.foreign(BorderBoundary, 'border_status')
     receivers    = xs.foreign(FlowRouter,   'receivers',    intent='in')
     nb_receivers = xs.foreign(FlowRouter,   'nb_receivers', intent='in')
     weights      = xs.foreign(FlowRouter,   'weights',      intent='in')
     stack        = xs.foreign(FlowRouter,   'stack',        intent='in')
 
+    basin      = xs.variable(intent='in', default=True,
+                             description='Keep the per-node running integral (cumulative); False reports only the per-edge totals')
     flux       = xs.variable(dims=('y', 'x'), intent='out',
                              description='Upstream-eroded volume routed through each node this step (m^3)')
     cumulative = xs.variable(dims=('y', 'x'), intent='out',
                              description='Running time-integral of flux per node (m^3)')
+    edge_flux       = xs.variable(dims=('side',), intent='out',
+                                  description='Volume leaving the domain across each edge this step (m^3); NaN off fixed_value sides')
+    edge_cumulative = xs.variable(dims=('side',), intent='out',
+                                  description='Running time-integral of edge_flux per domain edge (m^3)')
 
     def initialize(self):
         self._cum = np.zeros(self.shape, dtype=np.float64)
+        self._edge_cum = np.zeros(4)
 
     def run_step(self):
         self.flux = accumulate_sediment(
             self.denudation, self.cell_area, self.stack, self.receivers,
             self.nb_receivers, self.weights, self.shape)
-        # New array each step (not in-place) so prior snapshots stay valid.
-        self._cum = self._cum + self.flux
+        if self.basin:
+            # New array each step (not in-place) so prior snapshots stay valid.
+            self._cum = self._cum + self.flux
         self.cumulative = self._cum
+        self.edge_flux = edge_sediment(self.flux, self.border_status)
+        self._edge_cum = self._edge_cum + self.edge_flux
+        self.edge_cumulative = self._edge_cum
 
 
 @xs.process

@@ -16,7 +16,7 @@ from typing import NamedTuple
 import numpy as np
 
 from ._render import (
-    _add_colorbar, output_path, _ice_ramp, _node_extent,
+    output_path, _ice_ramp, _node_extent,
     _footprint_ice_surface, _smooth_ice_mask, _field_ice_mask,
     _clean_ice_mask, _mean_recent_H, _smoothed_glacier_paths,
     _channel_closure, _trunk_ribbons,
@@ -26,7 +26,7 @@ from ._render import (
 # The ELA line in the cross-section / hypsometry panels: a forcing datum, not
 # another contour, so it gets its own colour.
 from ._style import COLORS, time_label
-from ._animation import movie_path, save_animation
+from ._animation import frame_indices, movie_path, save_animation
 
 ELA_COLOR = COLORS['ela']
 
@@ -147,34 +147,40 @@ def _resolve_style(style, field, H_threshold, ice_sigma_cells, ice_time_avg,
             area_threshold, contour_interval, ice_shading, trunk_display)
 
 
-def _run_global_H_max(m):
+def _run_global_H_max(m, frames=None):
     """The RUN-GLOBAL drawn-column depth ``hc_over_H * max H_out`` — the
-    default top of the ice scale.
+    default top of the ice scale (over ``frames`` alone when a movie encodes
+    only some of them).
 
     The veil and the ice colorbar both read it, so a still and every frame of a
     movie put the same colour on the same depth (a per-frame max would repaint
     each frame's thickest trunk the same dark blue). ``_frozen_scale_kwargs``
     freezes ``H_max`` to exactly this value, so the two paths agree."""
-    return float(m.hc_over_H * np.nanmax(np.asarray(m.H_out)))
+    H_out = np.asarray(m.H_out)
+    return float(m.hc_over_H * np.nanmax(H_out if frames is None
+                                         else H_out[frames]))
 
 
-def _frozen_scale_kwargs(m, landscape_kwargs):
+def _frozen_scale_kwargs(m, landscape_kwargs, frames=None):
     """Freeze ``landscape``'s AUTO colour scales across a whole animation.
 
     A still autoscales per frame, which in a movie puts every frame on its own
     scale: the bed colorbar top tracks each frame's highest peak and the
     ``ice_cmap`` norm collapses to ``H_min + 1`` on ice-free frames, so colours
     pulse for reasons that are not in the model (``map`` freezes its clim
-    globally for the same reason). Resolve both ONCE over all output frames —
-    ``max z_out`` bounds every frame's composited surface and
-    ``hc_over_H * max H_out`` every drawn column — unless the caller pinned
-    them. Returns a new kwargs dict; both the serial and the parallel frame
-    paths then render on the one scale."""
+    globally for the same reason). Resolve both ONCE over the frames the movie
+    will ENCODE (``frames``, all of them by default) — ``max z_out`` bounds
+    every frame's composited surface and ``hc_over_H * max H_out`` every drawn
+    column — unless the caller pinned them. Scaling a windowed movie to the
+    whole run would wash it out. Returns a new kwargs dict; both the serial and
+    the parallel frame paths then render on the one scale."""
     kwargs = dict(landscape_kwargs)
     if kwargs.get('z_max') is None:
-        kwargs['z_max'] = float(np.nanmax(np.asarray(m.z_out)))
+        z_out = np.asarray(m.z_out)
+        kwargs['z_max'] = float(np.nanmax(z_out if frames is None
+                                          else z_out[frames]))
     if kwargs.get('H_max') is None:
-        kwargs['H_max'] = _run_global_H_max(m)
+        kwargs['H_max'] = _run_global_H_max(m, frames)
     return kwargs
 
 
@@ -323,7 +329,14 @@ class LandscapeMixin:
         ``show_smoothed_paths`` adds a diagnostic centerline overlay, gated
         by ``channel_threshold`` (upstream area in m²), with
         ``smoothed_path_color``/``smoothed_path_lw`` styling.
-        ``cross_section`` is y in km; it adds a section and bed hypsometry.
+        ``cross_section`` is y in km, or ``'mean'`` to average over the
+        rendered rows of the section grid (an interpolated ``oversample`` grid,
+        so the two end rows carry less ground than the interior ones) — an
+        averaged profile whose ice band is the average ice column per unit x,
+        with the ice surface's 25-75% band across those rows shaded and the
+        bed's quartiles dashed, and with no map locator line and no lake layer
+        (a reduced water table is not a water table). Either way it adds a
+        section and bed hypsometry.
         ``cross_section_color`` styles its map locator. ``hyp_max`` fixes
         the percent-area scale (default 15); None auto-scales it.
 
@@ -410,6 +423,15 @@ class LandscapeMixin:
                 "to 0 — pass an explicit H_threshold with it).")
         if int(ice_time_avg) < 1:
             raise ValueError(f"ice_time_avg must be >= 1, got {ice_time_avg!r}")
+        # Resolve the section selector BEFORE anything is drawn: a typo used to
+        # raise only after the map, its colorbars and the panels existed,
+        # leaking the figure.
+        if isinstance(cross_section, str):
+            if cross_section != 'mean':
+                raise ValueError("cross_section must be a y in km or 'mean', "
+                                 f"got {cross_section!r}")
+        elif cross_section is not None:
+            cross_section = float(cross_section)
 
         z_in = m.z_out[i]
         H_in = m.H_out[i]
@@ -670,26 +692,44 @@ class LandscapeMixin:
             rgb = _shade_rgb_soft(rgb, z_lake_surface, dx_sub, dy_sub,
                                   ve, azdeg, altdeg)
 
+        bar_width, bar_pad, ice_bar_pad = 0.12, 0.18, 0.7
+        hyp_width = 0.8
         if ax is None:
-            fig_height = fig_width * (m.Ly / m.Lx)
+            # Size the map at its geographic aspect, with typographic margins
+            # in inches. Relative padding inflated the gap below square maps
+            # and made the bars/hypsometry dominate long, narrow domains.
+            bar_space = bar_pad + bar_width if colorbar else 0.0
+            if colorbar and show_ice and ice_cmap_obj is not None:
+                bar_space += ice_bar_pad + bar_width
+            right_margin = 0.65 if colorbar else 0.25
             if cross_section is not None:
-                cs_height = fig_width * 0.24
-                hyp_w_in = fig_width * 0.05
-                if fig is None:
-                    fig = plt.figure(figsize=(fig_width + hyp_w_in,
-                                              fig_height + cs_height))
+                right_margin = max(right_margin,
+                                   bar_pad + hyp_width + 0.2 - bar_space)
+            map_width = fig_width - 0.65 - right_margin - bar_space
+            map_height = map_width * (m.Ly / m.Lx)
+            cs_height = np.clip(0.22 * map_width, 1.2, 2.6)
+            fig_height = map_height + 0.8
+            if cross_section is not None:
+                fig_height += cs_height + 0.4
+            if fig is None:
+                fig = plt.figure(figsize=(fig_width, fig_height))
+            margins = dict(left=0.65 / fig_width,
+                           right=1 - right_margin / fig_width,
+                           bottom=0.5 / fig_height, top=1 - 0.3 / fig_height)
+            if cross_section is not None:
                 gs = fig.add_gridspec(
-                    2, 2, height_ratios=[fig_height, cs_height],
-                    width_ratios=[fig_width, hyp_w_in], hspace=0.25, wspace=0.04)
-                ax = fig.add_subplot(gs[0, 0])
+                    2, 2, height_ratios=[map_height, cs_height],
+                    width_ratios=[map_width, 1.0],
+                    hspace=0.8 / (map_height + cs_height), wspace=0,
+                    **margins)
+                ax = fig.add_subplot(gs[0, :])
                 if ax_cs is None:
                     ax_cs = fig.add_subplot(gs[1, 0])
                 if ax_hyp is None:
                     ax_hyp = fig.add_subplot(gs[1, 1], sharey=ax_cs)
             else:
-                if fig is None:
-                    fig = plt.figure(figsize=(fig_width, fig_height))
-                ax = fig.add_subplot(1, 1, 1)
+                gs = fig.add_gridspec(1, 1, **margins)
+                ax = fig.add_subplot(gs[0, 0])
         fig = ax.figure
         # imshow places pixel CENTRES inside `extent`, but the array is
         # NODE-valued: run the raster half a subgrid pixel past each edge so
@@ -738,8 +778,8 @@ class LandscapeMixin:
 
         ax.set_aspect('equal')
         if cross_section is None:
-            ax.set_xlabel('x (km)')
-        ax.set_ylabel('y (km)')
+            ax.set_xlabel('x (km)', fontsize=10)
+        ax.set_ylabel('y (km)', fontsize=10)
         ax.tick_params(labelsize=9)
         ax.set_title(time_label(m.output_times[i]), loc='right', fontsize=10)
 
@@ -748,37 +788,42 @@ class LandscapeMixin:
             # Without ice the composite IS the bare bed — name it as map() does.
             bed_label = ('Surface elevation (m)' if show_ice
                          else 'Bedrock elevation (m)')
+            # One divider keeps both bars flush with the map's top/bottom.
+            # Fixed inch widths stay slender even on a 20-inch panorama.
+            from mpl_toolkits.axes_grid1 import make_axes_locatable
+            divider = make_axes_locatable(ax)
+            cax_bed = divider.append_axes('right', size=bar_width, pad=bar_pad)
+            cb_bed = fig.colorbar(sm_bed, cax=cax_bed)
+            cb_bed.set_label(bed_label, fontsize=10)
+            cax_bed.tick_params(labelsize=9)
             if show_ice and ice_cmap_obj is not None:
-                # Two stacked bars MUST share one divider, else separate
-                # make_axes_locatable calls each place a bar immediately right of
-                # the axes and they overlap. pad leaves room for the elevation
-                # bar's tick labels + title between the two.
-                from mpl_toolkits.axes_grid1 import make_axes_locatable
-                divider = make_axes_locatable(ax)
-                cax_bed = divider.append_axes('right', size='4%', pad=0.05)
-                ax.figure.colorbar(sm_bed, cax=cax_bed, label=bed_label)
                 sm_ice = plt.cm.ScalarMappable(cmap=ice_cmap_obj, norm=ice_norm)
-                # pad is in INCHES and must clear the elevation bar's tick
-                # labels + rotated title — a TYPOGRAPHIC width, not a fraction
-                # of the page. Measured on this layout: 0.7 in clears down to
-                # fig_width=5, while a purely relative 0.05*fig_width collides
-                # everywhere below ~14 in. So 0.7 is the FLOOR and the pad only
-                # grows (relatively) on a figure wider than that.
-                cax_ice = divider.append_axes('right', size='4%',
-                                              pad=max(0.7, 0.05 * fig_width))
+                # Clear the first bar's ticks and label at paper widths too.
+                cax_ice = divider.append_axes('right', size=bar_width,
+                                              pad=ice_bar_pad)
                 # What the map paints is the local COLUMN depth to the flat ice
                 # surface (hc_over_H * H at the thalweg, more on carved flanks)
                 # — not the width-mean H that map(field='ice') shows.
-                ax.figure.colorbar(sm_ice, cax=cax_ice,
-                                   label='Ice column depth (m)')
-            else:
-                _add_colorbar(sm_bed, ax, label=bed_label)
+                cb_ice = fig.colorbar(sm_ice, cax=cax_ice)
+                cb_ice.set_label('Ice column depth (m)', fontsize=10)
+                cax_ice.tick_params(labelsize=9)
 
         if cross_section is not None:
-            y_km = float(cross_section)
-            ax.axhline(y_km, color=cross_section_color, lw=1.0, alpha=0.8, zorder=3)
-            if ax_cs is not None:
+            # 'mean' takes every RENDERED row of the section grid (ny_sub rows,
+            # so oversample-dependent) instead of reading one, so the painted
+            # band is the average ice column per unit x (and vanishes where
+            # nothing is iced) and no single y can be marked. The quartile
+            # bands below carry the spread the mean hides.
+            # Validated to 'mean' or a float above.
+            reduce_y = np.mean if cross_section == 'mean' else None
+            if reduce_y is None:
+                y_km = cross_section
                 j_cs = max(0, min(ny_sub - 1, int(round(y_km * 1e3 / dy_sub))))
+                ax.axhline(y_km, color=cross_section_color, lw=1.0, alpha=0.8,
+                           zorder=3)
+            else:
+                j_cs = slice(None)
+            if ax_cs is not None:
                 # The section reads the PRE-smoothing composite, never z_smooth:
                 # the map's Gaussian (sigma_cells) bridges bed slots narrower
                 # than its kernel, and painting the bridge-to-bed gap as ice
@@ -786,7 +831,8 @@ class LandscapeMixin:
                 # Unsmoothed, the profile collapses onto the bed wherever no
                 # ice is drawn, so the ice band below is exactly the drawn ice
                 # column and nothing else.
-                cs_profile = z_composite[j_cs, :]
+                cs_rows = z_composite[j_cs]
+                cs_profile = cs_rows if reduce_y is None else reduce_y(cs_rows, axis=0)
                 cs_x = np.linspace(0, m.Lx / 1e3, nx_sub)
                 n_z = 200
                 z_grid = np.linspace(z_min, z_max, n_z).reshape(-1, 1)
@@ -800,12 +846,11 @@ class LandscapeMixin:
                     # ON the profile wherever no ice is drawn, so an ice-free
                     # column still paints a zero-thickness band (no phantom
                     # ice from the order-3/order-1 gap).
-                    cs_zb = map_coordinates(
-                        zb_in, [np.full(nx_sub, y_idx[j_cs]), x_idx],
-                        order=1, mode='nearest')
-                    cs_bedrock = np.where(ice_mask[j_cs, :],
-                                          np.minimum(cs_zb, cs_profile),
-                                          cs_profile)
+                    cs_zb = map_coordinates(zb_in, [Y[j_cs], X[j_cs]],
+                                            order=1, mode='nearest')
+                    cs_bed = np.where(ice_mask[j_cs],
+                                      np.minimum(cs_zb, cs_rows), cs_rows)
+                    cs_bedrock = cs_bed if reduce_y is None else reduce_y(cs_bed, axis=0)
                     upper_for_bed = cs_bedrock
                 else:
                     cs_bedrock = None
@@ -841,7 +886,7 @@ class LandscapeMixin:
                                  extent=[0, m.Lx / 1e3, z_min, z_max],
                                  aspect='auto', interpolation='nearest', zorder=2)
 
-                if show_lake and lake_filled is not None:
+                if show_lake and lake_filled is not None and reduce_y is None:
                     cs_lake = lake_filled[j_cs, :]
                     cs_in_lake = lake_mask[j_cs, :]
                     lake_mask_2d_cs = ((z_grid >= cs_profile.reshape(1, -1)) &
@@ -853,6 +898,24 @@ class LandscapeMixin:
                     ax_cs.imshow(lake_img, origin='lower',
                                  extent=[0, m.Lx / 1e3, z_min, z_max],
                                  aspect='auto', interpolation='nearest', zorder=2.5)
+
+                if reduce_y is not None:
+                    # What the mean hides: the SPREAD across the rows it
+                    # averaged. The ice surface gets a translucent 25-75% band;
+                    # the BED gets two dashed quartile lines instead — a second
+                    # filled band under the plateau read as more ice rather
+                    # than as topography. Both ride above the section's ice
+                    # fill, which is OPAQUE: the bed quartiles reach well into
+                    # the ice column (+327 m over the mean bed on the mode-C
+                    # test run), so underneath it they would simply vanish.
+                    if show_ice:
+                        lo, hi = np.percentile(cs_rows, [25, 75], axis=0)
+                        ax_cs.fill_between(cs_x, lo, hi, color=COLORS['ice'],
+                                           alpha=0.22, lw=0, zorder=2.6)
+                    for edge in np.percentile(cs_bed if show_ice else cs_rows,
+                                              [25, 75], axis=0):
+                        ax_cs.plot(cs_x, edge, color='black', linestyle='--',
+                                   lw=0.8, zorder=2.7)
 
                 if contour_obj is not None:
                     for lev in contour_obj.levels:
@@ -879,16 +942,21 @@ class LandscapeMixin:
                     ax_cs.annotate('ELA', xy=(0.995, zela),
                                    xycoords=('axes fraction', 'data'),
                                    ha='right', va='bottom', color=ELA_COLOR,
-                                   fontsize='small', zorder=4,
+                                   fontsize=9, zorder=4,
                                    bbox=dict(fc='white', ec='none', alpha=0.7,
                                              pad=0.5))
                 ax_cs.set_xlim(0, m.Lx / 1e3)
                 ax_cs.set_ylim(z_min, z_max)
-                ax_cs.set_xlabel('x (km)')
-                ax_cs.set_ylabel('Elevation (m)')
+                ax_cs.set_xlabel('x (km)', fontsize=10)
+                ax_cs.set_ylabel('Elevation (m)', fontsize=10)
+                ax_cs.tick_params(labelsize=9)
                 ax_cs.spines['top'].set_visible(False)
                 ax_cs.spines['right'].set_visible(False)
                 fig.canvas.draw()
+                pos_main = ax.get_position()
+                pos_cs = ax_cs.get_position()
+                ax_cs.set_position([pos_main.x0, pos_cs.y0,
+                                    pos_main.width, pos_cs.height])
                 # Vertical exaggeration of the section, from the axes' own
                 # display box vs its data range — the panel is much wider than
                 # tall, so the relief it shows is not to scale.
@@ -897,11 +965,14 @@ class LandscapeMixin:
                          / (bb.width / m.Lx))
                 ax_cs.annotate(f'VE {ve_cs:.0f}$\\times$', xy=(0.005, 0.94),
                                xycoords='axes fraction', ha='left', va='top',
-                               fontsize='small', color='#666666', zorder=4)
-                pos_main = ax.get_position()
-                pos_cs = ax_cs.get_position()
-                ax_cs.set_position([pos_main.x0, pos_cs.y0,
-                                    pos_main.width, pos_cs.height])
+                               fontsize=9, color='#666666', zorder=4)
+                if reduce_y is not None:
+                    # Two lines, not one: the single-line spelling overflows
+                    # the panel at fig_width=5 (109% of its width, measured).
+                    ax_cs.annotate('shaded: surface IQR\ndashed: bed quartiles',
+                                   xy=(0.005, 0.80), xycoords='axes fraction',
+                                   ha='left', va='top', fontsize=9,
+                                   color='#666666', zorder=4)
 
                 if ax_hyp is not None:
                     bedrock_surface = zb_sub
@@ -931,13 +1002,16 @@ class LandscapeMixin:
                         ax_hyp.axhline(zela, color=ELA_COLOR,
                                        linestyle='--', lw=0.9, zorder=4)
                     ax_hyp.set_ylim(z_min, z_max)
-                    ax_hyp.tick_params(axis='y', labelleft=False)
+                    ax_hyp.tick_params(axis='y', which='both',
+                                       left=False, labelleft=False)
+                    ax_hyp.tick_params(axis='x', labelsize=9)
+                    ax_hyp.tick_params(axis='x', which='minor', bottom=False)
                     from matplotlib.ticker import FormatStrFormatter, MaxNLocator
                     ax_hyp.xaxis.set_major_formatter(FormatStrFormatter('%g'))
                     # At narrow fig_width the default tick set put a 0 hard
                     # against the section's last x tick — three ticks, no zero.
                     ax_hyp.xaxis.set_major_locator(MaxNLocator(3, prune='lower'))
-                    ax_hyp.set_xlabel('% area')
+                    ax_hyp.set_xlabel(r'$\%$ area', fontsize=10)
                     if hyp_max is None:
                         ax_hyp.set_xlim(left=0)
                     else:
@@ -945,9 +1019,10 @@ class LandscapeMixin:
                     ax_hyp.spines['top'].set_visible(False)
                     ax_hyp.spines['right'].set_visible(False)
                     pos_cs_now = ax_cs.get_position()
-                    hyp_x0 = pos_cs_now.x1 + 0.015
+                    width_in = fig.get_figwidth()
+                    hyp_x0 = pos_cs_now.x1 + bar_pad / width_in
                     ax_hyp.set_position([hyp_x0, pos_cs_now.y0,
-                                         max(0.97 - hyp_x0, 0.05),
+                                         hyp_width / width_in,
                                          pos_cs_now.height])
 
         if save is not None:
@@ -955,9 +1030,14 @@ class LandscapeMixin:
         return fig, ax
 
     def animate_landscape(self, path='landscape_animate', run_id=None, *,
-                          interval=42, fig_width=8, n_workers=None,
-                          **landscape_kwargs):
+                          interval=42, fps=None, frames=None, fig_width=8,
+                          n_workers=None, **landscape_kwargs):
         """MP4 of ``landscape`` (its kwargs passed through). Returns the path.
+
+        ``interval`` is milliseconds per frame; an explicit ``fps`` overrides it
+        on both render paths. ``frames`` encodes a subset of the saved frames —
+        a slice, a range or a sequence of indices, negatives counting from the
+        end — in the order given.
 
         Frames are independent, so they render IN PARALLEL by default
         (audit N35): the arrays ``landscape`` reads are dumped once and
@@ -974,12 +1054,13 @@ class LandscapeMixin:
         the arrays the workers need). Frame content is identical either way —
         only the wall clock changes.
 
-        The auto colour scales are FROZEN over the run: ``z_max`` and the ice
-        norm's ``H_max`` are resolved once across all output frames instead of
+        The auto colour scales are FROZEN over the movie: ``z_max`` and the ice
+        norm's ``H_max`` are resolved once across the ENCODED frames instead of
         per frame, so a frame's colours mean the same thing throughout the
-        movie; pass explicit values to override. (``H_max`` freezes to the
-        run-global ``hc_over_H * max H_out``, which is already the still
-        render's default for the depth-graded veil.)
+        movie; pass explicit values to override. (Over the whole run, ``H_max``
+        freezes to the run-global ``hc_over_H * max H_out``, which is already
+        the still render's default for the depth-graded veil; a ``frames``
+        window scales to that window, not to relief it never shows.)
 
         Inherits ``landscape``'s ``style='smooth'`` default (the cartographic
         view — supersampled + hillshaded terrain, footprint-width ice drawn as
@@ -1006,28 +1087,36 @@ class LandscapeMixin:
             raise ValueError(
                 "animate_landscape renders every frame; per-frame 'save' "
                 "makes no sense here — use 'path' for the movie file.")
-        landscape_kwargs = _frozen_scale_kwargs(m, landscape_kwargs)
         path = movie_path(path, run_id, 'landscape')[:-4]
         if not np.isfinite(interval) or interval <= 0:
             raise ValueError('interval must be positive and finite')
+        if fps is not None and (not np.isfinite(fps) or fps <= 0):
+            raise ValueError('fps must be positive and finite')
         nframes = len(m.output_times)
+        # Resolve the selection ONCE (negatives included); n_out is what the
+        # worker gates and the encoder actually render. The colour scales
+        # freeze over THOSE frames, so a windowed movie is not washed out by
+        # relief it never shows.
+        frames = frame_indices(nframes, frames)
+        n_out = len(frames)
+        landscape_kwargs = _frozen_scale_kwargs(m, landscape_kwargs, frames)
 
         parallel_ok = (
             not any(landscape_kwargs.get(key) is not None
                     for key in ('fig', 'ax', 'ax_cs', 'ax_hyp'))
             and all(hasattr(m, a) for a in _ANIM_ARRAYS + _ANIM_META)
-            and nframes >= 4)
+            and n_out >= 4)
         if n_workers is None and parallel_ok:
             # Adaptive: time one probe frame; parallel only when the projected
             # serial render dwarfs the ~5 s/worker spawn+load startup.
             import time
             t0 = time.perf_counter()
-            fig_probe, _ = self.landscape(i=0, fig_width=fig_width,
+            fig_probe, _ = self.landscape(i=frames[0], fig_width=fig_width,
                                           **landscape_kwargs)
             plt.close(fig_probe)
             t_frame = time.perf_counter() - t0
-            n_workers = (min(8, os.cpu_count() or 1, nframes)
-                         if t_frame * nframes > 30.0 else 1)
+            n_workers = (min(8, os.cpu_count() or 1, n_out)
+                         if t_frame * n_out > 30.0 else 1)
         elif n_workers is None:
             n_workers = 1
         n_workers = max(1, int(n_workers))
@@ -1055,7 +1144,8 @@ class LandscapeMixin:
 
         if n_workers > 1:
             return self._animate_parallel(path, interval, fig_width,
-                                          n_workers, landscape_kwargs)
+                                          n_workers, landscape_kwargs,
+                                          frames=frames, fps=fps)
 
         supplied_axes = [landscape_kwargs[key] for key in ('ax', 'ax_cs', 'ax_hyp')
                          if landscape_kwargs.get(key) is not None]
@@ -1068,7 +1158,7 @@ class LandscapeMixin:
         positions = {ax: ax.get_position(original=True).frozen() for ax in supplied_axes}
         if supplied_fig is not None:
             landscape_kwargs['fig'] = supplied_fig
-        fig, _ = self.landscape(i=0, fig_width=fig_width, **landscape_kwargs)
+        fig, _ = self.landscape(i=frames[0], fig_width=fig_width, **landscape_kwargs)
         render_kwargs = {**landscape_kwargs, 'fig': fig}
 
         def update(idx):
@@ -1082,15 +1172,17 @@ class LandscapeMixin:
             self.landscape(i=idx, fig_width=fig_width, **render_kwargs)
             return fig.axes
 
-        return save_animation(fig, update, nframes, path + '.mp4', interval=interval,
+        return save_animation(fig, update, nframes, path + '.mp4', fps=fps,
+                              frames=frames, interval=interval,
                               close=supplied_fig is None)
 
     def _animate_parallel(self, path, interval, fig_width, n_workers,
-                          landscape_kwargs, dpi=150):
+                          landscape_kwargs, frames, fps=None, dpi=150):
         """Parallel frame renderer for :meth:`animate_landscape`: dump ONLY
-        the arrays/metadata ``landscape`` reads, render frames to PNG across
-        spawned workers via a lightweight plotter shim, assemble with ffmpeg
-        (the same binary matplotlib's writer uses)."""
+        the arrays/metadata ``landscape`` reads, render the already-resolved
+        ``frames`` to PNG across spawned workers via a lightweight plotter
+        shim, assemble with ffmpeg (the same binary matplotlib's writer
+        uses)."""
         import os
         import pickle
         import shutil
@@ -1102,7 +1194,6 @@ class LandscapeMixin:
         import tqdm
 
         m = self.model
-        nframes = len(m.output_times)
         tmpdir = tempfile.mkdtemp(prefix='siim_animate_')
         try:
             for name in _ANIM_ARRAYS:
@@ -1113,18 +1204,20 @@ class LandscapeMixin:
                 getattr(m, 'boundary_status', ['fixed_value'] * 4))
             with open(os.path.join(tmpdir, 'meta.pkl'), 'wb') as f:
                 pickle.dump(meta, f)
-            jobs = [(idx, os.path.join(tmpdir, f'frame_{idx:05d}.png'), dpi)
-                    for idx in range(nframes)]
+            # ffmpeg reads a CONTIGUOUS %05d sequence, so the selected frames
+            # are numbered by position, not by their saved index.
+            jobs = [(idx, os.path.join(tmpdir, f'frame_{pos:05d}.png'), dpi)
+                    for pos, idx in enumerate(frames)]
             with ProcessPoolExecutor(
                     max_workers=n_workers,
                     mp_context=get_context('spawn'),
                     initializer=_animate_worker_init,
                     initargs=(tmpdir, fig_width, landscape_kwargs)) as pool:
                 futures = [pool.submit(_animate_render_frame, j) for j in jobs]
-                for fut in tqdm.tqdm(as_completed(futures), total=nframes,
+                for fut in tqdm.tqdm(as_completed(futures), total=len(frames),
                                      desc=f'Rendering frames ({n_workers} workers)'):
                     fut.result()          # surface worker exceptions
-            fps = 1000.0 / interval
+            fps = 1000.0 / interval if fps is None else fps
             cmd = [anm.FFMpegWriter.bin_path(), '-y',
                    '-framerate', f'{fps:g}',
                    '-i', os.path.join(tmpdir, 'frame_%05d.png'),

@@ -135,8 +135,12 @@ class MapMixin:
 
     def animate_map(self, field='bedrock', path=None, run_id=None,
                     field_min=None, field_max=None, cmap=None,
-                    fps=20, interval=42, fig_width=6):
-        """MP4 of map(). Explicit fps wins; fps=None uses interval (ms/frame)."""
+                    fps=20, interval=42, fig_width=6, frames=None):
+        """MP4 of map(). Explicit fps wins; fps=None uses interval (ms/frame).
+
+        ``frames`` encodes a subset of the saved frames: a slice, a range or a
+        sequence of indices (negatives count from the end).
+        """
         field = field.lower()
         arr, im = self._setup_map(field, field_min, field_max, cmap, None, fig_width)
 
@@ -145,4 +149,4 @@ class MapMixin:
 
         return save_animation(im.figure, update, len(arr),
                               movie_path(path, run_id, f'map_{field}'),
-                              fps=fps, interval=interval)
+                              fps=fps, interval=interval, frames=frames)

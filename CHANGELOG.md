@@ -3,7 +3,48 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.7 — September 2026 (current)
+## 0.9.8 — September 2026 (current)
+
+### Features
+
+- **Tidier landscape layout.** Slender, map-aligned colorbars and a narrower
+  hypsometry panel keep the terrain prominent; consistent panel spacing and a
+  capped section height suit both square maps and wide domains.
+
+- **Animation frame rate and frame range.** `animate_landscape` takes `fps`
+  (an explicit rate, overriding `interval` on both the serial and the parallel
+  render path) and `frames` — a slice, a range or a sequence of saved-frame
+  indices, negatives counting from the end — so a movie can cover part of a run,
+  or be re-timed, without re-running it. A windowed landscape movie freezes its
+  colour scales over the selected frames alone, and an empty selection raises
+  instead of writing an unplayable file. `animate_map` and `animate_profile`
+  gain the same `frames` selection; they already took `fps`.
+
+- **Averaged landscape profile.** `landscape(cross_section=...)` accepts
+  `'mean'` beside a `y` in km: the section then averages over the rendered rows
+  of the section grid, so its ice band is the average ice column per unit x and
+  vanishes where nothing is iced, and it shows the spread behind that mean: the
+  ice surface's 25-75% band across those rows shaded, the bed's quartiles dashed.
+  An averaged profile draws no map locator line and skips the lake layer;
+  `animate_landscape` inherits it like any other `landscape` keyword. Any other
+  string is rejected.
+
+- **Sediment reported by domain edge.** `track_sediment` widens from a flag to
+  `False | True | 'basin' | 'edge' | 'both'`. `'edge'` adds
+  `sediment_edge_flux_out` and `sediment_edge_cumulative_out`, shaped
+  `(time, side)` over `['left', 'right', 'bottom', 'top']`: the routed sediment
+  summed over each `'fixed_value'` outlet ring, corners counted once, `NaN` on
+  an edge with no outlet — the volume actually leaving the domain there, rather
+  than the single-outlet sample `sediment_history` takes. `True` still means
+  `'basin'` and its rasters are unchanged.
+
+- **Time-varying precipitation, documented.** `P` has accepted a length-`nt`
+  series on the run clock in both models; the configuring guide now
+  shows it beside the ELA and uplift series (`interp_forcing` ramp), and the
+  example notebook carries a precipitation cell that reproduces the scalar run
+  until its endpoints are changed. No package code changed.
+
+## 0.9.7 — September 2026
 
 ### Behavioural changes
 

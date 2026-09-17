@@ -247,6 +247,49 @@ def test_landscape_movie_uses_serial_when_ram_is_unknown(models, monkeypatch, tm
     assert frames == list(range(len(model.output_times)))
 
 
+def test_landscape_movie_selects_frames_and_rate(models, monkeypatch, tmp_path):
+    """``frames`` encodes exactly the requested saved frames (slices and
+    negative indices included) and ``fps`` reaches the encoder."""
+    model = models['2d']
+    nframes = len(model.output_times)
+    recorded = {}
+
+    def save(movie, *args, **kwargs):
+        movie._draw_was_started = True
+        recorded['fps'] = kwargs.get('fps')
+        recorded['frames'] = []
+        for idx in movie.new_frame_seq():
+            movie._func(idx)
+            recorded['frames'].append(idx)
+
+    monkeypatch.setattr('matplotlib.animation.Animation.save', save)
+    style = dict(n_workers=1, style='raw', hillshade=False, contour_interval=0)
+    model.plot.animate_landscape(path=str(tmp_path / 'tail.mp4'),
+                                 frames=slice(1, None), **style)
+    assert recorded['frames'] == list(range(1, nframes))
+    model.plot.animate_landscape(path=str(tmp_path / 'ends.mp4'),
+                                 frames=[0, -1], fps=5, **style)
+    assert recorded['frames'] == [0, nframes - 1]
+    assert recorded['fps'] == 5
+
+
+@pytest.mark.parametrize('empty', [[], slice(0, 0), slice(10, 20)])
+def test_movie_refuses_an_empty_frame_selection(models, monkeypatch, tmp_path, empty):
+    """A selection that resolves to nothing wrote a 262-byte unplayable mp4 and
+    reported success; every animator must raise before the encoder instead."""
+    model = models['2d']
+
+    def save(movie, *args, **kwargs):
+        pytest.fail('an empty selection must not reach the encoder')
+
+    monkeypatch.setattr('matplotlib.animation.Animation.save', save)
+    with pytest.raises(ValueError, match='No simulation output'):
+        model.plot.animate_landscape(path=str(tmp_path / 'empty.mp4'),
+                                     n_workers=1, style='raw', frames=empty)
+    with pytest.raises(ValueError, match='No simulation output'):
+        model.plot.animate_map(path=str(tmp_path / 'empty_map.mp4'), frames=empty)
+
+
 def test_slider_view_sets_canvas_traits_and_updates(monkeypatch):
     pytest.importorskip('ipympl', reason='interactive viewer requires the optional notebook backend')
     from siim.plotting._render import _slider_view

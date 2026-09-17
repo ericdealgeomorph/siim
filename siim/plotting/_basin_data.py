@@ -201,8 +201,9 @@ def sediment_history_data(m, n_basins, ref, quantity):
         raise ValueError("quantity must be 'volume' or 'flux'")
     attr = 'eroded_volume_out' if quantity == 'volume' else 'sediment_flux_out'
     if not hasattr(m, attr):
-        raise RuntimeError("No sediment outputs found — re-run the model "
-                           "with track_sediment=True.")
+        raise RuntimeError("No per-node sediment outputs found — re-run the "
+                           "model with track_sediment=True (or 'both', which "
+                           "keeps the per-edge totals as well).")
 
     data = getattr(m, attr)
     nt = data.shape[0]

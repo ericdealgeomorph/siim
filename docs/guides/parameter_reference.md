@@ -147,7 +147,7 @@ interaction and ELA-retuning guidance.
 | `lithos_density` | `2800` | Lithospheric density (kg/m³), scalar or `(ny, nx)` field. |
 | `asthen_density` | `3200` | Asthenospheric density (kg/m³). |
 | `e_thickness` | `35e3` | Effective elastic thickness (m). |
-| `track_sediment` | `False` | Accumulate per-step eroded volume through the flow graph and expose sediment throughput/cumulative outputs. |
+| `track_sediment` | `False` | Accumulate per-step eroded volume through the flow graph and report it: `True`/`'basin'` as per-node throughput/cumulative rasters, `'edge'` as the volume crossing each domain edge, or `'both'`. |
 
 (initial-topography-formats)=
 ## Initial-topography formats
