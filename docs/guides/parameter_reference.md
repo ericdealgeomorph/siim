@@ -82,6 +82,8 @@ time-varying structure.
 The `nu`/`ell`/`mu` relationships depend on the sliding law. Prefer `nu` for
 ordinary runs. Use direct exponent overrides only when you mean to depart from
 the exact-law/default analytical pairing.
+{doc}`choosing_glacial_parameters` explains what `beta`, `ce`/`ell`,
+`lambda_p` and `lambda_c` set physically and how they trade off.
 
 ## 1D-only parameters
 

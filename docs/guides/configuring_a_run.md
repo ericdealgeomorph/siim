@@ -57,7 +57,8 @@ pre-trunk-surface runs.
 ## Sliding law — `sliding_law`
 
 `'power'` (default), `'eff-exp'`, or `'coulomb'`; all three work under either
-routing and either mode.
+routing and either mode. What the laws' length scales `lambda_p` and `lambda_c` set,
+and how they trade off against `ce`, is in {doc}`choosing_glacial_parameters`.
 
 ## Flow routing (2D) — `flow_routing`
 

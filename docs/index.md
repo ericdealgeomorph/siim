@@ -36,7 +36,8 @@ walkthrough ({doc}`getting_started/first_1d_run`). {doc}`guides/concepts`
 describes the state conventions (modes, the channel-floor datum, sub-grid
 width); the parameters that set the regime are explained in
 {doc}`guides/configuring_a_run`, with every numerical-model key in
-{doc}`guides/parameter_reference`.
+{doc}`guides/parameter_reference`, and the glacial ones interpreted in
+{doc}`guides/choosing_glacial_parameters`.
 
 ```{toctree}
 :maxdepth: 2
@@ -54,6 +55,7 @@ getting_started/first_2d_run
 guides/concepts
 guides/configuring_a_run
 guides/parameter_reference
+guides/choosing_glacial_parameters
 guides/outputs_and_io
 guides/fastscape_processes
 ```

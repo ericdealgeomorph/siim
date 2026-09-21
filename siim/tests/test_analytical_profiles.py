@@ -665,3 +665,24 @@ def test_sweep_regime_grid():
     np.testing.assert_allclose(out['Lt'][1, 2], p.Lt, equal_nan=True)
     # warming (higher zELA) never increases the regime code at fixed cs
     assert np.all(np.diff(out['regime'].astype(int), axis=0) <= 0)
+
+
+@pytest.mark.pin
+@pytest.mark.parametrize("law", ["power", "coulomb"])
+def test_ce_ell_collapse_at_fixed_sliding_speed(law):
+    """The steady state depends on (ce, ell, U) only through the sliding speed
+    u_b* = (U/ce)^(1/ell) [m/yr]: every pair on ce = U / u_b*^ell gives the
+    identical profile (phi = mu/nu is ell-free for both laws). Measured
+    2026-09-17 to 1e-14; a derive_power/derive_coulomb refactor that breaks
+    it would silently falsify the parameter guide and the model paper."""
+    from siim.analytical import SteadyStateProfile
+    U = constants.U
+    ref = SteadyStateProfile({"sliding_law": law})
+    ub_star = (U / constants.CE) ** (1.0 / ref.ell)
+    for ell in (0.8, 1.0, 1.5, 2.0, 3.0):
+        alt = SteadyStateProfile({"sliding_law": law, "ell": ell,
+                                  "ce": U / ub_star ** ell})
+        assert alt.glacier_flag == ref.glacier_flag == 2
+        assert alt.zo == pytest.approx(ref.zo, rel=1e-10)
+        assert alt.Lt == pytest.approx(ref.Lt, rel=1e-10)
+        np.testing.assert_allclose(alt.surface, ref.surface, rtol=1e-10)

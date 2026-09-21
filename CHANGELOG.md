@@ -3,7 +3,29 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.8 — September 2026 (current)
+## 0.9.9 — September 2026 (current)
+
+### Documentation
+
+- **Choosing glacial parameters.** A new guide, `guides/choosing_glacial_parameters`,
+  says what `beta`, `ce` and `nu`, `lambda_p` and `lambda_c` set physically and
+  how they trade off: β against a temperature lapse rate through a degree-day
+  identity, with modern and LGM Alpine worked examples and the plausible
+  10⁻³–10⁻² range across climates; the collapse of (`ce`, ℓ, U) onto the
+  balancing sliding speed u_b\* and where the default sits against the
+  Herman et al. (2021) erosion-rule compilation; and the measured relief and
+  sliding-fraction scalings with `lambda_p` and `lambda_c`. Linked from the
+  parameter reference, the configuring guide and the index; two bibliography
+  entries added.
+
+### Tests
+
+- A `pin` test that the analytical steady state depends on (`ce`, `ell`, U)
+  only through u_b\* = (U/ce)^(1/ell).
+
+No behavioural change.
+
+## 0.9.8 — September 2026
 
 ### Features
 
