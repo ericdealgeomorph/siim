@@ -54,26 +54,37 @@ Both helpers take the same options:
 |--------|--------|---------|
 | `mode` | `'B'` (default), `'A'`, `'C'` | bedrock + ice thickness (bed memory) vs ice surface vs `'C'` = B + carve |
 | `carve` | `None` → off (default), `True`, `False` | sub-grid glacier-width carving (mode B); `mode='C'` is the alias that turns it on (`mode='C', carve=False` raises) |
-| `trunk_surface` | `False` (default), `True` | fabricated trunk-surface routing — converge trunk flow onto the centerline (mode B/C) |
+| `trunk_surface` | `None` → mode-dependent (default), `True`, `False` | fabricated trunk-surface routing — converge trunk flow onto the centerline (mode B/C); `None` is on for mode C, off for plain B |
 | `routing` | `'single'` (default), `'dinf'` | D8 single-flow vs Tarboton D-infinity |
 | `flexure` | `False` (default), `True` | add glacial-isostatic flexure |
 | `sediment` | `False` (default), `True` | add sediment tracking |
 
-This facade stays **explicit**: every flag defaults off, with no mode-resolved
-defaults. In particular `glacial_model(mode='C')` selects B + carve but leaves
-`trunk_surface` off — the *mode-C standard* (trunk-surface routing on,
-routing relaxation, `widening_rate=3`) is applied only by the
-{class}`siim.siim2d.siim` wrapper. To reproduce it here, pass
-`carve=True, trunk_surface=True` and set `routing_relax` / `widening_rate` on
-the model inputs.
+Every flag defaults off except `trunk_surface`, which follows the *mode-C
+standard* exactly as the {class}`siim.siim2d.siim` wrapper does: on for mode C
+(`mode='C'`, or `mode='B'` with `carve=True`), off otherwise.
+`glacial_model(mode='C')` with no extra inputs therefore **is** native mode C:
+trunk-surface routing on (`TrunkSurfaceToErode` in the `surf2erode` slot, whose
+`routing_relax` input defaults to 0.5) and `widening_rate=3`. An explicit value
+always wins; `trunk_surface=False` gives the plain carved composition
+(`GlacialSurfaceToErode`, `routing_relax=0`). Here `routing_relax` follows the
+provider class, where `siim2d` follows the mode, so two explicit combinations
+differ from `siim2d` unless `surf2erode__routing_relax` is set: `mode='B'` with
+`trunk_surface=True` (0.5 here, 0 in `siim2d`) and `mode='C'` with
+`trunk_surface=False` (0 here, 0.5 in `siim2d`).
 
 ## The processes
 
-The classes the helpers wire in are exported from `siim.fastscape` (e.g.
+Every class the helpers wire in is exported from `siim.fastscape`:
 `GlacialLaw`, `GlacialFlowAccumulator`, `GlacialSPLModeA`, `GlacialSPLModeB`,
 `GlacialSPLModeC`, `GlacialSurfaceToErode`, `TrunkSurfaceToErode`,
-`GlacialFlexure`, `SedimentTracker`, `DinfFlowRouter`), together with two
-reusable forcing processes (`WaveUplift`, `PlateauSurface`). They can be
-imported and subclassed directly to customise behaviour.
+`GlacialFlexure`, `SedimentTracker`, `D8FlowRouter`, `DinfFlowRouter`,
+`GlacialBlockUplift`, `HillslopeDiffusion` and `InitialTopography`, together
+with two reusable forcing processes (`WaveUplift`, `PlateauSurface`). A model
+can therefore be written out as an explicit `xs.Model({...})` from these and
+fastscape's stock processes alone. Across the modes only two slots change:
+`glacial_spl` (`GlacialSPLModeA` / `GlacialSPLModeB` / `GlacialSPLModeC`) and
+`surf2erode` (fastscape's `SurfaceAfterTectonics` / `GlacialSurfaceToErode` /
+`TrunkSurfaceToErode` for the mode-C standard). The classes can also be
+subclassed to customise behaviour.
 
 See {doc}`../api/fastscape` for the full reference.

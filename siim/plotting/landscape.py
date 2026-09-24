@@ -333,8 +333,9 @@ class LandscapeMixin:
         rendered rows of the section grid (an interpolated ``oversample`` grid,
         so the two end rows carry less ground than the interior ones) — an
         averaged profile whose ice band is the average ice column per unit x,
-        with the ice surface's 25-75% band across those rows shaded and the
-        bed's quartiles dashed, and with no map locator line and no lake layer
+        with the ice thickness's 25-75% band across those rows shaded on
+        the mean bed and the bed's quartiles dashed, both named in a legend,
+        and with no map locator line and no lake layer
         (a reduced water table is not a water table). Either way it adds a
         section and bed hypsometry.
         ``cross_section_color`` styles its map locator. ``hyp_max`` fixes
@@ -901,21 +902,36 @@ class LandscapeMixin:
 
                 if reduce_y is not None:
                     # What the mean hides: the SPREAD across the rows it
-                    # averaged. The ice surface gets a translucent 25-75% band;
-                    # the BED gets two dashed quartile lines instead — a second
+                    # averaged. The ice THICKNESS gets a translucent 25-75%
+                    # band hung on the mean bed (a surface band mostly repeats
+                    # the bed's spread — measured, decision
+                    # 2026-09-22-section-band-ice-thickness-iqr); the BED gets
+                    # two dashed quartile lines instead — a second
                     # filled band under the plateau read as more ice rather
                     # than as topography. Both ride above the section's ice
                     # fill, which is OPAQUE: the bed quartiles reach well into
                     # the ice column (+327 m over the mean bed on the mode-C
                     # test run), so underneath it they would simply vanish.
+                    handles = []
                     if show_ice:
-                        lo, hi = np.percentile(cs_rows, [25, 75], axis=0)
-                        ax_cs.fill_between(cs_x, lo, hi, color=COLORS['ice'],
-                                           alpha=0.22, lw=0, zorder=2.6)
+                        lo, hi = cs_bedrock + np.percentile(cs_rows - cs_bed,
+                                                            [25, 75], axis=0)
+                        handles.append(ax_cs.fill_between(
+                            cs_x, lo, hi, color=COLORS['ice'], alpha=0.22, lw=0,
+                            zorder=2.6, label='ice thickness IQR'))
                     for edge in np.percentile(cs_bed if show_ice else cs_rows,
                                               [25, 75], axis=0):
-                        ax_cs.plot(cs_x, edge, color='black', linestyle='--',
-                                   lw=0.8, zorder=2.7)
+                        line, = ax_cs.plot(cs_x, edge, color='black',
+                                           linestyle='--', lw=0.8, zorder=2.7,
+                                           label='topography IQR')
+                    handles.append(line)
+                    # Legend from this render's own artists (a re-used supplied
+                    # ax_cs would otherwise list every earlier render too),
+                    # under the VE label; 77% of the panel width at
+                    # fig_width=5 (measured).
+                    ax_cs.legend(handles=handles, loc='upper left',
+                                 bbox_to_anchor=(0.005, 0.80), borderaxespad=0,
+                                 frameon=False, fontsize=8)
 
                 if contour_obj is not None:
                     for lev in contour_obj.levels:
@@ -966,14 +982,6 @@ class LandscapeMixin:
                 ax_cs.annotate(f'VE {ve_cs:.0f}$\\times$', xy=(0.005, 0.94),
                                xycoords='axes fraction', ha='left', va='top',
                                fontsize=9, color='#666666', zorder=4)
-                if reduce_y is not None:
-                    # Two lines, not one: the single-line spelling overflows
-                    # the panel at fig_width=5 (109% of its width, measured).
-                    ax_cs.annotate('shaded: surface IQR\ndashed: bed quartiles',
-                                   xy=(0.005, 0.80), xycoords='axes fraction',
-                                   ha='left', va='top', fontsize=9,
-                                   color='#666666', zorder=4)
-
                 if ax_hyp is not None:
                     bedrock_surface = zb_sub
                     if contour_obj is not None and len(contour_obj.levels) >= 2:

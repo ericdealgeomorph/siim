@@ -15,12 +15,14 @@ from fastscape.models import basic_model
 
 import siim.fastscape as F
 
-# The process classes promoted as the intended-stable public surface (modes A
-# and B + auxiliaries). Subset check: adding names is fine, dropping one breaks.
+# The process classes promoted as the intended-stable public surface (modes A,
+# B and C + auxiliaries + every class glacial_processes wires in). Subset check:
+# adding names is fine, dropping one breaks.
 ADVERTISED = {
     "GlacialLaw", "GlacialFlowAccumulator", "GlacialSPLModeA", "GlacialSPLModeB",
     "GlacialSPLModeC", "GlacialSurfaceToErode", "TrunkSurfaceToErode",
     "SedimentTracker", "GlacialFlexure", "DinfFlowRouter",
+    "D8FlowRouter", "GlacialBlockUplift", "HillslopeDiffusion", "InitialTopography",
 }
 
 
@@ -80,3 +82,37 @@ def test_siim2d_uses_the_helper():
     m = siim({'mode': 'B', 'carve_width': False, 'flow_routing': 'single'})
     assert m._process_overrides() == F.glacial_processes(
         mode='B', carve=False, routing='single')
+
+
+@pytest.mark.parametrize("mode,relax_name", [
+    ('C', 'MODE_C_ROUTING_RELAX'),   # TrunkSurfaceToErode redeclares the default
+    ('B', 'ROUTING_RELAX'),          # GlacialSurfaceToErode keeps the plain one
+])
+def test_surf2erode_routing_relax_default_seen_by_xsimlab(mode, relax_name):
+    """The routing_relax default an un-set input resolves to, read through
+    xsimlab itself (create_setup's default fill), not the class attribute —
+    the subclass redeclaration must reach the model."""
+    import xsimlab as xs
+    from siim import constants
+    ds = xs.create_setup(model=F.glacial_model(mode=mode), clocks={'t': [0, 1]})
+    assert ds['surf2erode__routing_relax'].item() == getattr(constants, relax_name)
+
+
+
+@pytest.mark.parametrize("kw,surf2erode", [
+    (dict(mode='C'), 'TrunkSurfaceToErode'),                     # the mode-C standard
+    (dict(mode='C', trunk_surface=False), 'GlacialSurfaceToErode'),  # explicit opt-out
+    (dict(mode='B'), 'GlacialSurfaceToErode'),                   # plain B: standard off
+    (dict(mode='B', carve=True), 'TrunkSurfaceToErode'),         # B + carve IS mode C
+    (dict(mode='B', trunk_surface=True), 'TrunkSurfaceToErode'),  # explicit opt-in
+])
+def test_glacial_processes_resolves_mode_C_standard(kw, surf2erode):
+    """The facade resolves trunk_surface=None by siim2d's rule (on for mode B +
+    carve, off otherwise); an explicit value wins."""
+    assert F.glacial_processes(**kw)['surf2erode'] is getattr(F, surf2erode)
+
+
+def test_glacial_processes_mode_A_ignores_trunk_surface():
+    """Mode A keeps fastscape's stock surf2erode whatever trunk_surface says."""
+    assert 'surf2erode' not in F.glacial_processes(mode='A')
+    assert F.glacial_processes(mode='A', trunk_surface=True) == F.glacial_processes(mode='A')

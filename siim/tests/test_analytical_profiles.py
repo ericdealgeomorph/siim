@@ -626,6 +626,31 @@ def test_steady_state_scalar_evaluators():
                                rtol=1e-13)
 
 
+@pytest.mark.parametrize('bcs', [
+    {}, {'left_bc': 'reflecting', 'right_bc': 'base_level'}])
+def test_steady_state_plot_axis_is_distance_from_divide(bcs):
+    """``plot`` draws the divide (z = zo) at x = 0, base level at x = L and
+    the ice column over [0, Lt] whichever end holds base level (old: a fixed
+    ``L - x`` flip, right only with base level on the right)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from siim.analytical import SteadyStateProfile
+    a = SteadyStateProfile(bcs)
+    assert a.glacier_flag == 2
+    ax = a.plot(show_bedrock=False, label='topo')  # ice fill = sole collection
+    topo = next(ln for ln in ax.lines if ln.get_label() == 'topo')
+    x_km, z = topo.get_xdata(), topo.get_ydata()
+    np.testing.assert_allclose(z[np.argmin(x_km)], a.zo)
+    assert z[np.argmax(x_km)] == 0.0
+    ice_km = ax.collections[0].get_paths()[0].vertices[:, 0]
+    assert ice_km.min() == 0.0
+    assert a.Lt - a.dx <= ice_km.max() * 1e3 <= a.Lt
+    bed_km = next(ln for ln in ax.lines if ln is not topo).get_xdata()
+    assert ice_km.min() <= bed_km.min() and bed_km.max() <= ice_km.max()
+    plt.close(ax.figure)
+
+
 def test_steady_state_shared_vocabulary():
     """SteadyStateProfile exposes Solution-typed steady states, and the public
     import paths resolve to the one object."""

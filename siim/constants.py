@@ -193,11 +193,25 @@ DEFAULT_MODE_2D = 'C'
 # defaults trunk-surface routing ON and the routing surface EMA-relaxed, so a
 # standard carved run converges trunk flow onto the centerline (honest
 # cross-section flux) and damps the discrete-D8 planview ice flicker. Plain
-# mode B (no carve) and mode A keep both OFF. siim2d resolves the sentinels
-# after mode normalization; an explicit user value always wins. (The fastscape
-# facade stays explicit — no mode magic for standalone users.)
+# mode B (no carve) and mode A keep both OFF. siim2d and the fastscape facade
+# (glacial_processes) both resolve their sentinels with mode_c_standard() after
+# mode normalization; an explicit user value always wins.
 MODE_C_TRUNK_SURFACE = True
 MODE_C_ROUTING_RELAX = 0.5
+
+
+def mode_c_standard(is_mode_c):
+    """The mode-C standard defaults ``(trunk_surface, routing_relax)``.
+
+    ``(MODE_C_TRUNK_SURFACE, MODE_C_ROUTING_RELAX)`` for mode C (mode B with
+    sub-grid carving), ``(False, ROUTING_RELAX)`` otherwise. Callers apply each
+    value only to a sentinel left at ``None``; an explicit user value wins.
+    """
+    if is_mode_c:
+        return MODE_C_TRUNK_SURFACE, MODE_C_ROUTING_RELAX
+    return False, ROUTING_RELAX
+
+
 _MODE_TO_CODE = {
     MODE_ICE_SURFACE: 'A',
     MODE_BEDROCK_ICE: 'B',

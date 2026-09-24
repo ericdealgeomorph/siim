@@ -303,9 +303,9 @@ class analytical_steady_state_solution:
         reference overlays in the identical visual language as the standalone
         profiles. ``bed`` is the channel-floor datum (``z - HC_OVER_H*H``).
 
-        Plotted against distance from the divide (``x`` runs L -> 0). Returns
-        the axis (a new 8x3-inch figure when ``ax`` is None); a no-op axis
-        when there is no steady-state glacier to draw.
+        Plotted against distance from the divide, whichever end holds base
+        level. Returns the axis (a new 8x3-inch figure when ``ax`` is None); a
+        no-op axis when there is no steady-state glacier to draw.
         """
         import matplotlib.pyplot as plt  # lazy: keep the module headless
         from .profiles import draw_profile
@@ -316,14 +316,18 @@ class analytical_steady_state_solution:
         if ax is None:
             _, ax = plt.subplots(figsize=(8, 3))
 
-        # x runs L -> 0 (from the outlet); plot distance from the divide.
-        x_from_divide = self.L - self.x
-        order = np.argsort(x_from_divide)
-        xd = x_from_divide[order]
+        # x is stored L -> 0 (index 0 = left end). With base level on the
+        # right it is distance from base level, so flip it; otherwise it is
+        # already distance from the divide and only needs reversing for
+        # draw_profile (two-sided: the mirrored fields are symmetric).
+        if self.right_bc == 'base_level':
+            xd, zs, zb = self.L - self.x, surface, bed
+        else:
+            xd, zs, zb = self.x[::-1], surface[::-1], bed[::-1]
         has_glacier = self.glacier_flag in (2, 3, 4, 5)
         ice_end = (self.Lt if (has_glacier and np.isfinite(self.Lt)
                                and self.Lt <= self.L) else self.L)
-        draw_profile(ax, xd, surface[order], bed[order],
+        draw_profile(ax, xd, zs, zb,
                      ice_x_range=(self.xo, ice_end) if has_glacier else None,
                      topo_color=topo_color, ice_color=ice_color,
                      ice_alpha=ice_alpha, bedrock_color=bedrock_color,

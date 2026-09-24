@@ -34,7 +34,7 @@ repos:
         always_run: true
       - id: gate
         name: gate structural check
-        entry: bash -c 'if [ -f "$HOME/.agents/gate/gate.py" ]; then exec /usr/bin/python3 "$HOME/.agents/gate/gate.py" precommit; fi'
+        entry: bash -c 'if [ -f gate.json ] || git cat-file -e HEAD:gate.json 2>/dev/null; then f="$HOME/.agents/gate/gate.py"; if [ ! -f "$f" ]; then echo "Required shared gate is missing; restore ~/.agents/gate/gate.py" >&2; exit 1; fi; exec /usr/bin/python3 "$HOME/.agents/gate/gate.py" precommit; fi'
         language: system
         pass_filenames: false
         always_run: true
@@ -42,7 +42,7 @@ repos:
         stages: [pre-commit, pre-merge-commit]
       - id: gate-message
         name: gate commit message check
-        entry: bash -c 'if [ -f "$HOME/.agents/gate/gate.py" ]; then exec /usr/bin/python3 "$HOME/.agents/gate/gate.py" commit-msg "$@"; fi' --
+        entry: bash -c 'if [ -f gate.json ] || git cat-file -e HEAD:gate.json 2>/dev/null; then f="$HOME/.agents/gate/gate.py"; if [ ! -f "$f" ]; then echo "Required shared gate is missing; restore ~/.agents/gate/gate.py" >&2; exit 1; fi; exec /usr/bin/python3 "$HOME/.agents/gate/gate.py" commit-msg "$@"; fi' --
         language: system
         pass_filenames: true
         always_run: true

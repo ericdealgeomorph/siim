@@ -55,15 +55,16 @@ from .processes import (
     GlacialSPLModeC,        # mode B + sub-grid carve, citizen semantics
     GlacialSurfaceToErode,
     HillslopeDiffusion,     # in-house ADI hillslope diffuser (numerics_backend='inhouse')
-    InitialTopography,      # siim-specific forcing — internal, not exported
+    InitialTopography,      # initial surface + tie-breaking noise (fixed edges kept clean)
     SedimentTracker,
-    TrunkSurfaceToErode,    # fabricated trunk-surface routing (opt-in)
+    TrunkSurfaceToErode,    # fabricated trunk-surface routing (the mode-C standard)
 )
 from .forcing import PlateauSurface, WaveUplift
 
 # The intended-stable public process surface: modes A, B and C + the auxiliary
-# processes + the two generic forcing processes. GlacialSPLBase (a base class)
-# and InitialTopography (siim-specific forcing — bring your own) stay internal.
+# processes + the two generic forcing processes + every process the helpers wire
+# in, so a model can be composed by hand from this surface alone. GlacialSPLBase
+# (a base class) stays internal.
 __all__ = [
     "GlacialLaw",
     "GlacialFlowAccumulator",
@@ -75,6 +76,11 @@ __all__ = [
     "SedimentTracker",
     "GlacialFlexure",
     "DinfFlowRouter",
+    # the rest of what glacial_processes wires in
+    "D8FlowRouter",
+    "GlacialBlockUplift",
+    "HillslopeDiffusion",
+    "InitialTopography",
     # generic fastscape forcing processes (reusable in any fastscape model)
     "WaveUplift",
     "PlateauSurface",
@@ -85,7 +91,7 @@ __all__ = [
 
 def glacial_processes(*, mode='B', carve=None, routing='single',
                       router_backend=None,
-                      flexure=False, sediment=False, trunk_surface=False,
+                      flexure=False, sediment=False, trunk_surface=None,
                       numerics_backend=_constants.NUMERICS_BACKEND):
     """Build the slot→process-class override dict for fastscape's ``basic_model``.
 
@@ -99,11 +105,11 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
     this function; the default in-house driver consumes the same shared law
     records and numerical kernels without xsimlab.
 
-    This facade stays EXPLICIT: every flag defaults off, with no mode-resolved
-    magic (standalone fastscape users opt in by hand). The mode-C standard —
-    ``trunk_surface=True`` and ``routing_relax`` = ``constants.MODE_C_ROUTING_RELAX``
-    for a carved mode-B run, ``widening_rate`` = ``constants.DEFAULT_WIDENING_RATE``
-    — is applied only by the :class:`siim.siim2d.siim` wrapper.
+    Every flag defaults off, except that mode C (``mode='C'``, or ``mode='B'``
+    with ``carve=True``) resolves ``trunk_surface`` to the mode-C standard
+    exactly as :class:`siim.siim2d.siim` does
+    (:func:`siim.constants.mode_c_standard`), so ``glacial_model(mode='C')``
+    with no extra inputs is native mode C.
 
     Parameters
     ----------
@@ -121,12 +127,19 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
         :class:`siim.siim2d.siim` defaults to Mode C, which enables carving;
         explicit Mode B leaves it off unless requested. ``mode='C'`` is the
         alias for turning it on.
-    trunk_surface : bool, optional
+    trunk_surface : bool or None, optional
         Fabricated trunk-surface routing (mode B/C) — swaps in
         :class:`TrunkSurfaceToErode` so routing + accumulation converge trunk
         flow onto the centerline (the centerline's raw flux is then the full
-        cross-section). Off by default here; :class:`siim.siim2d.siim` turns it
-        on as part of the mode-C standard. Ignored for ``mode='A'``.
+        cross-section). ``None`` (default) resolves to the mode-C standard: on
+        for mode C, off for plain mode B. An explicit ``True`` / ``False``
+        wins. ``routing_relax`` follows the provider class here (0.5 on
+        :class:`TrunkSurfaceToErode`, 0 on :class:`GlacialSurfaceToErode`)
+        where :class:`siim.siim2d.siim` follows the mode, so two explicit
+        combinations differ unless ``surf2erode__routing_relax`` is set: mode
+        B with ``trunk_surface=True`` (0.5 here, 0 in siim2d) and mode C with
+        ``trunk_surface=False`` (0 here, 0.5 in siim2d). Ignored for
+        ``mode='A'``.
     routing : {'single', 'dinf'}, optional
         D8 single-flow (``'single'``, default) or D-infinity (``'dinf'``).
     router_backend : {'inhouse_d8'}, optional
@@ -159,6 +172,9 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
             raise ValueError("mode='C' is the mode-B + sub-grid-carve alias; "
                              "carve=False contradicts it (use mode='B').")
         mode, carve = 'B', True
+    if trunk_surface is None:
+        # The mode-C standard, resolved by siim2d's rule (explicit value wins).
+        trunk_surface, _ = _constants.mode_c_standard(mode == 'B' and bool(carve))
     if routing not in ('single', 'dinf'):
         raise ValueError(f"routing must be 'single' or 'dinf', got {routing!r}")
     if numerics_backend != 'inhouse':
@@ -205,7 +221,7 @@ def glacial_processes(*, mode='B', carve=None, routing='single',
 
 
 def glacial_model(*, mode='B', carve=None, routing='single', router_backend=None,
-                  flexure=False, sediment=False, trunk_surface=False,
+                  flexure=False, sediment=False, trunk_surface=None,
                   numerics_backend=_constants.NUMERICS_BACKEND):
     """Return a ready-to-run xsimlab ``Model``: fastscape's ``basic_model`` with
     its ``'spl'``/``'drainage'`` slots replaced by siim's glacial processes.

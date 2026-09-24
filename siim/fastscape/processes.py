@@ -575,7 +575,13 @@ class GlacialSurfaceToErode(SurfaceAfterTectonics):
 
 @xs.process
 class TrunkSurfaceToErode(GlacialSurfaceToErode):
-    """Fabricated trunk-surface routing (mode B/C, opt-in ``trunk_surface``).
+    """Fabricated trunk-surface routing (mode B/C, ``trunk_surface``; on by
+    default for mode C, as part of the mode-C standard).
+
+    ``routing_relax`` defaults to ``constants.MODE_C_ROUTING_RELAX`` here
+    (the parent's is ``constants.ROUTING_RELAX``), so this class in the
+    ``surf2erode`` slot is the whole mode-C routing standard with no extra
+    inputs.
 
     A trunk glacier of mean thickness H occupies width ``W = alpha_g*H`` —
     routinely several cells — but the flow graph carries its ice down 2-3
@@ -622,6 +628,18 @@ class TrunkSurfaceToErode(GlacialSurfaceToErode):
     _dx_cell      = xs.foreign(RasterGrid2D, 'dx')
     _dy_cell      = xs.foreign(RasterGrid2D, 'dy')
     border_status = xs.foreign(BorderBoundary, 'border_status')
+    # Redeclared from the parent only to change the default: this provider is
+    # the mode-C standard's routing surface, so it carries the mode-C relax.
+    routing_relax = xs.variable(
+        default=_constants.MODE_C_ROUTING_RELAX,
+        description="EMA relaxation r in [0, 1) of the lagged thickness feeding "
+                    "the routing + mass-balance surface (anti-flicker): "
+                    "H_eff = r*H_eff_prev + (1-r)*H_lag, seeded at H_lag. 0 = off "
+                    "(raw lagged H, bit-for-bit). Routing/accumulation only — the "
+                    "kernel/carve/outputs stay on raw state. Default "
+                    "constants.MODE_C_ROUTING_RELAX (the mode-C standard; the "
+                    "plain GlacialSurfaceToErode defaults to "
+                    "constants.ROUTING_RELAX).")
     trunk_dip_k = xs.variable(
         default=_constants.TRUNK_DIP_K,
         description="Cross-valley dip slope factor k_dip: S_c = k_dip * S_v(s), "

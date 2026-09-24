@@ -3,7 +3,47 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.9.9 — September 2026 (current)
+## 0.9.10 — September 2026 (current)
+
+### Behavioural changes
+
+- **`glacial_model(mode='C')` is now native mode C.** The fastscape facade
+  (`glacial_processes` / `glacial_model`) resolves the mode-C standard the way
+  `siim2d` does: `trunk_surface` defaults to `None`, which turns trunk-surface
+  routing on for mode C (`mode='C'`, or `mode='B'` with `carve=True`) and leaves
+  it off otherwise, and `TrunkSurfaceToErode`'s `routing_relax` input now
+  defaults to 0.5 (`constants.MODE_C_ROUTING_RELAX`). With no extra inputs,
+  facade mode C matches `siim2d` mode C bit for bit. Before, it gave carving
+  without trunk-surface routing and with `routing_relax=0`;
+  `trunk_surface=False` restores that composition. Without a `routing_relax`
+  input, two explicit combinations differ from `siim2d`: facade mode B with
+  `trunk_surface=True` gets 0.5 (`siim2d`: 0), and facade mode C with
+  `trunk_surface=False` gets 0 (`siim2d`: 0.5). `siim2d` runs, on either driver,
+  are unchanged.
+
+### Features
+
+- Averaged landscape cross-sections now shade the ice thickness's interquartile
+  range, hung on the mean bed, instead of the ice surface's (whose spread mostly
+  repeated the bed's), and name it and the dashed bed quartiles in a legend, in
+  still plots and animations.
+- `siim.fastscape` now exports `D8FlowRouter`, `GlacialBlockUplift`,
+  `HillslopeDiffusion` and `InitialTopography`, the rest of the processes
+  `glacial_processes` wires in, so a fastscape model can be written out by hand
+  from the public surface alone. They were already importable; this makes them
+  part of the advertised API.
+
+### Fixes
+
+- **`SteadyStateProfile.plot` x-axis sense.** With base level on the left
+  (the default) the canonical single-axis renderer plotted the profile against
+  distance from *base level* under a "Distance from divide" label — the divide
+  sat at `L`, base level at 0, and the sub-ice bed line was drawn away from the
+  ice fill. The divide now sits at 0 and base level at `L` whichever end holds
+  base level (the 2D model's reference has it on the right, which was already
+  drawn correctly), matching `GeneralProfile.plot` and the model plotters.
+
+## 0.9.9 — September 2026
 
 ### Documentation
 

@@ -568,11 +568,21 @@ def test_averaged_cross_section_reduces_every_row(_basin_model):
     plt.close(fig)
 
 
+SECTION_LEGEND = ['ice thickness IQR', 'topography IQR']
+
+
+def _section_legend(ax_cs):
+    """The averaged section's legend labels ([] when there is no legend)."""
+    legend = ax_cs.get_legend()
+    return [t.get_text() for t in legend.get_texts()] if legend else []
+
+
 # gate: bed IQR is now two dashed lines, decision 2026-09-17
 def test_mean_cross_section_shades_the_interquartile_range(_iced_model):
     """A mean alone cannot say whether the rows it averaged agree, so the
-    section shows their spread: the ice surface's 25-75% band shaded, the bed's
-    quartiles dashed (a second fill read as more ice, not as topography). On a
+    section shows their spread: the ice thickness's 25-75% band shaded on the
+    mean bed, the bed's quartiles dashed (a second fill read as more ice, not
+    as topography). On a
     bare bed at oversample=1 the composite IS the stored bed, so the dashed
     pair is exactly the stored rows' quartiles."""
     from matplotlib.collections import PolyCollection
@@ -586,22 +596,27 @@ def test_mean_cross_section_shades_the_interquartile_range(_iced_model):
     ax_cs = _section_axes(fig)
     # gate: bed IQR is now two dashed lines, decision 2026-09-17
     assert not [c for c in ax_cs.collections if isinstance(c, PolyCollection)], \
-        "a bare bed has no ice surface to shade"
+        "a bare bed has no ice to shade"
     want = np.percentile(np.asarray(m.zb_out[-1]), [25, 75], axis=0)
     assert (want[1] - want[0]).min() > 1.0, "test setup: the rows barely spread"
     dashed = _quartile_lines(ax_cs, nx_sub)
     assert len(dashed) == 2, "the bed quartiles are two dashed lines"
     np.testing.assert_allclose([ln.get_ydata() for ln in dashed], want, atol=1e-6)
     assert all(ln.get_color() == 'black' for ln in dashed)
-    note = '\n'.join(t.get_text() for t in ax_cs.texts)
-    assert 'shaded: surface IQR' in note and 'dashed: bed quartiles' in note
+    # gate: legend replaces the text note (Eric, 2026-09-21)
+    assert _section_legend(ax_cs) == SECTION_LEGEND[1:]
     plt.close(fig)
 
-    # with ice drawn, the surface carries the only band
+    # with ice drawn, the ice THICKNESS carries the only band. With the cell
+    # extent, no trunk ribbons and a crisp mask, the section's rows at
+    # oversample=1 are the stored surface and bed, so the band is exactly
+    # mean bed + quartiles of the drawn column hc*H.
     fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, oversample=1,
-                              cross_section='mean', hillshade=False,
-                              contour_interval=0)
+                              ice_extent='cells', ice_sigma_cells=0,
+                              trunk_display='none', cross_section='mean',
+                              hillshade=False, contour_interval=0)
     ax_cs = _section_axes(fig)
+    assert _section_legend(ax_cs) == SECTION_LEGEND
     bands = [c for c in ax_cs.collections if isinstance(c, PolyCollection)]
     assert len(bands) == 1
     np.testing.assert_allclose(bands[0].get_facecolor()[0],
@@ -611,18 +626,34 @@ def test_mean_cross_section_shades_the_interquartile_range(_iced_model):
     # the section's ice fill is OPAQUE (zorder 2): anything under it is invisible
     assert bands[0].get_zorder() > 2
     assert min(ln.get_zorder() for ln in dashed) > bands[0].get_zorder()
-    assert (_band_bounds(bands[0])[1] > np.asarray(dashed[1].get_ydata())).any(), \
-        "the iced surface band must rise above the bed's upper quartile"
+    zb = np.asarray(m.zb_out[-1])
+    q = np.percentile(m.hc_over_H * np.asarray(m.H_out[-1]), [25, 75], axis=0)
+    assert (q[1] - q[0]).max() > 1.0, "test setup: no ice column spreads anywhere"
+    # gate: the band is the ice THICKNESS IQR hung on the mean bed, not the
+    # surface's (decision 2026-09-22-section-band-ice-thickness-iqr)
+    np.testing.assert_allclose(_band_bounds(bands[0]), zb.mean(axis=0) + q, atol=1e-6)
     plt.close(fig)
 
-    # a single row is one landscape: no band, no quartile lines, no note
+    # the default style repaints the surface (ribbons, smoothed mask), but the
+    # band still hangs on the drawn mean bed: its lower edge is bed + H25 >= bed
+    fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, oversample=1,
+                              cross_section='mean', hillshade=False,
+                              contour_interval=0)
+    ax_cs = _section_axes(fig)
+    band = [c for c in ax_cs.collections if isinstance(c, PolyCollection)][0]
+    bed_line = [np.asarray(ln.get_ydata()) for ln in ax_cs.lines
+                if ln.get_linestyle() == '-' and len(ln.get_ydata()) == nx_sub][0]
+    assert (_band_bounds(band)[0] >= bed_line - 1e-6).all()
+    plt.close(fig)
+
+    # a single row is one landscape: no band, no quartile lines, no legend
     fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, oversample=1,
                               cross_section=15.0, hillshade=False,
                               contour_interval=0)
     ax_cs = _section_axes(fig)
     assert not [c for c in ax_cs.collections if isinstance(c, PolyCollection)]
     assert not _quartile_lines(ax_cs, nx_sub)
-    assert not [t for t in ax_cs.texts if 'quartile' in t.get_text()]
+    assert _section_legend(ax_cs) == []
     plt.close(fig)
 
 
@@ -649,6 +680,9 @@ def test_animate_landscape_accepts_an_averaged_section(_basin_model, monkeypatch
         for idx in movie.new_frame_seq():
             movie._func(idx)
             drawn.append(idx)
+        # gate: legend replaces the text note; the parallel-worker block that
+        # re-asserted the same landscape() call was dropped (Eric, 2026-09-21)
+        assert _section_legend(_section_axes(movie._fig)) == SECTION_LEGEND
 
     monkeypatch.setattr('matplotlib.animation.Animation.save', save)
     out = m.plot.animate_landscape(path=str(tmp_path / 'averaged.mp4'),

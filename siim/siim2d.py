@@ -818,16 +818,17 @@ class siim:
         # --- Mode-C standard defaults -------------------------------------------
         # Mode C (mode B + sub-grid carve — the flagship carved mode) resolves its
         # unset trunk_surface / routing_relax sentinels (None) to the mode-C
-        # standard (constants.MODE_C_TRUNK_SURFACE / MODE_C_ROUTING_RELAX); plain
-        # mode B (no carve) and mode A keep them OFF. An EXPLICIT user value (not
-        # None) always wins. widening_rate has no sentinel — its constants
-        # default (3.0) is the mode-C standard and is a no-op wherever carve is
-        # off. Resolved here, after carve_width is finalized (line above).
-        _is_mode_c = self.mode == 'B' and self.carve_width
+        # standard (constants.mode_c_standard, shared with the fastscape
+        # facade); plain mode B (no carve) and mode A keep them OFF. An EXPLICIT
+        # user value (not None) always wins. widening_rate has no sentinel — its
+        # constants default (3.0) is the mode-C standard and is a no-op wherever
+        # carve is off. Resolved here, after carve_width is finalized (line above).
+        _trunk_std, _relax_std = _constants.mode_c_standard(
+            self.mode == 'B' and self.carve_width)
         if params.trunk_surface is None:
-            params.trunk_surface = _constants.MODE_C_TRUNK_SURFACE if _is_mode_c else False
+            params.trunk_surface = _trunk_std
         if params.routing_relax is None:
-            params.routing_relax = _constants.MODE_C_ROUTING_RELAX if _is_mode_c else 0.0
+            params.routing_relax = _relax_std
         # Fabricated trunk-surface routing (mode B/C only). Routes + accumulates
         # on a fabricated ice surface so trunk flow converges to the centerline
         # (raw flux there = full cross-section).

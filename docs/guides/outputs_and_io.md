@@ -207,9 +207,12 @@ one row and marks it on the map; `'mean'` averages over the rendered rows of
 the section grid instead — the interpolated `oversample` grid, whose two end
 rows carry less ground than the interior ones — so the painted band is the
 average ice column per unit x and vanishes where nothing is iced. The mean
-section also shows the spread behind that mean — the ice surface's 25–75% band
-shaded, the bed's 25th and 75th percentiles as dashed lines — so a flat mean
-over one landscape reads differently from a flat mean over several. An averaged profile has no single y to mark, so the map gets
+section also shows the spread behind that mean — the ice thickness's 25–75%
+band shaded on the mean bed, the bed's 25th and 75th percentiles as dashed
+lines, both named in a legend — so a flat mean over one landscape reads
+differently from a flat mean over several. The band is the spread of the ice
+column, not an envelope of surfaces: a surface band would mostly repeat the
+bed's spread. An averaged profile has no single y to mark, so the map gets
 no locator line, and it skips the lake layer — a reduced water table is not a
 water table:
 
