@@ -121,6 +121,26 @@ def _nondegenerate_mask(z, z_route, interior):
     return mask
 
 
+def _neighbour_slopes(z, idx):
+    """``{neighbour: slope}`` over the 8-neighbourhood of ``idx`` on ``z``, with
+    ``_d8_receivers``' own link length and slope arithmetic (looped axes wrap)."""
+    j, i = idx // NX, idx % NX
+    out = {}
+    for jj in (-1, 0, 1):
+        jn = (j + jj) % NY if WRAP_Y else j + jj
+        if jn < 0 or jn >= NY:
+            continue
+        for ii in (-1, 0, 1):
+            if jj == 0 and ii == 0:
+                continue
+            in_ = (i + ii) % NX if WRAP_X else i + ii
+            if in_ < 0 or in_ >= NX:
+                continue
+            n = jn * NX + in_
+            out[n] = (z[idx] - z[n]) / np.sqrt((DX * ii) ** 2 + (DY * jj) ** 2)
+    return out
+
+
 def _inhouse(surface):
     rec, _w, lengths, _nr, stack, _basin = route_d8(surface, (NY, NX), DX, DY, BSTD)
     return rec, lengths, stack
@@ -165,6 +185,10 @@ def test_glaciated_behavioral():
             continue
         r = ih_rec[idx]
         assert z_route[r] < z_route[idx] + 1e-12   # strictly downhill on the fill
+        slopes = _neighbour_slopes(z_route, idx)
+        # gate: added (audit #20) -- the receiver is the STEEPEST neighbour, not just a lower one
+        assert r in slopes and slopes[r] >= max(slopes.values()) * (1.0 - 1e-12), (
+            f"cell {idx}: receiver {r} is not a steepest-descent neighbour")
 
     # 3. spill: no interior self-receivers, no cycles, valid topological order
     assert not np.any((interior == 1) & (ih_rec == np.arange(nn))), \

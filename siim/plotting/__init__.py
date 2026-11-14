@@ -1,11 +1,7 @@
-"""siim plotting package — ``siim_plotter`` assembled from per-area mixins.
-
-Split out of the old ``siim2d_plotting.py`` for file-size hygiene and a trimmed
-v1.0 keeper set; the public API (``m.plot.<method>``) is unchanged. See
-``docs/guides/outputs_and_io.md`` for the public plotting contract.
-
-``siim_plotter`` is assembled from the per-area mixins below; ``siim2d.py``
-imports it from here, and the old ``siim2d_plotting.py`` is gone.
+"""siim plotting package — the 2D ``siim_plotter`` (``m.plot``), assembled
+from per-area mixins: raw maps, channel profiles, the landscape renderer, basin
+summaries and convergence diagnostics. See ``docs/guides/outputs_and_io.md``
+for the public plotting contract.
 """
 
 from .maps import MapMixin

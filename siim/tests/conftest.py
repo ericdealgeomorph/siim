@@ -36,10 +36,17 @@ def both_drivers(request, monkeypatch):
     (:mod:`siim._core.driver`, the standalone default) and the xsimlab-
     orchestrated adapter loop (``adapter``-marked arm, conda-only),
     monkeypatching ``constants.DRIVER_DEFAULT`` so every ``.run()`` inside the
-    test resolves to the selected backend. Returns the backend key."""
+    test resolves to the selected backend; the xsimlab arm also resets the B/C
+    damping defaults to the one pass the adapter runs. Returns the backend
+    key."""
+    from siim import constants
     if request.param == 'xsimlab':
         pytest.importorskip('xsimlab')
         pytest.importorskip('fastscape')
-    from siim import constants
+        # The adapter routes once per step, so it runs modes B/C at the
+        # undamped single pass, not siim2d's adaptive default.
+        monkeypatch.setattr(constants, 'MODE_BCD_INNER_DAMPING', constants.INNER_DAMPING)
+        monkeypatch.setattr(constants, 'MODE_BC_INNER_PASSES', constants.INNER_PASSES)
+        monkeypatch.setattr(constants, 'MODE_BC_INNER_RELAX', constants.INNER_RELAX)
     monkeypatch.setattr(constants, 'DRIVER_DEFAULT', request.param)
     return request.param

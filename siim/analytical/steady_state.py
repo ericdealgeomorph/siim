@@ -24,13 +24,24 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ..constants import (AC, ALPHA_G, BETA, CE, D_HACK, DEFAULT_SLIDING_LAW,
-                         GRAVITY, HC_OVER_H, K_ACCUM, KH, KO, KT, LAMBDA_C,
+from .. import constants as _constants
+from .._palette import COLORS
+from ..constants import (AC, ALPHA_G, BETA, BOUNDARY_CONDITIONS_1D, CE, D_HACK,
+                         DEFAULT_SLIDING_LAW, SLIDING_LAWS,
+                         GRAVITY, K_ACCUM, KH, KO, KT, LAMBDA_C,
                          LAMBDA_P, N_FLUVIAL, NU, P, RHO_ICE, SIGMA, TAU_C, U,
-                         XO, ZELA, Co_power, cg_prefactor, derive_coulomb,
-                         derive_power)
+                         XO, ZELA, Co_power, cg_prefactor, check_range,
+                         derive_coulomb, derive_power)
 from .core import (Solution, closure_slope, find_closure_roots,
                    incomplete_beta_compl)
+
+
+def _same(a, b):
+    """Input equality for the mutate-then-solve() check (NaN equals NaN). An
+    array-valued input reads as changed, so set_and_check_parameters refuses it."""
+    if np.ndim(a) or np.ndim(b):
+        return False
+    return a is b or a == b or (isinstance(a, float) and isinstance(b, float) and a != a and b != b)
 
 
 class analytical_steady_state_solution:
@@ -55,7 +66,9 @@ class analytical_steady_state_solution:
             user_params = {}
         elif not isinstance(user_params, dict):
             raise TypeError("params must be provided as a dictionary.")
+        self._user_params = dict(user_params)
         self.set_and_check_parameters(user_params)
+        self._inputs_seen = self._input_values()
         # eager solve. Sets self.surface/.bed (primary) and, when bistable,
         # self.surface_alt/.bed_alt (fluvial alt). glacier_flag enumerates:
         #   -1 : no SS (no stable glaciated root and fluvial inviable)
@@ -77,7 +90,7 @@ class analytical_steady_state_solution:
             # climate
             "P": P,
             "beta": BETA,
-            "zELA": ZELA,
+            "zELA": None,   # None: ZELA, unless zT is given
             "zT": None,
             "U": U,
             # fluvial
@@ -100,6 +113,9 @@ class analytical_steady_state_solution:
             "sliding_law": DEFAULT_SLIDING_LAW,
             "ce": CE,
             "tau_c": TAU_C,
+            # channel-floor datum of the reported bed, zb = z - hc_over_H*H
+            # (None: constants.HC_OVER_H); the solve itself is in (z, H)
+            "hc_over_H": None,
             "left_bc": "base_level",
             "right_bc": "reflecting",
         }
@@ -107,11 +123,22 @@ class analytical_steady_state_solution:
         unexpected = set(user_params) - set(defaults)
         if unexpected:
             raise ValueError(f"Unexpected parameter(s): {sorted(unexpected)}")
+        self._INPUT_NAMES = tuple(defaults)     # what solve() watches for a change
 
         params = SimpleNamespace(**{**defaults, **user_params})
 
+        # a typo crashed later on a missing xp, an unknown law ran the power
+        # law, sigma = 0 divided by zero (audit #58)
+        for side in ("left_bc", "right_bc"):
+            if getattr(params, side) not in BOUNDARY_CONDITIONS_1D:
+                raise ValueError(f"{side} must be one of {BOUNDARY_CONDITIONS_1D}, "
+                                 f"got {getattr(params, side)!r}")
         if (params.left_bc != "base_level") & (params.right_bc != "base_level"):
             raise ValueError("At least one boundary condition must be 'base_level'")
+        if params.sliding_law not in SLIDING_LAWS:
+            raise ValueError(f"sliding_law must be one of {SLIDING_LAWS}, got {params.sliding_law!r}")
+        if not (np.isfinite(params.sigma) and params.sigma > 0):
+            raise ValueError(f"sigma must be finite and > 0, got {params.sigma!r}")
 
         # U and zELA must be scalars in the analytical
         if not np.isscalar(params.U):
@@ -169,6 +196,10 @@ class analytical_steady_state_solution:
         self.ce = params.ce
         self.tau_c = params.tau_c
         self.sliding_law = params.sliding_law
+        # None resolves at call time, as siim1d/siim2d do
+        self.hc_over_H = (float(_constants.HC_OVER_H) if params.hc_over_H is None
+                          else float(params.hc_over_H))
+        check_range('hc_over_H', self.hc_over_H, 0.0)
 
         # cg (kt absorbed; 2/5 = depth-integrated Glen prefactor) and fluvial K
         self.cg = cg_prefactor(self.alpha_g, self.Ac, self.rho_g, self.g)
@@ -216,8 +247,38 @@ class analytical_steady_state_solution:
                     else self.d * self.sigma / (self.d * self.sigma + self.k))
 
     # ---- Analytical solve -------------------------------------------------
+    def _input_values(self):
+        """The current value of every input parameter the object stores under its
+        own name (what a mutate-then-solve() changes)."""
+        return {k: getattr(self, k) for k in self._INPUT_NAMES if hasattr(self, k)}
+
     def solve(self):
-        """Re-run the full SS solve (idempotent). Updates self.surface/.bed."""
+        """Re-run the full SS solve (idempotent). Updates self.surface/.bed.
+
+        An input attribute changed since the last solve (``self.Ko *= 4``) is
+        re-derived from: everything set_and_check_parameters builds on it (K,
+        Co, cg, lam, the x grid, ...) is rebuilt first, so the solve no longer
+        mixes new inputs with stale derived values (audit #59). Of a
+        zELA / zT, nu / ell or nx / dx pair, the one changed wins; changing
+        both is refused. A rebuild that raises leaves the object as it was."""
+        changed = {k: v for k, v in self._input_values().items()
+                   if not _same(v, self._inputs_seen.get(k))}
+        if changed:
+            params = {**self._user_params, **changed}
+            for a, b in (("zELA", "zT"), ("nu", "ell"), ("nx", "dx")):
+                if a in changed and b in changed:
+                    raise ValueError(f"change one of {a} / {b} before solve(), not both")
+                if b in changed or a in changed:
+                    params.pop(a if b in changed else b, None)
+            state = self.__dict__.copy()
+            try:
+                self.set_and_check_parameters(params)
+            except BaseException:
+                self.__dict__.clear()
+                self.__dict__.update(state)
+                raise
+            self._user_params = params
+            self._inputs_seen = self._input_values()
         self.surface, self.bed = self._analytical_profiles()
         return self.surface, self.bed
 
@@ -294,18 +355,20 @@ class analytical_steady_state_solution:
         return surface, bed
 
     def plot(self, ax=None, *, show_ela=True, show_thickness=True,
-             show_bedrock=True, topo_color='k', ice_color='#b0d6e2',
-             ice_alpha=0.55, bedrock_color='#888888', bedrock_fade='auto',
+             show_bedrock=True, topo_color='k', ice_color=COLORS['ice_fill'],
+             ice_alpha=0.55, bedrock_color=COLORS['bed'], bedrock_fade='auto',
              bedrock_alpha=0.6, label=None):
         """Plot the steady-state profile in the paper's canonical profile
         style — the same renderer as ``GeneralProfile.plot``
         (``analytical.profiles.draw_profile``), so a basin-fitted analytical
         reference overlays in the identical visual language as the standalone
-        profiles. ``bed`` is the channel-floor datum (``z - HC_OVER_H*H``).
+        profiles. ``bed`` is the channel-floor datum (``z - hc_over_H*H``).
 
         Plotted against distance from the divide, whichever end holds base
-        level. Returns the axis (a new 8x3-inch figure when ``ax`` is None); a
-        no-op axis when there is no steady-state glacier to draw.
+        level; with base level at both ends, against x, the divide in the
+        middle. Returns the axis (a new 6x2.25-inch figure when ``ax`` is
+        None); a no-op axis when there is no steady-state glacier to draw. The
+        ice and bed fills and the ELA take the model plotters' colours.
         """
         import matplotlib.pyplot as plt  # lazy: keep the module headless
         from .profiles import draw_profile
@@ -314,7 +377,7 @@ class analytical_steady_state_solution:
         if surface is None:
             return ax
         if ax is None:
-            _, ax = plt.subplots(figsize=(8, 3))
+            _, ax = plt.subplots(figsize=(6, 2.25), layout='constrained')
 
         # x is stored L -> 0 (index 0 = left end). With base level on the
         # right it is distance from base level, so flip it; otherwise it is
@@ -325,10 +388,16 @@ class analytical_steady_state_solution:
         else:
             xd, zs, zb = self.x[::-1], surface[::-1], bed[::-1]
         has_glacier = self.glacier_flag in (2, 3, 4, 5)
+        # Lt and xo are measured from the divide, over the Ld it drains to
         ice_end = (self.Lt if (has_glacier and np.isfinite(self.Lt)
-                               and self.Lt <= self.L) else self.L)
+                               and self.Lt <= self.Ld) else self.Ld)
+        ice_x_range = (self.xo, ice_end) if has_glacier else None
+        two_sided = self.left_bc == 'base_level' and self.right_bc == 'base_level'
+        if two_sided and has_glacier:
+            # xd runs from the left base level; the divide sits at Ld = L/2
+            ice_x_range = (self.Ld - ice_end, self.Ld + ice_end)
         draw_profile(ax, xd, zs, zb,
-                     ice_x_range=(self.xo, ice_end) if has_glacier else None,
+                     ice_x_range=ice_x_range,
                      topo_color=topo_color, ice_color=ice_color,
                      ice_alpha=ice_alpha, bedrock_color=bedrock_color,
                      bedrock_fade=bedrock_fade, bedrock_alpha=bedrock_alpha,
@@ -336,26 +405,30 @@ class analytical_steady_state_solution:
                      label=label)
 
         if show_ela:
-            ax.axhline(self.zELA, color='r', lw=0.8, ls='--', zorder=-1)
-        ax.set_xlabel('Distance from divide (km)')
+            ax.axhline(self.zELA, color=COLORS['ela'], lw=0.8, ls='--', zorder=-1)
+        ax.set_xlabel('x (km)' if two_sided else 'Distance from divide (km)')
         ax.set_ylabel('Elevation (m)')
         ax.set_xlim(0, self.L / 1e3)
         return ax
 
-    # Field names mirror siim1d's ``plot.profile`` (siim/plotting/profiles.py).
+    # Field names mirror the 2D ``plot.profile`` (siim/plotting/profiles.py);
+    # the 1D one adds shear_stress and sliding_velocity.
     _PROFILE_FIELDS = ('elevation', 'ice_thickness', 'erosion_rate',
                        'ice_flux', 'water_flux')
 
     def plot_profile(self, fields='elevation', *, axes=None):
-        """Stacked analytical-profile panels (filled-band notebook style), one
-        per field. Mirrors the five fields of ``siim1d``'s ``plot.profile`` --
-        'elevation', 'ice_thickness', 'erosion_rate', 'ice_flux', 'water_flux'
-        -- but draws the analytical steady state only (no extracted 2D channel).
+        """Stacked analytical-profile panels, one per field. Takes the five
+        fields of the 2D ``plot.profile`` -- 'elevation', 'ice_thickness',
+        'erosion_rate', 'ice_flux', 'water_flux' -- but draws the analytical
+        steady state only (no extracted 2D channel).
 
-        Unlike ``plot`` (the canonical single-axis ``draw_profile`` renderer),
-        this reproduces the two-panel bed/ice/thickness layout. ``bed`` is the
-        channel-floor datum (``z - HC_OVER_H*H``); at steady state the erosion
-        rate is uniformly ``U``. Plotted against ``x`` (distance, km).
+        The elevation panel is ``plot`` itself (the canonical ``draw_profile``
+        renderer); the others are filled bands in the model plotters'
+        colours. ``ice_thickness`` is the column depth ``surface - bed =
+        hc_over_H*H`` (``bed`` is the channel-floor datum); at steady state the
+        erosion rate is uniformly ``U``. Plotted against distance (km) oriented
+        as ``plot`` draws it: from the divide, or x when both ends are base
+        level. A new figure is 6 in wide for one field, 12 in for a stack.
 
         Parameters
         ----------
@@ -381,13 +454,17 @@ class analytical_steady_state_solution:
         if self.surface is None:
             return None, None
 
-        x = self.x / 1e3
+        # the same orientation as plot(): divide at 0 (two-sided: x)
+        x = (self.L - self.x if self.right_bc == 'base_level' else self.x) / 1e3
+        two_sided = self.left_bc == 'base_level' and self.right_bc == 'base_level'
         H = self.surface - self.bed
 
         if axes is None:
+            # the house widths, as the model plotters' profile()
+            width, aspect = (6, 0.38) if len(fields) == 1 else (12, 0.25)
             fig, axes = plt.subplots(len(fields), 1,
-                                     figsize=(10, 2 * len(fields)),
-                                     sharex=True, squeeze=False)
+                                     figsize=(width, width * aspect * len(fields)),
+                                     sharex=True, squeeze=False, layout='constrained')
             axes = axes[:, 0]
         else:
             axes = np.atleast_1d(axes)
@@ -395,46 +472,39 @@ class analytical_steady_state_solution:
             if len(axes) != len(fields):
                 raise ValueError("axes length must match the number of fields")
 
+        def band(ax, values, line, fill, ylabel):
+            ax.fill_between(x, 0, values, color=fill, alpha=0.25, lw=0)
+            ax.plot(x, values, color=line, lw=1)
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(0, None)
+
         for ax, field in zip(axes, fields):
             if field == 'elevation':
-                ax.fill_between(x, 0, self.bed, color='gray', alpha=0.2)
-                ax.fill_between(x, self.bed, self.surface, color='steelblue',
-                                alpha=0.25, label='ice')
-                ax.plot(x, self.bed, 'k-', lw=1, label='bedrock')
-                ax.plot(x, self.surface, 'navy', lw=1, label='ice surface')
-                ax.axhline(self.zELA, color='goldenrod', ls='--', lw=1,
-                           label='ELA')
-                ax.set_ylabel('Elevation (m)')
-                ax.set_ylim(0, 2 * self.zELA)
+                self.plot(ax=ax, show_ela=False, label='Surface')
+                ax.axhline(self.zELA, color=COLORS['ela'], lw=0.8, ls='--',
+                           zorder=-1, label='ELA')
+                # from the data: a fixed 2*zELA top clipped the profile
+                ax.set_ylim(min(0.0, float(np.min(self.bed))), None)
                 ax.legend(loc='upper right')
             elif field == 'ice_thickness':
-                ax.fill_between(x, 0, H, color='steelblue', alpha=0.3)
-                ax.plot(x, H, color='navy', lw=1)
-                ax.set_ylabel('Ice thickness (m)')
-                ax.set_ylim(0, None)
+                band(ax, H, COLORS['ice'], COLORS['ice_fill'], 'Ice column depth (m)')
             elif field == 'erosion_rate':
-                ax.axhline(self.U, color='firebrick', lw=1.5,
+                ax.axhline(self.U, color=COLORS['erosion'], lw=1.5,
                            label='erosion rate = U (steady state)')
                 ax.set_ylabel('Erosion rate (m/yr)')
                 ax.set_ylim(0, 2 * self.U if self.U > 0 else None)
                 ax.legend(loc='upper right')
             elif field == 'ice_flux':
-                Qg = self._analytical_ice_flux()
-                ax.fill_between(x, 0, Qg, color='dodgerblue', alpha=0.25)
-                ax.plot(x, Qg, color='navy', lw=1)
-                ax.set_ylabel('Ice flux (m$^3$/yr)')
-                ax.set_ylim(0, None)
+                band(ax, self._analytical_ice_flux(), COLORS['ice_flux'],
+                     COLORS['ice_flux'], 'Ice flux (m$^3$/yr)')
             elif field == 'water_flux':
-                Qf = self._analytical_water_flux()
-                ax.fill_between(x, 0, Qf, color='orangered', alpha=0.25)
-                ax.plot(x, Qf, color='firebrick', lw=1)
-                ax.set_ylabel('Water flux (m$^3$/yr)')
-                ax.set_ylim(0, None)
+                band(ax, self._analytical_water_flux(), COLORS['water_flux'],
+                     COLORS['water_flux'], 'Water flux (m$^3$/yr)')
             ax.grid(True, alpha=0.2)
             ax.set_xlim(0, self.L / 1e3)
+            ax.set_xlabel('')
 
-        axes[-1].set_xlabel('Distance (km)')
-        fig.tight_layout()
+        axes[-1].set_xlabel('x (km)' if two_sided else 'Distance from divide (km)')
         return fig, axes
 
     # --- Steady-state solve (shared closure solver) -------------------------
@@ -689,8 +759,8 @@ class analytical_steady_state_solution:
         Returns
         -------
         ndarray or float
-            Width-mean ice thickness [m] (the dimensionless H' = H/zELA is
-            multiplied back by zELA before returning), shape of ``xp``. Zero
+            Width-mean ice thickness [m] (zELA * NH, computed without the
+            1/zELA in NH so zELA = 0 holds; audit #57), shape of ``xp``. Zero
             outside the ice extent (x > L_t) and identically zero for a fluvial
             or absent solution (L_t is NaN) — matching the profiles._thickness
             family (audit m26); no NaN/RuntimeWarning past the terminus.
@@ -708,24 +778,26 @@ class analytical_steady_state_solution:
 
         if self.sliding_law == 'coulomb':
             # Coulomb closure: gamma = phi,
-            # NH = ((cs/lambda_tau)^3 + cg*lambda_c*lambda_tau^2/(kh*beta*lam*Go))^(-1/3)
-            #      * Lt^(gamma(1+d)/(1+phi)) / zELA, lambda_tau = tau_c/(rho_g g).
+            # H = pref * Lt^(gamma(1+d)/(1+phi)) * spatial^gamma, with
+            # pref = ((cs/lambda_tau)^3 + cg*lambda_c*lambda_tau^2/(kh*beta*lam*Go))^(-1/3),
+            # lambda_tau = tau_c/(rho_g g).
             gamma = phi
             lambda_tau = self.tau_c / (self.rho_g * self.g)
             denom = ((self.cs / lambda_tau) ** 3
                      + self.cg * self.lambda_c * lambda_tau ** 2
                        / (self.k_h * self.beta * self.lam * self.Go))
-            NH = denom ** (-1.0 / 3.0)
+            pref = denom ** (-1.0 / 3.0)
         else:
             # eff-exp / power closure: gamma = (2/3)(1/3 + phi),
-            # NH = (kh*beta*lam*Go / (cg*lambda_p^(3/2)*cs^2))^(2/9)
-            #      * Lt^(gamma(1+d)/(1+phi)) / zELA.
+            # H = pref * Lt^(gamma(1+d)/(1+phi)) * spatial^gamma, with
+            # pref = (kh*beta*lam*Go / (cg*lambda_p^(3/2)*cs^2))^(2/9).
             gamma = (2.0 / 3.0) * (1.0 / 3.0 + phi)
-            NH = (self.k_h * self.beta * self.lam * self.Go
+            pref = (self.k_h * self.beta * self.lam * self.Go
                   / (self.cg * self.lambda_p ** 1.5 * self.cs ** 2)) ** (2.0 / 9.0)
 
-        NH *= Lt ** (gamma * (1.0 + self.d) / (1.0 + phi)) / self.zELA
-        return self.zELA * NH * spatial ** gamma
+        # = zELA * NH * spatial^gamma with NH's 1/zELA cancelled, so zELA = 0
+        # (an ELA at base level, physical) no longer raises (audit #57)
+        return pref * Lt ** (gamma * (1.0 + self.d) / (1.0 + phi)) * spatial ** gamma
 
     def analytical_z(self, xp):
         """Surface elevation [m] at xp = x/Ld: glacial branch where
@@ -741,17 +813,17 @@ class analytical_steady_state_solution:
 
     def analytical_zb(self, xp):
         """Bed elevation [m] at xp = x/Ld on the channel-floor datum:
-        zb = z - HC_OVER_H * H under ice, zb = z elsewhere."""
+        zb = z - hc_over_H * H under ice, zb = z elsewhere."""
         xp = np.asarray(xp, dtype=float)
         scalar = xp.ndim == 0
         xp = np.atleast_1d(xp)
         zb = np.zeros_like(xp)
         glacier = xp <= self.Lt / self.Ld
-        # Channel-floor datum: bed = surface - hc with hc = HC_OVER_H * H
+        # Channel-floor datum: bed = surface - hc with hc = hc_over_H * H
         # (H is the width-mean depth and is NOT rescaled — only the bed
-        # reconstruction carries the parabola max/mean factor).
+        # reconstruction carries the datum factor, 1.5 by default).
         zb[glacier] = (self.analytical_z_glacial(xp[glacier])
-                       - HC_OVER_H * self.analytical_ice_thickness(xp[glacier]))
+                       - self.hc_over_H * self.analytical_ice_thickness(xp[glacier]))
         zb[~glacier] = self.analytical_z_fluvial(xp[~glacier])
         return float(zb[0]) if scalar else zb
 

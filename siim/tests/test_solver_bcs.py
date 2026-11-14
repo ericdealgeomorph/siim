@@ -673,13 +673,13 @@ def test_wave_uplift_integrates_to_delta_h():
     total = np.zeros(w.shape)
     n_steps = int((900e3 / w.wave_velocity) / dt)      # 60 Myr: wave crosses all x
     for k in range(n_steps):
-        w.run_step(dt, k * dt)
+        w.run_step(dt, k * dt, 0.0)
         total += w.uplift
     # every interior column fully passed by the wave received delta_h
     np.testing.assert_allclose(total[1, 5:-5], w.delta_h, rtol=1e-3)
 
     # midpoint sampling: peak of the step-k rate sits at c(t + dt/2)
-    w.run_step(dt, 0.0)
+    w.run_step(dt, 0.0, 0.0)
     X = w.x
     k_peak = int(np.argmax(w.uplift[1]))
     c_expected = w.x[0] + w.x_escarpment + 0.5 * dt * w.wave_velocity

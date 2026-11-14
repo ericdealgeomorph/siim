@@ -38,9 +38,9 @@ import pytest
 if not (os.environ.get('SIIM_S0_REF_DIR') or os.environ.get('CI')):
     pytest.skip(
         "frozen reference battery is platform-bound (CI linux/x86-64 floats); "
-        "freeze a local battery first — "
-        "SIIM_S0_REF_DIR=siim/tests/data/reference_local python "
-        "siim/tests/data/reference/capture_snapshots.py --write --if-absent — "
+        "freeze a fresh local battery from the baseline commit first — "
+        "SIIM_S0_REF_DIR=.scratch/reference_local python "
+        "siim/tests/data/reference/capture_snapshots.py --write — "
         "then rerun the suite with SIIM_S0_REF_DIR set",
         allow_module_level=True)
 

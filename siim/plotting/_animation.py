@@ -30,12 +30,17 @@ def frame_indices(nframes, frames):
     return selected
 
 
+MOVIE_DPI = 150
+
+
 def save_animation(fig, update, nframes, path, *, fps=None, interval=42,
-                   frames=None, close=True, dpi=150):
+                   frames=None, close=True, dpi=MOVIE_DPI, extra_args=None):
     """Encode frames; explicit fps wins, otherwise interval is milliseconds/frame.
 
     ``frames`` selects a subset of the ``nframes`` saved frames (see
-    :func:`frame_indices`); None encodes every one, in order.
+    :func:`frame_indices`); None encodes every one, in order. ``extra_args``
+    go to ffmpeg before the output name, after the user's
+    ``rcParams['animation.ffmpeg_args']`` (None keeps matplotlib's defaults).
 
     Only figures created by the plotter are closed, including on encoder errors.
     """
@@ -48,11 +53,15 @@ def save_animation(fig, update, nframes, path, *, fps=None, interval=42,
         rate = 1000.0 / interval if fps is None else fps
         if not np.isfinite(rate) or rate <= 0:
             raise ValueError('fps must be positive and finite')
+        if extra_args is not None:
+            # matplotlib's writer reads the rcParam only without extra_args
+            extra_args = [*plt.rcParams['animation.ffmpeg_args'], *extra_args]
         movie = animation.FuncAnimation(
             fig, update, frames=frame_indices(nframes, frames),
             interval=interval, blit=False, repeat=False,
         )
-        movie.save(filename=path, writer='ffmpeg', fps=rate, dpi=dpi)
+        movie.save(filename=path, writer='ffmpeg', fps=rate, dpi=dpi,
+                   extra_args=extra_args)
         return path
     finally:
         if close:

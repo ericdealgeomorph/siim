@@ -55,6 +55,20 @@ def _ib_b0_log_series(eps, a):
 # Cap on the b -> b+1 recurrence (guards the b = (1-d*phi)/k -> -inf abuse
 # that previously hung or NaN-corrupted the evaluation).
 _MAX_RECURRENCE = 10_000
+# 0 < |b| < _b_small(a) takes the small-b form in _ib_near_one: the reflection
+# (b > 0) and the recurrence (b < 0) each subtract two ~1/b terms, losing
+# ~1e-16/|b| relative, so a d*phi one rounding step off 1 was O(1) wrong (audit
+# #56). The small-b form's log R series converges for |b| < a and is cut after
+# b^5, a relative truncation of ~(|b|/a)^5/6: below 1e-15 at the switch, where
+# the reflection's own error is ~1e-13.
+_B_SMALL = 1e-3
+_ZETA2, _ZETA3, _ZETA4, _ZETA5 = (float(_sp.zeta(k)) for k in (2, 3, 4, 5))
+_S_MAX_TERMS = 10_000          # the S series ends in ~50 terms at eps <= 1/2
+
+
+def _b_small(a):
+    """The |b| below which the small-b form replaces the reflection."""
+    return _B_SMALL * min(a, 1.0)
 
 
 def _arccosh_safe(v):
@@ -77,6 +91,54 @@ def _ib_small_x(x, a, b):
     return x ** a / a * _sp.hyp2f1(a, 1.0 - b, a + 1.0, x)
 
 
+def _ib_near_one_small_b(eps, a, b):
+    r"""B(1-eps; a, b) for 0 < |b| < _b_small(a), either sign, without the
+    cancellation of the reflection B(a, b) - B(eps; b, a): both terms are
+    taken minus their common 1/b analytically,
+
+    .. math::
+
+       B(a,b) - \frac{1}{b} = \frac{\mathrm{expm1}(\log R)}{b},\quad
+       R = \frac{\Gamma(a)\,\Gamma(1+b)}{\Gamma(a+b)},
+
+    with log R from its Taylor series in b (an lgamma difference would
+    cancel the same way), and, from DLMF 8.17.7,
+
+    .. math::
+
+       B(\epsilon;\,b,\,a) - \frac{1}{b} =
+       \frac{\mathrm{expm1}(bL)}{b} + (1 + \mathrm{expm1}(bL))\,S,\quad
+       S = \sum_{n\ge1} \frac{(1-a)_n\,\epsilon^n}{(b+n)\,n!},
+
+    L = log eps. At b -> 0 this is the b = 0 limit -log eps - psi(a) -
+    gamma_E - S(0) term by term; no term divides a difference by b."""
+    L = np.log(eps)
+    logR_over_b = (-_EULER_GAMMA - _sp.digamma(a)
+                   + b * (_ZETA2 - _sp.polygamma(1, a)) / 2.0
+                   + b ** 2 * (-_ZETA3 / 3.0 - _sp.polygamma(2, a) / 6.0)
+                   + b ** 3 * (_ZETA4 / 4.0 - _sp.polygamma(3, a) / 24.0)
+                   + b ** 4 * (-_ZETA5 / 5.0 - _sp.polygamma(4, a) / 120.0))
+    big = np.expm1(b * logR_over_b) / b
+    # at b = 0, S is minus _ib_b0_log_series's sum (kept apart: that branch
+    # is oracle-pinned)
+    S = np.zeros_like(eps)
+    term = np.ones_like(eps)              # (1-a)_n eps^n / n!, built up
+    for n in range(1, _S_MAX_TERMS):
+        term = term * (n - a) * eps / n
+        add = term / (b + n)
+        S = S + add
+        if not np.any(np.abs(add) > 1e-17 * np.abs(S)):
+            break
+    else:
+        raise RuntimeError(f'incomplete_beta small-b series did not converge '
+                           f'in {_S_MAX_TERMS} terms (eps up to {eps.max()!r})')
+    e = np.expm1(b * L)
+    # eps = 0 (x = 1): S = 0 and e = +-inf; skip e*S there (inf * 0)
+    with np.errstate(invalid='ignore'):
+        eS = np.where(S == 0.0, 0.0, e * S)
+    return big - (e / b + S + eS)
+
+
 def _ib_near_one(eps, a, b):
     r"""B(1-eps; a, b) for eps in [0, ~0.5], exact for b <= 0.
 
@@ -96,7 +158,9 @@ def _ib_near_one(eps, a, b):
        + (a-1)\,\epsilon + O(\epsilon^2)
 
     for small eps and hyp2f1 otherwise; b > 0 uses the reflection
-    B(1-eps; a, b) = B(a, b) - B(eps; b, a).
+    B(1-eps; a, b) = B(a, b) - B(eps; b, a). The recurrence runs only for
+    b <= -_b_small(a); any 0 < |b| below it, either sign, uses
+    :func:`_ib_near_one_small_b` instead.
     """
     eps = np.asarray(eps, dtype=float)
     xa = np.exp(a * np.log1p(-eps))        # (1-eps)^a without cancellation
@@ -104,7 +168,7 @@ def _ib_near_one(eps, a, b):
     boundary = np.zeros_like(eps)
     coeff = 1.0
     with np.errstate(over='ignore', divide='ignore'):
-        while b < 0:
+        while b <= -_b_small(a):
             boundary -= coeff * xa * eps ** b / b
             coeff *= (a + b) / b
             b += 1.0
@@ -132,6 +196,8 @@ def _ib_near_one(eps, a, b):
                 if (~near).any():
                     out[~near] = _ib_small_x(1.0 - eps[~near], a, 0.0)
             core = out
+        elif abs(b) < _b_small(a):
+            core = _ib_near_one_small_b(eps, a, b)
         else:
             core = _sp.beta(a, b) * (1.0 - _sp.betainc(b, a, eps))
 
@@ -185,10 +251,15 @@ def incomplete_beta(x, a, b):
     if b > 0:
         out[:] = _sp.beta(a, b) * _sp.betainc(a, b, x)
     else:
+        # x = 1 diverges for every a > 0: exactly +inf. There the recurrence
+        # can form inf - inf or 0*inf (NaN), e.g. at a >= 1, b = -1 (audit #63).
+        one = x == 1.0
+        out[one] = np.inf
         if lo.any():
             out[lo] = _ib_small_x(x[lo], a, b)
-        if (~lo).any():
-            out[~lo] = _ib_near_one(1.0 - x[~lo], a, b)
+        near = ~lo & ~one
+        if near.any():
+            out[near] = _ib_near_one(1.0 - x[near], a, b)
     return float(out[0]) if scalar else out
 
 
@@ -227,15 +298,21 @@ def incomplete_beta_compl(eps, a, b):
         raise ValueError('incomplete_beta_compl requires eps in [0, 1]')
 
     out = np.empty_like(eps)
+    # eps = 0 (x = 1) with b <= 0 diverges for every a > 0: exactly +inf, as in
+    # incomplete_beta (at a >= 1, b <= -1 the recurrence forms inf - inf).
+    one = (eps == 0.0) & (b <= 0)
+    out[one] = np.inf
     near = eps <= (1.0 - _X_SPLIT)
+    far = ~near
+    near &= ~one
     if near.any():
         out[near] = _ib_near_one(eps[near], a, b)
-    if (~near).any():
-        x = 1.0 - eps[~near]
+    if far.any():
+        x = 1.0 - eps[far]
         if b > 0:
-            out[~near] = _sp.beta(a, b) * _sp.betainc(a, b, x)
+            out[far] = _sp.beta(a, b) * _sp.betainc(a, b, x)
         else:
-            out[~near] = _ib_small_x(x, a, b)
+            out[far] = _ib_small_x(x, a, b)
     return float(out[0]) if scalar else out
 
 

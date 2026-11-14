@@ -375,3 +375,55 @@ def test_map_colorbar_labels_fit_inside_export(models, field, width):
         bounds = panel.get_tightbbox(renderer)
         assert bounds.x0 >= 0 and bounds.y0 >= 0
         assert bounds.x1 <= fig.bbox.width and bounds.y1 <= fig.bbox.height
+
+
+def test_default_bed_colormap_is_the_embedded_trimmed_turku(models):
+    """map() and landscape() colour the bed with Crameri's turku, its darkest
+    20 % dropped (rows 51-255 of 256), embedded so cmcrameri is not needed."""
+    from matplotlib.colors import Normalize
+    from siim.plotting._colormaps import BED_COLORS, bed_cmap
+    assert len(BED_COLORS) == 205
+    assert BED_COLORS[0] == (0.235309, 0.234470, 0.194450)
+    assert BED_COLORS[-1] == (1.000000, 0.901739, 0.900670)
+    probe = np.linspace(0.0, 1.0, 411)
+    model = models['2d']
+    image = model.plot.map('bedrock').get_images()[0]
+    np.testing.assert_array_equal(image.get_cmap()(probe), bed_cmap()(probe))
+    # raw bedrock: one pixel per node, no smoothing or hillshade
+    _, ax = model.plot.landscape(field='bedrock', style='raw')
+    zb = np.asarray(model.zb_out[-1])
+    expected = bed_cmap()(Normalize(-500.0, np.nanmax(zb))(zb))[..., :3]
+    np.testing.assert_allclose(np.asarray(ax.get_images()[0].get_array()),
+                               expected, atol=1e-12)
+
+
+def test_plot_text_takes_its_sizes_from_rcparams(models):
+    """No plotter hard-codes a font size: under distinctive rcParams every
+    drawn text is one of the rc sizes."""
+    from matplotlib.text import Text
+    allowed = {7.0, 7.5, 8.5, 6.5, 5.5, 9.5}
+    plot2d, plot1d = models['2d'].plot, models['1d'].plot
+    with matplotlib.rc_context({
+            'font.size': 7.0, 'axes.titlesize': 7.5, 'axes.labelsize': 8.5,
+            'xtick.labelsize': 6.5, 'ytick.labelsize': 6.5,
+            'legend.fontsize': 5.5, 'figure.titlesize': 9.5}):
+        figures = [
+            plot2d.landscape(cross_section=15.0)[0],
+            plot2d.landscape(cross_section='mean')[0],
+            plot2d.landscape(field='bedrock+speed')[0],
+            plot2d.map('ice').figure,
+            plot2d.profile(['elevation', 'erosion_rate'])[0],
+            plot2d.flux('ice').figure,
+            plot2d.hacks_law().figure,
+            plot1d.profile(['elevation', 'ice_thickness'])[0],
+        ]
+        plot2d.steady_state()
+        figures.append(plt.gcf())
+        plot2d.largest_basins_history(n_samples=2)
+        figures.append(plt.gcf())
+        for fig in figures:
+            fig.canvas.draw()
+            sizes = {round(float(text.get_fontsize()), 6)
+                     for text in fig.findobj(Text)
+                     if text.get_visible() and text.get_text()}
+            assert sizes <= allowed, sizes - allowed

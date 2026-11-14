@@ -1,5 +1,5 @@
-"""Display-side anti-flicker for landscape(): the ice_smoothing='field' variant,
-min_ice_cells speckle/hole cleanup, and ice_time_avg trailing average.
+"""Display-side anti-flicker for landscape(): the ice_smoothing='field' variant
+and min_ice_cells speckle/hole cleanup.
 
 Unit-tests the pure mask helpers in siim.plotting._render on small synthetic
 arrays (no figure rendering), plus a figure-level smoke test that landscape()
@@ -19,7 +19,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from siim.plotting._render import (
-    _smooth_ice_mask, _field_ice_mask, _clean_ice_mask, _mean_recent_H)
+    _smooth_ice_mask, _field_ice_mask, _clean_ice_mask)
 
 
 def _subgrid_coords(ny, nx, oversample):
@@ -83,25 +83,7 @@ def test_clean_ice_mask_components_and_holes():
 
 
 # ---------------------------------------------------------------------------
-# 3. ice_time_avg (trailing mean) indexing.
-# ---------------------------------------------------------------------------
-def test_mean_recent_H_indexing():
-    rng = np.random.RandomState(0)
-    H = rng.rand(6, 4, 5)
-    # k=1 is identity.
-    np.testing.assert_array_equal(_mean_recent_H(H, 3, 1), H[3])
-    # window clamps at the start (i=0, k=3 -> just frame 0).
-    np.testing.assert_array_equal(_mean_recent_H(H, 0, 3), H[0])
-    # general trailing window.
-    np.testing.assert_allclose(_mean_recent_H(H, 4, 3), H[2:5].mean(axis=0))
-    # i=-1 normalises to the last frame.
-    np.testing.assert_allclose(_mean_recent_H(H, -1, 2),
-                               _mean_recent_H(H, 5, 2))
-    np.testing.assert_allclose(_mean_recent_H(H, -1, 2), H[4:6].mean(axis=0))
-
-
-# ---------------------------------------------------------------------------
-# 4. Defaults-identity: the default kwargs reproduce the current mask pipeline.
+# 3. Defaults-identity: the default kwargs reproduce the current mask pipeline.
 # ---------------------------------------------------------------------------
 def test_defaults_identity():
     rng = np.random.RandomState(1)
@@ -110,16 +92,14 @@ def test_defaults_identity():
     Y, X = _subgrid_coords(ny, nx, os_)
     mask_nat = rng.rand(ny, nx) > 0.6
     sm = _smooth_ice_mask(mask_nat, Y, X, 2.0)
-    # min_ice_cells default (0) leaves the smoothed mask untouched, and
-    # ice_time_avg default (1) is the frame-i identity -> the whole default path
-    # equals today's _smooth_ice_mask output.
+    # min_ice_cells default (0) leaves the smoothed mask untouched -> the whole
+    # default path equals today's _smooth_ice_mask output.
+    # gate: the ice_time_avg identity check went with the knob (removed 0.10.0)
     np.testing.assert_array_equal(_clean_ice_mask(sm, 0, os_), sm)
-    H = rng.rand(5, ny, nx)
-    np.testing.assert_array_equal(_mean_recent_H(H, -1, 1), H[-1])
 
 
 # ---------------------------------------------------------------------------
-# 5. Figure-level smoke: landscape() accepts + renders the new kwargs.
+# 4. Figure-level smoke: landscape() accepts + renders the new kwargs.
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope='module')
 def _iced_model():
@@ -131,6 +111,11 @@ def _iced_model():
         D=1e-3, seed=7, boundary_status=['fixed_value'] * 4,
         initial_max_elevation=800, noise_amplitude=10, mode='C',
         flow_routing='single', progress_bar=False,
+        # The display heuristics below (ribbon/apron contrast factor 2.0) were
+        # calibrated on the cell closure; under the branch default
+        # closure_flux='transect_min' the contrast lands at 1.99x (a 0.6 % miss),
+        # so pin the closure this fixture was tuned for (branch closure-transect-flux).
+        closure_flux='cell',
     )
     m = siim2d(cfg)
     m.run()
@@ -139,13 +124,14 @@ def _iced_model():
 
 def test_landscape_accepts_new_kwargs(_iced_model):
     m = _iced_model
-    # cells + field smoothing + cleanup + time-average.
+    # gate: ice_time_avg removed (0.10.0); the smoke keeps the other knobs
+    # cells + field smoothing + cleanup.
     m.plot.landscape(field='bedrock+ice', ice_extent='cells',
                      ice_smoothing='field', H_threshold=20.0,
-                     min_ice_cells=2, ice_time_avg=2, i=-1, colorbar=False)
-    # footprint + cleanup + time-average (field smoothing not allowed here).
+                     min_ice_cells=2, i=-1, colorbar=False)
+    # footprint + cleanup (field smoothing not allowed here).
     m.plot.landscape(field='bedrock+ice', ice_extent='footprint',
-                     min_ice_cells=2, ice_time_avg=2, i=-1, colorbar=False)
+                     min_ice_cells=2, i=-1, colorbar=False)
     plt.close('all')
 
 
@@ -153,8 +139,8 @@ def test_landscape_field_footprint_raises(_iced_model):
     with pytest.raises(ValueError, match="ice_smoothing='field'"):
         _iced_model.plot.landscape(field='bedrock+ice', ice_extent='footprint',
                                    ice_smoothing='field', i=-1)
-    with pytest.raises(ValueError, match="ice_time_avg"):
-        _iced_model.plot.landscape(field='bedrock+ice', ice_time_avg=0, i=-1)
+    # gate: the ice_time_avg >= 1 check went with the knob (removed 0.10.0);
+    # test_plotting_review pins the refusal that replaced it
     plt.close('all')
 
 
@@ -169,63 +155,70 @@ def test_style_preset_resolution():
     style-differentiated knob resolves per style when left None; an explicit
     value always wins. H_threshold resolves to 0 under BOTH styles (Eric,
     2026-09-03: the veil fades thin ice out, so a thickness gate only deletes
-    real glacierets) — area_threshold still splits them; trunk_display splits
-    them too (smooth fills the resolved trunks as ribbons, raw draws none).
+    real glacierets) — area_threshold still splits them. trunk_display
+    resolves to 'none' under BOTH (Eric, 2026-11-05: ribbons off). Smooth's
+    ice_sigma_cells is half the oversample (Eric, 2026-11-06).
     Args/return order: (field, H_threshold,
-    ice_sigma_cells, ice_time_avg, sigma_cells, oversample, hillshade,
+    ice_sigma_cells, sigma_cells, oversample, hillshade,
     ice_extent, show_margin, area_threshold, contour_interval, ice_shading,
     trunk_display)."""
     from siim.plotting.landscape import _resolve_style
+    # gate: ice_time_avg (always resolved to 1) left the args and the
+    # resolved tuple with the knob (removed 0.10.0); smooth's trunk_display
+    # resolves to 'none' (ribbons off, Eric 2026-11-05); every other value as before
     # smooth: bed AND ice, hillshaded, supersampled, footprint width, NOTHING
     # hidden by thickness, no area gate, contours at 100, margin on, veiled ice.
     assert _resolve_style(
         'smooth', None, None, None, None, None, None, None, None, None,
-        None, None) == (
-        'bedrock+ice', 0.0, 2.0, 1, 4.0, 4, True, 'footprint', True, 0.0,
-        100.0, 'veil', 'ribbons')
+        None) == (
+        'bedrock+ice', 0.0, 2.0, 4.0, 4, True, 'footprint', True, 0.0,
+        100.0, 'veil', 'none')
     # raw: bed AND ice, everything stripped — no smoothing, no hillshade, no
     # margin outline, no contours, one pixel per cell, cells drawn directly,
     # flat ice, and small-catchment specks dropped by the 1e6 m^2 area gate.
     assert _resolve_style(
         'raw', None, None, None, None, None, None, None, None, None,
-        None, None) == (
-        'bedrock+ice', 0.0, 0.0, 1, 0.0, 1, False, 'cells', False, 1e6, 0.0,
+        None) == (
+        'bedrock+ice', 0.0, 0.0, 0.0, 1, False, 'cells', False, 1e6, 0.0,
         'flat', 'none')
     # explicit values override the preset, including explicit field / zeros / False
     assert _resolve_style(
-        'smooth', 'bedrock+lakes', 20.0, 0, 1, 0.0, 2, False, 'cells', False,
+        'smooth', 'bedrock+lakes', 20.0, 0, 0.0, 2, False, 'cells', False,
         5e5, 50.0, 'flat', 'none') == (
-        'bedrock+lakes', 20.0, 0, 1, 0.0, 2, False, 'cells', False, 5e5, 50.0,
+        'bedrock+lakes', 20.0, 0, 0.0, 2, False, 'cells', False, 5e5, 50.0,
         'flat', 'none')
     # raw with explicit field/hillshade/oversample/margin kept; area_threshold,
     # contour_interval, ice_shading and trunk_display left None still resolve
     # to the raw preset (1e6, off, flat, no ribbons)
     assert _resolve_style(
-        'raw', 'bedrock', None, None, None, None, 4, True, None, True,
+        'raw', 'bedrock', None, None, None, 4, True, None, True,
         None, None) == (
-        'bedrock', 0.0, 0.0, 1, 0.0, 4, True, 'cells', True, 1e6, 0.0, 'flat',
+        'bedrock', 0.0, 0.0, 0.0, 4, True, 'cells', True, 1e6, 0.0, 'flat',
         'none')
+    # gate: smooth's ice_sigma_cells follows half the oversample (Eric,
+    # 2026-11-06): 1.0 at oversample 2, the same half-cell outline smoothing in
+    # model cells as 2.0 at the default 4 (was a fixed 2.0)
     assert _resolve_style(
-        'smooth', None, None, None, None, None, 2, None, None, None,
+        'smooth', None, None, None, None, 2, None, None, None,
         None, None) == (
-        'bedrock+ice', 0.0, 2.0, 1, 2.0, 2, True, 'footprint', True, 0.0,
-        100.0, 'veil', 'ribbons')
+        'bedrock+ice', 0.0, 1.0, 2.0, 2, True, 'footprint', True, 0.0,
+        100.0, 'veil', 'none')
     # ...and H_threshold stays fully functional as an explicit knob.
     assert _resolve_style(
         'smooth', None, 100.0, None, None, None, None, None, None, None,
-        None, None)[1] == 100.0
+        None)[1] == 100.0
     with pytest.raises(ValueError, match="style"):
         _resolve_style(
             'shiny', None, None, None, None, None, None, None, None, None,
-            None, None)
+            None)
     with pytest.raises(ValueError, match="ice_shading"):
         _resolve_style(
             'smooth', None, None, None, None, None, None, None, None, None,
-            None, None, 'frosted')
+            None, 'frosted')
     with pytest.raises(ValueError, match="trunk_display"):
         _resolve_style(
             'smooth', None, None, None, None, None, None, None, None, None,
-            None, None, None, 'streaks')
+            None, None, 'streaks')
 
 
 def test_landscape_style_smoke(_iced_model):
@@ -296,8 +289,9 @@ def test_default_landscape_draws_ice(_iced_model):
 def test_veil_is_depth_graded_and_translucent(_iced_model):
     """style='smooth' shades ice as a depth-graded translucent veil: the ramp
     colour at the column's depth, alpha-blended over the terrain so thin apron
-    ice lets the bed read through. Deep ice (t >= 0.40) is fully opaque, so it
-    lands exactly on the ramp; thin ice must be a strict blend of both."""
+    ice lets the bed read through. Ice at least ``ice_opaque_depth`` deep
+    (default 100 m) is fully opaque, so it lands exactly on the ramp; thin ice
+    must be a strict blend of both."""
     from siim.plotting._render import _ice_ramp
     m = _iced_model
     i = -1
@@ -305,7 +299,7 @@ def test_veil_is_depth_graded_and_translucent(_iced_model):
     H0, z0 = m.H_out[i].copy(), m.z_out[i].copy()
     try:
         H = np.zeros_like(zb)
-        H[5:10, 5:25] = 100.0                          # thin: t = 0.1
+        H[5:10, 5:25] = 20.0                           # thin: t = 0.02 (a 30 m column)
         H[15:20, 5:25] = 1000.0                        # thick: t = 1
         m.H_out[i] = H
         m.z_out[i] = zb + m.hc_over_H * H
@@ -321,7 +315,8 @@ def test_veil_is_depth_graded_and_translucent(_iced_model):
         ramp = _ice_ramp()
         thin, thick = rgb[7, 15], rgb[17, 15]
         np.testing.assert_allclose(thick, ramp(1.0)[:3], atol=1e-9)
-        assert not np.allclose(thin, ramp(0.1)[:3], atol=1e-3)   # translucent
+        # gate: the thin column moves under the 100 m opaque depth (2026-11-05)
+        assert not np.allclose(thin, ramp(0.02)[:3], atol=1e-3)  # translucent
         assert not np.allclose(thin, ICE_COLOR_RGB, atol=1e-3)   # not the flat fill
         assert not np.allclose(thin, thick, atol=1e-3)           # depth-graded
         # ...and 'flat' still stamps the one opaque ice_color (raw's shading).
@@ -375,7 +370,8 @@ def test_ice_labels_say_what_they_show(_iced_model):
     assert 'Ice column depth (m)' in labels
     assert 'Surface elevation (m)' in labels
     plt.close(fig)
-    assert FIELD_REGISTRY['ice'][2] == 'Mean ice thickness H̄ (m)'
+    # gate: the unicode H-bar crashed savefig under usetex (audit C9)
+    assert FIELD_REGISTRY['ice'][2] == r'Mean ice thickness $\bar{H}$ (m)'
     ax = m.plot.map(field='ice', i=-1)
     assert FIELD_REGISTRY['ice'][2] in [a.get_ylabel() for a in ax.figure.axes]
     plt.close('all')
@@ -523,17 +519,89 @@ def test_trunk_ribbons_cross_a_looped_seam():
     assert cut[j_mid, 0] > 0 and cut[j_mid, -1] == 0      # the far side is lost
 
 
+def _bar_extends(fig):
+    """``{colorbar label: extend}`` of a landscape figure."""
+    return {a.get_ylabel(): a._colorbar.extend for a in fig.axes
+            if getattr(a, '_colorbar', None) is not None}
+
+
+def test_ice_colorbar_arrows_where_the_drawn_depth_saturates(_iced_model):
+    """The ice bar gets an arrow where the drawn column depth runs past its
+    H_max, as the bed bar does at z_min/z_max (Eric, 2026-11-05): none at the
+    default run-global H_max, 'max' under a shallower explicit one, an
+    explicit extend_ice wins, and a movie decides it once."""
+    from siim.plotting.landscape import _frozen_scale_kwargs
+    m = _iced_model
+    for kw, want in ((dict(), 'neither'), (dict(H_max=10.0), 'max'),
+                     (dict(H_max=10.0, extend_ice='neither'), 'neither')):
+        fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, **kw)
+        assert _bar_extends(fig)['Ice column depth (m)'] == want, kw
+        plt.close(fig)
+    with pytest.raises(ValueError, match='extend_ice'):
+        m.plot.landscape(field='bedrock+ice', i=-1, extend_ice='up')
+    assert _frozen_scale_kwargs(m, dict(field='bedrock+ice'))['extend_ice'] == 'neither'
+    assert _frozen_scale_kwargs(m, dict(field='bedrock+ice', H_max=10.0))['extend_ice'] == 'max'
+    # a one-frame movie decides exactly as the still does, at both ends
+    last = len(m.output_times) - 1
+    for kw in (dict(), dict(H_max=10.0), dict(H_min=20.0), dict(H_min=20.0, H_max=10.0)):
+        fig, _ = m.plot.landscape(field='bedrock+ice', i=last, **kw)
+        still = _bar_extends(fig)['Ice column depth (m)']
+        plt.close(fig)
+        frozen = _frozen_scale_kwargs(m, dict(field='bedrock+ice', **kw), [last])['extend_ice']
+        assert frozen == still, kw
+
+
+def test_section_panel_is_sized_for_its_vertical_exaggeration(_iced_model):
+    """The section panel's height gives it section_ve (default 4) over its
+    z_min..z_max range, clamped to 0.8-2.6 in; the panel prints the VE it
+    actually got, so a clamped one says so (Eric, 2026-11-05)."""
+    m = _iced_model
+
+    def ve_label(**kw):
+        fig, _ = m.plot.landscape(field='bedrock+ice', i=-1, cross_section=15.0, **kw)
+        cs = [a for a in fig.axes if any(t.get_text().startswith('VE') for t in a.texts)]
+        assert len(cs) == 1, "test setup: one section panel"
+        text = [t.get_text() for t in cs[0].texts if t.get_text().startswith('VE')][0]
+        height = cs[0].get_position().height * fig.get_figheight()
+        plt.close(fig)
+        return text, height
+
+    text, height = ve_label()
+    assert 0.8 < height < 2.6, "test setup: the default panel must not be clamped"
+    assert text == 'VE 4$\\times$'
+    text, height = ve_label(section_ve=40.0)
+    assert height == pytest.approx(2.6) and text != 'VE 40$\\times$'   # clamped, and says so
+    with pytest.raises(ValueError, match='section_ve'):
+        m.plot.landscape(field='bedrock+ice', i=-1, cross_section=15.0, section_ve=0.0)
+
+
 def test_veil_ramp_is_linear_and_keeps_thin_ice_subordinate():
-    """The veil opacity is a LINEAR ramp topping out at t = 0.35. The old
-    sqrt(t/0.40) front-loading made a 30 m column half-opaque, so an apron of
-    sub-resolution ice read as one sheet with the trunks barely darker."""
-    from siim.plotting.landscape import _veil_alpha
-    t = np.array([0.0, 0.05, 0.175, 0.35, 0.7, 1.0])
-    a = _veil_alpha(t)
-    np.testing.assert_allclose(
-        a, [0.12, 0.12 + 0.88 * 0.05 / 0.35, 0.56, 1.0, 1.0, 1.0], atol=1e-12)
-    old_sqrt = 0.18 + 0.82 * np.sqrt(0.05 / 0.40)
-    assert a[1] < old_sqrt - 0.2            # thin ice much more see-through
+    """The veil opacity is set by ABSOLUTE column depth (a straight line at
+    sharpness 1, the shipped S-curve at 2), 0 at no ice and
+    opaque from ``opaque_depth`` down, with no floor: a few metres of ice no
+    longer tint the terrain, and the ramp does not stretch with the run's
+    H_max (kilometres on a sheet run). The shipped S-curve (sharpness 2)
+    fades thin ice further, is 50 % at half ``opaque_depth`` (100 m) and
+    eases into full opacity there."""
+    import inspect
+    from siim.plotting.landscape import LandscapeMixin, _veil_alpha
+    depth = np.array([0.0, 3.0, 30.0, 150.0, 300.0, 600.0])
+    # gate: opacity by absolute depth (Eric, 2026-11-05), replacing the
+    # 0.12-floored ramp on depth / H_max; then an S-curve, sharpness 2,
+    # opaque at 100 m
+    a = _veil_alpha(depth, 300.0)
+    np.testing.assert_allclose(a, [0.0, 0.01, 0.1, 0.5, 1.0, 1.0], atol=1e-12)
+    assert a[1] < 0.12 - 0.1                # 3 m: far below the old floor
+    params = inspect.signature(LandscapeMixin.landscape).parameters
+    opaque, k = params['ice_opaque_depth'].default, params['ice_alpha_sharpness'].default
+    assert (opaque, k) == (100.0, 2.0)
+    d = np.array([10.0, 20.0, 50.0, 80.0, 100.0, 150.0])
+    np.testing.assert_allclose(_veil_alpha(d, opaque, k),
+                               [1 / 82, 1 / 17, 0.5, 16 / 17, 1.0, 1.0], atol=1e-12)
+    assert _veil_alpha(20.0, opaque, k) < 0.06                   # 20 m: under 6 %
+    d = np.linspace(0.0, opaque, 41)                            # symmetric about half depth
+    np.testing.assert_allclose(_veil_alpha(d, opaque, k) + _veil_alpha(opaque - d, opaque, k),
+                               1.0, atol=1e-12)
 
 
 def test_trunk_display_none_is_the_plain_veil(_iced_model, monkeypatch):
@@ -554,15 +622,18 @@ def test_trunk_display_none_is_the_plain_veil(_iced_model, monkeypatch):
     base = raster(trunk_display='none')
     np.testing.assert_array_equal(base, raster(
         trunk_display='none', trunk_alpha=0.2, trunk_width_cells=0.1))
-    np.testing.assert_array_equal(base, raster(trunk_width_cells=1e6))
-    assert not np.allclose(base, raster())          # ribbons ARE the default
+    # gate: ribbons are opt-in (Eric, 2026-11-05), so the default IS the plain veil
+    np.testing.assert_array_equal(base, raster())
+    np.testing.assert_array_equal(base, raster(trunk_display='ribbons',
+                                               trunk_width_cells=1e6))
+    assert not np.allclose(base, raster(trunk_display='ribbons'))
 
     def boom(*args, **kwargs):
         raise AssertionError('the ribbon machinery ran on a no-trunk path')
 
     monkeypatch.setattr(landscape_mod, '_trunk_ribbons', boom)
     monkeypatch.setattr(landscape_mod, '_channel_closure', boom)
-    raster(trunk_display='none')
+    raster()                                        # the default: 'none'
     m.plot.landscape(i=-1, style='raw', colorbar=False)
     plt.close('all')
 
@@ -571,9 +642,7 @@ def test_ribbons_separate_the_trunks_from_the_apron(_iced_model):
     """The point of the look: the resolved trunks stop reading as slightly
     darker streaks in a uniform veil. Measured as the mean RGB distance
     between trunk and apron pixels (the veil-only render scored 0.13 against
-    0.67 for apron-vs-bare on the reference run). Under ribbons the margin
-    outlines the RIBBONS only, so a frame with no resolved trunk draws no
-    outline at all rather than ringing every glacieret."""
+    0.67 for apron-vs-bare on the reference run)."""
     from siim.plotting._render import (_channel_closure, _trunk_ribbons,
                                        _footprint_ice_surface, _smooth_ice_mask)
     m = _iced_model
@@ -597,14 +666,26 @@ def test_ribbons_separate_the_trunks_from_the_apron(_iced_model):
     assert trunk.any() and apron.any()
 
     def contrast(**kw):
+        # gate: the 2.0 factor was calibrated on the gist_earth bed, which shows
+        # through the translucent apron; pinned when the default bed map became
+        # the trimmed turku (Phase C, 2026-11-05), where it measures 1.97x.
         fig, ax = m.plot.landscape(i=i, colorbar=False, z_min=0.0,
-                                   z_max=1500.0, **kw)
+                                   z_max=1500.0, cmap_bed='gist_earth', **kw)
         img = np.asarray(ax.get_images()[0].get_array(), dtype=float)
         d = float(np.linalg.norm(img[trunk].mean(0) - img[apron].mean(0)))
         plt.close(fig)
         return d
 
-    assert contrast() > 2.0 * contrast(trunk_display='none')
+    # gate: the outline asserts moved to test_ribbons_outline_the_margin,
+    # unmarked; ribbons are opt-in since 2026-11-05, so asked for explicitly
+    assert contrast(trunk_display='ribbons') > 2.0 * contrast(trunk_display='none')
+
+
+def test_ribbons_outline_the_margin(_iced_model):
+    """Under ribbons the margin outlines the RIBBONS only, so a frame with no
+    resolved trunk draws no outline at all rather than ringing every
+    glacieret."""
+    m, i = _iced_model, -1
 
     def n_outlines(**kw):
         fig, ax = m.plot.landscape(i=i, colorbar=False, contour_interval=0,
@@ -613,6 +694,8 @@ def test_ribbons_separate_the_trunks_from_the_apron(_iced_model):
         plt.close(fig)
         return n
 
+    # gate: ribbons are opt-in since 2026-11-05, so asked for explicitly
     assert n_outlines(trunk_display='none') == 1     # the veil is outlined
-    assert n_outlines() == 1                         # ...the ribbons are
-    assert n_outlines(trunk_width_cells=1e6) == 0    # ...the veil is NOT
+    assert n_outlines(trunk_display='ribbons') == 1  # ...the ribbons are
+    assert n_outlines(trunk_display='ribbons',
+                      trunk_width_cells=1e6) == 0    # ...the veil is NOT

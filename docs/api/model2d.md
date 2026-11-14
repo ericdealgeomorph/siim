@@ -9,7 +9,7 @@ The constructor accepts a parameter dictionary; see
 .. automodule:: siim.siim2d
 
 .. autoclass:: siim.siim2d.siim
-   :members: run, save, load, extract_channel, strahler_order
+   :members: run, save, load, ice_speed, extract_channel, strahler_order
    :show-inheritance:
 
 .. autofunction:: siim.siim2d.load

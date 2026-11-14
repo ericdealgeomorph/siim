@@ -17,9 +17,11 @@ from ..constants import (BL as _BL, FLOTATION_GATE as _FLOT_GATE,
 from .solvers import _modeb_closure
 from .eroders import (_erode_modeb_sfr, _erode_modeb_dinf,
                       _erode_modeb_sfr_levels, _erode_modeb_dinf_levels,
+                      _erode_modeb_eff, _erode_modeb_eff_levels,
                       _modeb_border_erosion)
 from .diffusion import _diffuse_H_2d
-from .routing import _priority_flood_eps, _levels_sfr, _levels_dinf
+from .routing import (_priority_flood_eps, _levels_sfr, _levels_dinf,
+                      gamma_scaled_lengths)
 
 
 @numba.njit(cache=True)
@@ -86,9 +88,10 @@ def _implicit_border_step(zb0, U, E, dt, H, hc_over_H, bl, ramp):
 def _lake_fill_sfr_2d(z_flat, stack, rec):
     """In-place monotone fill: walk stack outlet-first; any cell below its
     receiver gets raised to receiver level. The 2D analog of lake_fill_1d —
-    relies on the basin-corrected receivers from fastscape's flowrouting
-    (lake-interior cells point toward the spillway), so this single pass
-    fills closed depressions to the spillway elevation. Boundary cells
+    relies on the in-house D8 receivers, routed on the eps-filled surface
+    (:func:`siim._core.step.route_d8`; lake-interior cells point toward the
+    spillway), so this single pass fills closed depressions to the spillway
+    elevation. Boundary cells
     (rec == self) are untouched.
     """
     for inode in stack:
@@ -147,7 +150,8 @@ def _glac_fast_solve_modeA_sfr(z_flat, ice_flux, water_flux, H_flat, law_code, p
     lengths : ndarray
         Distance from each node to its receiver (m).
     stack : ndarray
-        Topological sort (upstream → downstream).
+        Topological sort, outlet-first (downstream → upstream: each receiver
+        precedes its donors).
     rec : ndarray
         Receiver indices.
     """
@@ -241,7 +245,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
                                ny, nx, dx_cell, dy_cell, border_bed_uplift,
                                bl=_BL, gate=_FLOT_GATE, ramp=_FLOT_RAMP,
                                wrap_y=False, wrap_x=False,
-                               parallel_erode=False):
+                               parallel_erode=False, hc_cell=None):
     """SFR + mode B (zb-tracking joint walk + lake-fill), law-agnostic skeleton.
 
     One ``@njit(cache=True)`` kernel for all three sliding laws; the per-law
@@ -277,7 +281,8 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
     H_flat : ndarray
         Ice thickness; previous-step value on input, MODIFIED IN PLACE.
     surface_out : ndarray
-        Filled with zb + hc_over_H*H_new (the new ice surface) on return.
+        Filled with zb + hcc*H_new (the new ice surface; hcc = the per-cell
+        datum, ``hc_over_H`` everywhere unless ``hc_cell`` is given) on return.
     law_code : int
         ``LAW_EFFEXP`` / ``LAW_POWER`` / ``LAW_COULOMB`` (see _core.solvers).
     p : GlacialParams
@@ -319,6 +324,16 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
     """
     Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p, lambda_c, tau_c, coulomb_clamp, rho_g_g, hc_over_H, D_H = p
     nn = zb_flat.shape[0]
+    # Per-cell channel-floor datum (mode D's valley <-> sheet map, constants.
+    # HC_SHEET): hcc[i]*H is the ice column every surface below is built
+    # from. None = the run's scalar everywhere (hcc[i] == hc_over_H bit-for-bit).
+    # lazy: one nn-float fill per call outside mode D (~1-2 ms at 1000^2,
+    # beside this kernel's own nn allocations); upgrade path: a per-run scratch
+    # handed down from run_modeB_kernel.
+    if hc_cell is None:
+        hcc = np.full(nn, hc_over_H)
+    else:
+        hcc = hc_cell
 
     # --- 0a. Per-node water datum: ``bl`` carries each base-level BORDER
     # node's own side datum (a scalar broadcasts to the uniform field, so the
@@ -369,15 +384,16 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
             if L <= 0.0:
                 H_flat[inode] = 0.0
                 continue
-            zs_r = zb_flat[r] + hc_over_H * H_flat[r]
+            zs_r = zb_flat[r] + hcc[r] * H_flat[r]
             a = zb_flat[inode] - zs_r
             H_flat[inode] = _modeb_closure(
-                law_code, False, a, ice_flux[inode], L, hc_over_H,
+                law_code, False, a, ice_flux[inode], L, hcc[inode],
                 cg, lambda_p, lambda_c, tau_c, rho_g_g, coulomb_clamp)
         if any_icy_border:
             for i in range(nn):
-                if rec[i] == i and ice_flux[i] > 0.0 and dom[i] >= 0:
-                    H_flat[i] = H_flat[dom[i]]      # zero-gradient thickness
+                if rec[i] == i and ice_flux[i] > 0.0:
+                    # zero-gradient thickness; 0 with no icy donor (the 1D twin; audit #14)
+                    H_flat[i] = H_flat[dom[i]] if dom[i] >= 0 else 0.0
 
     # --- 1b. Pre-diffusion H scrub: heal negative/NaN H from Newton edge cases
     # BEFORE diffusion, so one bad cell can't spread through the 5-point stencil
@@ -397,7 +413,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
         if ice_flux[i] <= 0.0 or H_flat[i] < 0.0 or H_flat[i] != H_flat[i]:
             H_flat[i] = 0.0
 
-    # --- 3. Build z' = zb + hc_over_H*H and lake-fill in place via stack walk.
+    # --- 3. Build z' = zb + hcc*H and lake-fill in place via stack walk.
     # An ICE-FREE border presents the WATER LINE max(.., bl) BEFORE the fill
     # (rho_i = rho_w: a still-water border below the datum is open water), so
     # the fill propagates the waterline across the submerged connected reach —
@@ -407,7 +423,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
     # the real border surface, not to bl. ---
     z_filled = np.empty(nn)
     for i in range(nn):
-        z_filled[i] = zb_flat[i] + hc_over_H * H_flat[i]
+        z_filled[i] = zb_flat[i] + hcc[i] * H_flat[i]
         if rec[i] == i and H_flat[i] <= 0.0 and z_filled[i] < bl_node[i]:
             z_filled[i] = bl_node[i]
     _lake_fill_sfr_2d(z_filled, stack, rec)
@@ -441,8 +457,8 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
         delta = z_pre[i] - z_filled[i]
         if delta > 0.0:
             if gate and H_flat[i] > 0.0:
-                f = _flot_factor(zb_flat[i] + hc_over_H * H_flat[i],
-                                 H_flat[i], bl_node[i], hc_over_H, ramp)
+                f = _flot_factor(zb_flat[i] + hcc[i] * H_flat[i],
+                                 H_flat[i], bl_node[i], hcc[i], ramp)
                 if f <= 0.0:
                     continue
                 delta *= f
@@ -470,8 +486,8 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
             if d >= 0:
                 d2 = dom[d]
                 if d2 >= 0 and lengths[d2] > 0.0:
-                    s = (zb_flat[d2] + hc_over_H * H_flat[d2]
-                         - zb_flat[d] - hc_over_H * H_flat[d]) / lengths[d2]
+                    s = (zb_flat[d2] + hcc[d2] * H_flat[d2]
+                         - zb_flat[d] - hcc[d] * H_flat[d]) / lengths[d2]
                     if s > S_arr:
                         S_arr = s
             E = _modeb_border_erosion(law_code, ice_flux[i], S_arr,
@@ -480,25 +496,25 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
             if gate:
                 zb_flat[i] = _implicit_border_step(
                     zb_flat[i], border_bed_uplift[i], E, dt,
-                    H_flat[i], hc_over_H, bl_node[i], ramp)
+                    H_flat[i], hcc[i], bl_node[i], ramp)
             else:                    # unbounded control (diagnostics only)
                 zb_flat[i] += (border_bed_uplift[i] - E) * dt
         elif zb_flat[i] < bl_node[i]:
             zb_flat[i] = min(zb_flat[i] + border_bed_uplift[i] * dt,
                              bl_node[i])
 
-    # --- 6. Output surface = zb + hc_over_H*H — the TRUE state everywhere: a relict
+    # --- 6. Output surface = zb + hcc*H — the TRUE state everywhere: a relict
     # drowned border bed shows through below bl, an icy through-flowing (outflow)
     # border stands at its true surface, and interior trough cells present their
     # drowned bed (mass balance melts at the real deep elevation, ice flux dies
     # crossing an empty trough). The ice-free-border floor + lake fill live ONLY
     # in the erosion working view (steps 3-4); water is a display layer at bl. ---
     for i in range(nn):
-        surface_out[i] = zb_flat[i] + hc_over_H * H_flat[i]
+        surface_out[i] = zb_flat[i] + hcc[i] * H_flat[i]
 
 @numba.njit(cache=True)
 def _dinf_modeB_recv(zb_flat, H_flat, inode, nb_receivers, receivers,
-                     weights, lengths, hc_over_H):
+                     weights, lengths, hcc):
     """Effective receiver for the joint walk: a = zb_i − Z̄ and L̄ from the
     weighted receiver surfaces (receivers already solved — stack order).
     Returns (a, L_eff, ok)."""
@@ -510,7 +526,7 @@ def _dinf_modeB_recv(zb_flat, H_flat, inode, nb_receivers, receivers,
         w = weights[inode, k]
         if L <= 0.0 or w <= 0.0 or r == inode:
             continue
-        zs_r = zb_flat[r] + hc_over_H * H_flat[r]
+        zs_r = zb_flat[r] + hcc[r] * H_flat[r]
         A += w / L
         B += w * zs_r / L
     if A <= 0.0:
@@ -519,9 +535,9 @@ def _dinf_modeB_recv(zb_flat, H_flat, inode, nb_receivers, receivers,
     return zb_flat[inode] - B * L_eff, L_eff, True
 
 @numba.njit(cache=True)
-def _dinf_modeB_filled_view(zb_flat, H_flat, receivers, hc_over_H, ny, nx,
+def _dinf_modeB_filled_view(zb_flat, H_flat, receivers, hcc, ny, nx,
                             wrap_y, wrap_x, bl_node):
-    """Erosion working view: z' = zb + hc_over_H*H with ICE-FREE borders floored
+    """Erosion working view: z' = zb + hcc*H with ICE-FREE borders floored
     at their own water line ``bl_node[i]``, depression-filled by the flat
     (eps = 0) priority flood
     seeded at the borders — the 2D generalization of the SFR lake-fill stack
@@ -531,7 +547,7 @@ def _dinf_modeB_filled_view(zb_flat, H_flat, receivers, hc_over_H, ny, nx,
     z_raw = np.empty(nn)
     interior = np.empty(nn, dtype=np.int8)
     for i in range(nn):
-        z_raw[i] = zb_flat[i] + hc_over_H * H_flat[i]
+        z_raw[i] = zb_flat[i] + hcc[i] * H_flat[i]
         if receivers[i, 0] == i:
             interior[i] = 0
             if H_flat[i] <= 0.0 and z_raw[i] < bl_node[i]:
@@ -551,7 +567,8 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
                                 ny, nx, dx_cell, dy_cell,
                                 border_bed_uplift, wrap_y, wrap_x,
                                 bl=_BL, gate=_FLOT_GATE, ramp=_FLOT_RAMP,
-                                parallel_erode=False):
+                                parallel_erode=False, slope_normalise=False,
+                                hc_cell=None):
     """D-inf + mode B, law-agnostic skeleton.
 
     The D-inf twin of :func:`_glac_fast_solve_modeB_sfr` and the routing twin of
@@ -578,9 +595,45 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
     the SFR twin).
     ``parallel_erode``: level-scheduled parallel erosion step,
     bit-for-bit with the serial eroder (see the SFR twin). Default False.
+
+    ``slope_normalise`` (kernel default False; the facades pass the
+    router-derived value, see
+    ``siim._core.router.SLOPE_NORMALISED_ROUTERS``): divide every effective
+    slope by the per-cell ``gamma = |sum_k w_k*e_k|``, applied as gamma-scaled
+    link lengths (:func:`siim._core.routing.gamma_scaled_lengths`). The CLOSURE
+    reduction and the EROSION step both read the scaled array, so thickness and
+    erosion see the same effective slope -- and erosion switches to the
+    EFFECTIVE-RECEIVER eroders (:func:`siim._core.eroders._erode_modeb_eff`),
+    which collapse the fan to the closure's own ``(Z̄, L̄_eff = gamma*L̄)``;
+    scaled lengths alone would be exact only at residual exponent 1 (Jensen; see
+    the eroders block comment). The step-5b border budget deliberately keeps the
+    RAW lengths, because its arrival slope is a single donor-to-donor EDGE, not
+    a multi-receiver reduction, and gamma is not defined for it. Router-gated
+    by :data:`siim._core.router.SLOPE_NORMALISED_ROUTERS`: on by default for
+    every multi-receiver router (D-inf since 2026-09-05, and MFD), off for SFR,
+    where gamma == 1 identically. See ``constants.MFD_GAMMA_FLOOR``.
     """
     Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p, lambda_c, tau_c, coulomb_clamp, rho_g_g, hc_over_H, D_H = p
     nn = zb_flat.shape[0]
+    # Per-cell channel-floor datum (mode D's valley <-> sheet map, constants.
+    # HC_SHEET): hcc[i]*H is the ice column every surface below is built
+    # from. None = the run's scalar everywhere (hcc[i] == hc_over_H bit-for-bit).
+    # lazy: one nn-float fill per call outside mode D (~1-2 ms at 1000^2,
+    # beside this kernel's own nn allocations); upgrade path: a per-run scratch
+    # handed down from run_modeB_kernel.
+    if hc_cell is None:
+        hcc = np.full(nn, hc_over_H)
+    else:
+        hcc = hc_cell
+
+    # Effective-slope normalisation: one (n, k) scaled-length array per step,
+    # shared by the closure reduction (step 1) and the eroders (step 4).
+    if slope_normalise:
+        lengths_s = gamma_scaled_lengths(receivers, weights, nb_receivers,
+                                         lengths, ny, nx, dx_cell, dy_cell,
+                                         wrap_y, wrap_x)
+    else:
+        lengths_s = lengths
 
     # --- 0a. Per-node water datum (see the SFR twin): border nodes carry their
     # own side's datum, interior nodes inherit their basin OUTLET's. The D-inf
@@ -637,17 +690,19 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
                 H_flat[inode] = 0.0
                 continue
             a, L_eff, ok = _dinf_modeB_recv(zb_flat, H_flat, inode, nb_receivers,
-                                            receivers, weights, lengths, hc_over_H)
+                                            receivers, weights, lengths_s,
+                                            hcc)
             if not ok:
                 H_flat[inode] = 0.0
                 continue
             H_flat[inode] = _modeb_closure(
-                law_code, False, a, ice_flux[inode], L_eff, hc_over_H,
+                law_code, False, a, ice_flux[inode], L_eff, hcc[inode],
                 cg, lambda_p, lambda_c, tau_c, rho_g_g, coulomb_clamp)
         if any_icy_border:
             for i in range(nn):
-                if receivers[i, 0] == i and ice_flux[i] > 0.0 and dom[i] >= 0:
-                    H_flat[i] = H_flat[dom[i]]      # zero-gradient thickness
+                if receivers[i, 0] == i and ice_flux[i] > 0.0:
+                    # zero-gradient thickness; 0 with no icy donor (as the SFR twin)
+                    H_flat[i] = H_flat[dom[i]] if dom[i] >= 0 else 0.0
 
     # --- 1b. pre-diffusion scrub: heal negative/NaN H before the stencil can
     # spread a bad cell (audit m18). ---
@@ -664,28 +719,47 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
             H_flat[i] = 0.0
 
     # --- 3. filled erosion view ---
-    z_filled = _dinf_modeB_filled_view(zb_flat, H_flat, receivers, hc_over_H,
+    z_filled = _dinf_modeB_filled_view(zb_flat, H_flat, receivers, hcc,
                                        ny, nx, wrap_y, wrap_x, bl_node)
     z_pre = z_filled.copy()
 
-    # --- 4. erode the filled view in place (per-law D-inf dispatch; serial
-    # walk, or level-scheduled parallel under the parallel_erode toggle —
-    # bit-for-bit twins). ---
+    # --- 4. erode the filled view in place (per-law dispatch; serial walk, or
+    # level-scheduled parallel under the parallel_erode toggle — bit-for-bit
+    # twins). Under slope_normalise the EFFECTIVE-RECEIVER eroders run instead:
+    # the same single (Z̄, L̄_eff) the closure reduced to one step earlier, so
+    # thickness and erosion see the same normalised slope (scaled lengths alone
+    # would only be exact at residual exponent 1; see the eroders block
+    # comment). ---
     if parallel_erode:
         order, offsets, nlev = _levels_dinf(stack, nb_receivers, receivers)
-        _erode_modeb_dinf_levels(law_code, z_filled, z_pre, water_flux,
-                                 ice_flux, H_flat,
-                                 Ko, Co, ce, n, nu, m, mu, cg, alpha_g,
-                                 lambda_p, lambda_c, tau_c, coulomb_clamp,
-                                 rho_g_g, dt,
-                                 nb_receivers, receivers, weights, lengths,
-                                 order, offsets, nlev)
+        if slope_normalise:
+            _erode_modeb_eff_levels(law_code, z_filled, z_pre, water_flux,
+                                    ice_flux, H_flat,
+                                    Ko, Co, ce, n, nu, m, mu, cg, alpha_g,
+                                    lambda_p, lambda_c, tau_c, coulomb_clamp,
+                                    rho_g_g, dt,
+                                    nb_receivers, receivers, weights, lengths_s,
+                                    order, offsets, nlev)
+        else:
+            _erode_modeb_dinf_levels(law_code, z_filled, z_pre, water_flux,
+                                     ice_flux, H_flat,
+                                     Ko, Co, ce, n, nu, m, mu, cg, alpha_g,
+                                     lambda_p, lambda_c, tau_c, coulomb_clamp,
+                                     rho_g_g, dt,
+                                     nb_receivers, receivers, weights, lengths_s,
+                                     order, offsets, nlev)
+    elif slope_normalise:
+        _erode_modeb_eff(law_code, z_filled, z_pre, water_flux, ice_flux,
+                         H_flat,
+                         Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p,
+                         lambda_c, tau_c, coulomb_clamp, rho_g_g, dt,
+                         stack, nb_receivers, receivers, weights, lengths_s)
     else:
         _erode_modeb_dinf(law_code, z_filled, z_pre, water_flux, ice_flux,
                           H_flat,
                           Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p,
                           lambda_c, tau_c, coulomb_clamp, rho_g_g, dt,
-                          stack, nb_receivers, receivers, weights, lengths)
+                          stack, nb_receivers, receivers, weights, lengths_s)
 
     # --- 5. erosion delta to zb (flotation gate: scale icy interior cells by
     # the effective-pressure ramp f — f = 0 exactly for zs <= bl, no glacial
@@ -694,8 +768,8 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
         delta = z_pre[i] - z_filled[i]
         if delta > 0.0:
             if gate and H_flat[i] > 0.0:
-                f = _flot_factor(zb_flat[i] + hc_over_H * H_flat[i],
-                                 H_flat[i], bl_node[i], hc_over_H, ramp)
+                f = _flot_factor(zb_flat[i] + hcc[i] * H_flat[i],
+                                 H_flat[i], bl_node[i], hcc[i], ramp)
                 if f <= 0.0:
                     continue
                 delta *= f
@@ -706,7 +780,15 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
     # dominant donor's own upstream surface slope (one cell inside the border);
     # in D-inf the donor-to-dominant-donor edge length is looked up over the
     # inner donor's receivers. Closed-form implicit step, ramp-bounded at the
-    # flotation draft. ---
+    # flotation draft.
+    #
+    # RAW lengths on purpose, even under slope_normalise: this is one donor-side
+    # EDGE slope, not a multi-receiver reduction, so gamma is undefined for it
+    # (mfd_router_plan.md, amendment b). Consequence, measured: under a widely
+    # spreading router the dominant-donor chain can leave the border
+    # DIAGONALLY, so on a cardinal plane the arrival slope is G/sqrt(2) where D8
+    # sees G — the border column is the one place MFD does not reproduce the D8
+    # mode-B step (pinned by test_mfd_routing's a7 border arm). ---
     for i in range(nn):
         if receivers[i, 0] != i:
             continue
@@ -722,8 +804,8 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
                             L2 = lengths[d2, k]
                             break
                     if L2 > 0.0:
-                        s = (zb_flat[d2] + hc_over_H * H_flat[d2]
-                             - zb_flat[d] - hc_over_H * H_flat[d]) / L2
+                        s = (zb_flat[d2] + hcc[d2] * H_flat[d2]
+                             - zb_flat[d] - hcc[d] * H_flat[d]) / L2
                         if s > S_arr:
                             S_arr = s
             E = _modeb_border_erosion(law_code, ice_flux[i], S_arr,
@@ -732,7 +814,7 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
             if gate:
                 zb_flat[i] = _implicit_border_step(
                     zb_flat[i], border_bed_uplift[i], E, dt,
-                    H_flat[i], hc_over_H, bl_node[i], ramp)
+                    H_flat[i], hcc[i], bl_node[i], ramp)
             else:                    # unbounded control (diagnostics only)
                 zb_flat[i] += (border_bed_uplift[i] - E) * dt
         elif zb_flat[i] < bl_node[i]:
@@ -742,7 +824,7 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
     # --- 6. output surface = zb + hc_over_H*H, the TRUE state everywhere
     # (true-state output convention; see the SFR twin's step 6). ---
     for i in range(nn):
-        surface_out[i] = zb_flat[i] + hc_over_H * H_flat[i]
+        surface_out[i] = zb_flat[i] + hcc[i] * H_flat[i]
 
 
 @numba.njit(cache=True)

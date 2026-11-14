@@ -6,8 +6,111 @@ out of the fastscape-importing model is what lets the solver kernels import
 without the fastscape stack. The ``DinfFlowRouter`` xsimlab *process* that
 consumes them lives in :mod:`siim.fastscape.processes`. numpy/numba only.
 """
+import math
+
 import numpy as np
 import numba
+
+from ..constants import MFD_GAMMA_FLOOR as _GAMMA_FLOOR
+
+# =============================================================================
+# Effective-slope normalisation (multi-receiver routers)
+# =============================================================================
+
+@numba.njit(cache=True)
+def _recv_mean_direction(i, receivers, weights, nb_receivers, ny, nx, dx, dy,
+                         wrap_y, wrap_x):
+    """Flux-weighted mean receiver vector of cell ``i``: ``v = sum_k w_k*e_k``
+    over its active receivers, with ``e_k`` the WRAP-AWARE unit vector from i to
+    receiver k. Returns ``(vx, vy, gamma)`` with ``gamma = |v|``.
+
+    One definition, two consumers (see ``constants.MFD_GAMMA_FLOOR``):
+
+    * the transect closure orients its line perpendicular to ``v/gamma``
+      (:func:`siim._core.step._transect_flux_kernel`, which is where this block
+      lived and whose arithmetic it reproduces exactly);
+    * ``gamma`` is the effective-slope normalisation -- the multi-receiver
+      reduction ``sum_k w_k*(zs_i - zs_rk)/L_k`` equals ``g.v``, so dividing it
+      by ``gamma`` turns a projected gradient back into a gradient magnitude.
+
+    ``gamma == 0`` for a self-receiving border cell (its only link is skipped)
+    and for a cell whose receiver fan is exactly balanced. Single-receiver
+    routers have ``gamma == 1`` identically, so nothing they feed moves.
+    """
+    iy = i // nx
+    ix = i - iy * nx
+    Lx = nx * dx
+    Ly = ny * dy
+    vx = 0.0
+    vy = 0.0
+    for k in range(nb_receivers[i]):
+        r = receivers[i, k]
+        if r == i:
+            continue
+        ry = r // nx
+        rx = r - ry * nx
+        ddx = (rx - ix) * dx
+        ddy = (ry - iy) * dy
+        if wrap_x:
+            if ddx > 0.5 * Lx:
+                ddx -= Lx
+            elif ddx < -0.5 * Lx:
+                ddx += Lx
+        if wrap_y:
+            if ddy > 0.5 * Ly:
+                ddy -= Ly
+            elif ddy < -0.5 * Ly:
+                ddy += Ly
+        L = math.sqrt(ddx * ddx + ddy * ddy)
+        if L > 0.0:
+            vx += weights[i, k] * ddx / L
+            vy += weights[i, k] * ddy / L
+    return vx, vy, math.sqrt(vx * vx + vy * vy)
+
+
+@numba.njit(cache=True)
+def gamma_per_cell(receivers, weights, nb_receivers, ny, nx, dx, dy,
+                   wrap_y, wrap_x):
+    """Per-cell ``gamma = |sum_k w_k*e_k|``, UNFLOORED -- the diagnostic view
+    (probes report min gamma and the fraction of icy cells at the floor)."""
+    nn = ny * nx
+    out = np.empty(nn)
+    for i in range(nn):
+        _vx, _vy, g = _recv_mean_direction(i, receivers, weights, nb_receivers,
+                                           ny, nx, dx, dy, wrap_y, wrap_x)
+        out[i] = g
+    return out
+
+
+@numba.njit(cache=True)
+def gamma_scaled_lengths(receivers, weights, nb_receivers, lengths, ny, nx,
+                         dx, dy, wrap_y, wrap_x):
+    """Per-cell scaled link lengths ``L_eff[i, k] = gamma_i * L[i, k]``, with
+    ``gamma_i`` floored at ``constants.MFD_GAMMA_FLOOR``.
+
+    This is how the effective-slope normalisation is applied: every consumer
+    that reads ``lengths`` as a slope denominator gets ``S/gamma`` for free, so
+    the thickness closure and the eroders see the SAME effective slope. In the
+    closure reduction (:func:`siim._core.skeleton._dinf_modeB_recv`) it gives
+    ``L_bar_eff = gamma*L_bar`` with ``Z_bar`` unchanged, since both the
+    ``sum w/L`` and the ``sum w*zs_r/L`` accumulators scale by ``1/gamma``.
+
+    Inactive slots (``L <= 0``) stay 0, so the producer contract's zeroed tail
+    and the slot-0 border sentinel survive untouched.
+    """
+    nn = ny * nx
+    out = np.zeros_like(lengths)
+    for i in range(nn):
+        _vx, _vy, g = _recv_mean_direction(i, receivers, weights, nb_receivers,
+                                           ny, nx, dx, dy, wrap_y, wrap_x)
+        if g < _GAMMA_FLOOR:
+            g = _GAMMA_FLOOR
+        for k in range(lengths.shape[1]):
+            L = lengths[i, k]
+            if L > 0.0:
+                out[i, k] = g * L
+    return out
+
 
 # =============================================================================
 # Flow accumulation helpers
@@ -132,6 +235,23 @@ def _heap_pop(hz, hi, hn):
     return z0, i0, hn
 
 
+@numba.njit(cache=True, inline='always')
+def _neighbour(j, i, dj, di, ny, nx, wrap_y, wrap_x):
+    """Flat index of the cell ``(j + dj, i + di)``, wrapped on a looped axis;
+    -1 past a non-looped edge."""
+    jn = j + dj
+    if jn < 0 or jn >= ny:
+        if not wrap_y:
+            return -1
+        jn = jn % ny
+    ii = i + di
+    if ii < 0 or ii >= nx:
+        if not wrap_x:
+            return -1
+        ii = ii % nx
+    return jn * nx + ii
+
+
 @numba.njit(cache=True)
 def _priority_flood_eps(z_flat, ny, nx, interior_flat, eps, wrap_y, wrap_x,
                         z_fill):
@@ -143,55 +263,102 @@ def _priority_flood_eps(z_flat, ny, nx, interior_flat, eps, wrap_y, wrap_x,
     spill on eps-gradients. eps accumulates to ~eps * lake diameter —
     millimetres for any realistic basin. 8-connectivity matches the D-inf
     facet neighbourhood, so routing the filled surface leaves no interior
-    pits. Looped axes wrap (wrap_y rows, wrap_x columns)."""
+    pits. Looped axes wrap (wrap_y rows, wrap_x columns).
+
+    The fill is the one field with ``fill = z`` on the outlets and
+    ``fill[n] = max(z[n], min over the 8 neighbours c of fill[c] + eps)``
+    elsewhere (a minimax path cost, eps added per step), so every exact order
+    of evaluation returns the same floats, and the heap is kept to the rims of
+    the depressions. A cell reached from a FINAL cell by a step that rises at
+    least eps takes ``z``, its lower bound, and is final at once: those cells
+    are expanded from a plain FIFO. An expanded cell that leaves a lower
+    neighbour unresolved is set aside; when the FIFO runs dry, the ones still
+    holding one (the rims) enter a heap keyed by their own fill, and the lowest
+    rim raises its unresolved neighbours to ``fill + eps`` — final, since every
+    other final neighbour of theirs is a rim with a key at least as large and
+    every cell still unresolved ends at least that high. Each cell is expanded
+    once, set aside at most once and pushed at most once. ``eps = 0`` (the flat
+    fill of the erosion view, ``skeleton._dinf_modeB_filled_view``) is the same
+    scheme."""
     nn = ny * nx
     BIG = 1.0e308
-    for i in range(nn):
-        z_fill[i] = BIG
-    visited = np.zeros(nn, dtype=np.uint8)
-    # capacity: a cell is re-pushed only on strict improvement, at most
-    # once per neighbour pop -> <= 8 pushes per cell + the seeds
-    cap = 9 * nn + 16
-    hz = np.empty(cap, dtype=np.float64)
-    hi = np.empty(cap, dtype=np.int64)
+    final = np.zeros(nn, dtype=np.uint8)
+    work = np.empty(nn, dtype=np.int64)      # FIFO: the final cells to expand
+    aside = np.empty(nn, dtype=np.int64)     # expanded, a lower neighbour left
+    hz = np.empty(nn, dtype=np.float64)      # the rims' heap: a cell at most once
+    hi = np.empty(nn, dtype=np.int64)
+    head = 0
+    tail = 0
+    n_aside = 0
     hn = 0
     for idx in range(nn):
         if interior_flat[idx] == 0:
             z_fill[idx] = z_flat[idx]
-            hn = _heap_push(hz, hi, hn, z_flat[idx], idx)
-    while hn > 0:
+            final[idx] = 1
+            work[tail] = idx
+            tail += 1
+        else:
+            z_fill[idx] = BIG
+    while True:
+        # --- expand every final cell waiting
+        while head < tail:
+            c = work[head]
+            head += 1
+            floor = z_fill[c] + eps
+            j = c // nx
+            i = c % nx
+            left = False
+            for dj in range(-1, 2):
+                for di in range(-1, 2):
+                    if dj == 0 and di == 0:
+                        continue
+                    n = _neighbour(j, i, dj, di, ny, nx, wrap_y, wrap_x)
+                    if n < 0 or final[n]:
+                        continue
+                    if z_flat[n] >= floor:
+                        z_fill[n] = z_flat[n]
+                        final[n] = 1
+                        work[tail] = n
+                        tail += 1
+                    elif z_flat[n] < floor:     # not a bare else: a NaN neighbour is skipped, as the heap flood did
+                        left = True
+            if left:
+                aside[n_aside] = c
+                n_aside += 1
+        # --- the cells set aside that still hold a lower neighbour: the rims
+        for t in range(n_aside):
+            c = aside[t]
+            floor = z_fill[c] + eps
+            j = c // nx
+            i = c % nx
+            left = False
+            for dj in range(-1, 2):
+                for di in range(-1, 2):
+                    if dj == 0 and di == 0:
+                        continue
+                    n = _neighbour(j, i, dj, di, ny, nx, wrap_y, wrap_x)
+                    if n >= 0 and not final[n] and z_flat[n] < floor:
+                        left = True
+            if left:
+                hn = _heap_push(hz, hi, hn, z_fill[c], c)
+        n_aside = 0
+        if hn == 0:
+            break
+        # --- the lowest rim raises what it still holds
         zc, c, hn = _heap_pop(hz, hi, hn)
-        if visited[c]:
-            continue
-        visited[c] = 1
+        floor = zc + eps
         j = c // nx
         i = c % nx
         for dj in range(-1, 2):
-            jn = j + dj
-            if jn < 0 or jn >= ny:
-                if wrap_y:
-                    jn = jn % ny
-                else:
-                    continue
             for di in range(-1, 2):
                 if dj == 0 and di == 0:
                     continue
-                ii = i + di
-                if ii < 0 or ii >= nx:
-                    if wrap_x:
-                        ii = ii % nx
-                    else:
-                        continue
-                n = jn * nx + ii
-                if visited[n]:
-                    continue
-                cand = z_flat[n]
-                floor = zc + eps
-                if cand < floor:
-                    cand = floor
-                if cand < z_fill[n]:
-                    z_fill[n] = cand
-                    hn = _heap_push(hz, hi, hn, cand, n)
+                n = _neighbour(j, i, dj, di, ny, nx, wrap_y, wrap_x)
+                if n >= 0 and not final[n] and z_flat[n] < floor:
+                    z_fill[n] = floor
+                    final[n] = 1
+                    work[tail] = n
+                    tail += 1
 
 
 @numba.njit(cache=True, parallel=True)
@@ -398,6 +565,250 @@ def _dinf_pack(rec1, rec2, w1, w2, len1, len2, n,
 
 
 # =============================================================================
+# Multiple-flow-direction (MFD) router — ``flow_routing='mfd'``
+# -----------------------------------------------------------------------------
+# A cell's flux is split over ALL strictly downhill 8-neighbours of the SAME
+# eps-filled surface the D8/D-inf producers route (``_priority_flood_eps``), with
+# weights (at p = inf, where they are exactly 1 on the steepest link and 0 on
+# the others, the pack holds the steepest link alone)
+#
+#     w_k = (S_k / S_max)^p / sum_j (S_j / S_max)^p ,   S_k = (z_i - z_k) / L_k
+#
+# (``p = constants.MFD_EXPONENT``; the ``S_max`` normalisation is what keeps the
+# p -> inf limit and crest conditioning well-behaved). Every admitted link
+# strictly descends one scalar potential, so the graph is a DAG by construction
+# — no tie-break, no flat handling, no fortran-parity obligation (ties are benign
+# here: both neighbours simply get weight).
+#
+# PRODUCER CONTRACT (``docs/dev/router_contract.md``; the pack is (nn, 8)):
+#   * active receivers occupy the CONTIGUOUS prefix ``0 .. nb_receivers[i]-1``;
+#   * every inactive tail slot is zeroed in all three arrays
+#     (``receivers = 0, weights = 0, lengths = 0``);
+#   * ``receivers[i, 0] == i`` (with ``nb = 1``, ``w = 1``, ``L = 0``) occurs ONLY
+#     at true border sinks — four consumers read slot 0 as the border marker;
+#   * no duplicate links (guaranteed by rejecting periodic axes below 3 cells,
+#     where the -1 and +1 offsets alias onto the same node);
+#   * ``sum_k w_k == 1`` and ``lengths`` Euclidean.
+# =============================================================================
+
+# 8 neighbour offsets, in the SAME (jj outer, ii inner) scan order as
+# ``_d8_receivers`` — so on a tie-free surface the largest-weight slot is the
+# neighbour D8 would pick, and the primary-receiver output view agrees with D8.
+_MFD_DJ = np.array([-1, -1, -1,  0,  0,  1,  1,  1], dtype=np.int64)
+_MFD_DI = np.array([-1,  0,  1, -1,  1, -1,  0,  1], dtype=np.int64)
+
+
+@numba.njit(cache=True, parallel=True)
+def _mfd_route(z_flat, ny, nx, dx, dy, interior_flat, p,
+               receivers, weights, lengths, nb_receivers, dj, di,
+               wrap_y, wrap_x, link_mask, out_degree):
+    """MFD receiver scan on the (eps-filled) surface. Fills ``receivers``,
+    ``weights``, ``lengths`` ``(nn, 8)`` and ``nb_receivers`` ``(nn,)`` in place,
+    in the producer-contract layout described in the block comment above, and,
+    for :func:`_mfd_stack`, ``link_mask`` (bit f set: a link of positive weight
+    to neighbour f) and ``out_degree`` (their count), both ``(nn,)`` uint8.
+
+    One neighbour pass per cell (the 8 slopes are kept, ``S_max`` taken), then
+    the active prefix is written with the raw ``(S/S_max)^p`` weights and
+    normalised in place by their sum; no per-cell allocation. ``p = 1`` skips
+    the power (``x**1`` is ``x``).
+    At ``p = inf`` the raw weights are exactly 1 or 0 and a zero is not a
+    link: the steepest link alone (equal steepest links share). A finite ``p``
+    writes every downhill link, as before.
+    A non-interior cell gets the slot-0 self sentinel. An interior cell with no
+    strictly-lower neighbour cannot occur on the eps-filled surface (see
+    ``_priority_flood_eps``); it would need ``|z|`` ~ 1e10 for ``z + eps`` to
+    round back to ``z``. It is handled the way the D8/D-inf producers handle their own
+    ``best_f < 0`` branch — the self sentinel — and the contract test asserts it
+    never fires on an interior cell.
+
+    Row-parallel (``prange`` over j): every cell writes only its own row of the
+    output arrays and reads only ``z_flat``, so the result is independent of
+    thread count and bit-for-bit identical to the serial scan."""
+    nslot = receivers.shape[1]
+    steepest_alone = np.isinf(p)
+    link_length = np.empty(8)
+    for f in range(8):
+        link_length[f] = np.sqrt((dx * di[f]) ** 2 + (dy * dj[f]) ** 2)
+    for j in numba.prange(ny):
+        slope = np.empty(8)                  # per-row scratch: the 8 neighbours
+        node = np.empty(8, dtype=np.int64)
+        direction = np.empty(8, dtype=np.int64)
+        for i in range(nx):
+            idx = j * nx + i
+            for k in range(nslot):          # zeroed tail by default
+                receivers[idx, k] = 0
+                weights[idx, k] = 0.0
+                lengths[idx, k] = 0.0
+            link_mask[idx] = 0
+            out_degree[idx] = 0
+            if not interior_flat[idx]:
+                receivers[idx, 0] = idx     # border sink marker
+                weights[idx, 0] = 1.0
+                lengths[idx, 0] = 0.0
+                nb_receivers[idx] = 1
+                continue
+            z_c = z_flat[idx]
+            # --- the 8 slopes (0 past a non-looped edge) and the steepest
+            s_max = 0.0
+            for f in range(8):
+                slope[f] = 0.0
+                jn = j + dj[f]
+                if jn < 0 or jn >= ny:
+                    if wrap_y:
+                        jn = jn % ny
+                    else:
+                        continue
+                in_ = i + di[f]
+                if in_ < 0 or in_ >= nx:
+                    if wrap_x:
+                        in_ = in_ % nx
+                    else:
+                        continue
+                node[f] = jn * nx + in_
+                slope[f] = (z_c - z_flat[node[f]]) / link_length[f]
+                if slope[f] > s_max:
+                    s_max = slope[f]
+            if s_max <= 0.0:                # unreachable on the filled surface
+                receivers[idx, 0] = idx
+                weights[idx, 0] = 1.0
+                lengths[idx, 0] = 0.0
+                nb_receivers[idx] = 1
+                continue
+            # --- the strictly-downhill prefix, raw (S/S_max)^p weights
+            nb = 0
+            tot = 0.0
+            for f in range(8):
+                s = slope[f]
+                if s <= 0.0:
+                    continue
+                wraw = s / s_max if p == 1.0 else (s / s_max) ** p
+                if steepest_alone and wraw == 0.0:
+                    continue
+                receivers[idx, nb] = node[f]
+                weights[idx, nb] = wraw
+                lengths[idx, nb] = link_length[f]
+                direction[nb] = f
+                tot += wraw
+                nb += 1
+            nb_receivers[idx] = nb
+            mask = 0
+            for k in range(nb):
+                weights[idx, k] = weights[idx, k] / tot
+                if weights[idx, k] > 0.0:
+                    mask |= 1 << direction[k]
+                    out_degree[idx] += 1
+            link_mask[idx] = mask
+
+
+@numba.njit(cache=True, parallel=True)
+def _mfd_donor_mask(link_mask, ny, nx, dj, di, wrap_y, wrap_x, donor_mask):
+    """``donor_mask[r]`` bit f set: neighbour f of r links INTO r, i.e. its own
+    ``link_mask`` carries the opposite direction, ``7 - f`` (the 8 offsets come
+    in opposite pairs f, 7 - f). Row-parallel gather: a cell writes only its
+    own entry."""
+    for j in numba.prange(ny):
+        for i in range(nx):
+            mask = 0
+            for f in range(8):
+                jn = j + dj[f]
+                if jn < 0 or jn >= ny:
+                    if wrap_y:
+                        jn = jn % ny
+                    else:
+                        continue
+                in_ = i + di[f]
+                if in_ < 0 or in_ >= nx:
+                    if wrap_x:
+                        in_ = in_ % nx
+                    else:
+                        continue
+                if (link_mask[jn * nx + in_] >> (7 - f)) & 1:
+                    mask |= 1 << f
+            donor_mask[j * nx + i] = mask
+
+
+@numba.njit(cache=True)
+def _mfd_stack(link_mask, out_degree, ny, nx, dj, di, wrap_y, wrap_x, stack):
+    """DONOR-FIRST topological order of the k-ary MFD graph (Kahn's algorithm),
+    written into ``stack``, from :func:`_mfd_route`'s ``link_mask`` and
+    ``out_degree`` (left untouched): the links of positive weight, the self
+    sentinel of a border sink not among them.
+
+    The k-ary sibling of :func:`_dinf_topo_stack` — which stays a two-receiver
+    producer internal and is deliberately NOT generalised in place. No
+    ``rec2 != rec1`` de-duplication is needed here: the producer emits each
+    neighbour at most once (periodic axes shorter than 3 cells, where opposite
+    offsets alias, are rejected by :func:`siim._core.step.route_mfd`).
+
+    A cell's donors are read off the 8 neighbours' masks
+    (:func:`_mfd_donor_mask`) and released in ASCENDING node index, the order a
+    donor list filled cell by cell holds — the order of the stack sets the
+    order every accumulation adds in, so it is part of the result. The offsets
+    f = 0..7 ascend in node index off the domain edge; on an edge row or
+    column, where a looped axis reorders them, the donors are sorted.
+
+    Kahn emits base cells first (receivers-first); the output is REVERSED into
+    ``stack`` so it lands in the donor-first convention
+    ``_flow_accumulate_dinf`` walks forward — the same convention D-inf's
+    ``route_dinf`` produces by reversing outside the kernel."""
+    n = ny * nx
+    donor_mask = np.empty(n, dtype=np.uint8)
+    _mfd_donor_mask(link_mask, ny, nx, dj, di, wrap_y, wrap_x, donor_mask)
+    out_deg = out_degree.copy()
+    offset = np.empty(8, dtype=np.int64)
+    for f in range(8):
+        offset[f] = dj[f] * nx + di[f]
+    donors = np.empty(8, dtype=np.int64)
+    queue = np.empty(n, dtype=np.int64)      # the emission order: base cells first
+    qhead = 0
+    qtail = 0
+    for i in range(n):
+        if out_deg[i] == 0:
+            queue[qhead] = i
+            qhead += 1
+    while qtail < qhead:
+        c = queue[qtail]
+        qtail += 1
+        mask = donor_mask[c]
+        if mask == 0:
+            continue
+        j = c // nx
+        i = c % nx
+        nd = 0
+        if 0 < j < ny - 1 and 0 < i < nx - 1:
+            for f in range(8):
+                if (mask >> f) & 1:
+                    donors[nd] = c + offset[f]
+                    nd += 1
+        else:
+            for f in range(8):
+                if (mask >> f) & 1:
+                    d = ((j + dj[f]) % ny) * nx + (i + di[f]) % nx
+                    k = nd                   # insertion: ascending node index
+                    while k > 0 and donors[k - 1] > d:
+                        donors[k] = donors[k - 1]
+                        k -= 1
+                    donors[k] = d
+                    nd += 1
+        for k in range(nd):
+            d = donors[k]
+            out_deg[d] -= 1
+            if out_deg[d] == 0:
+                queue[qhead] = d
+                qhead += 1
+    # Defensive: any unemitted cell (would signal a cycle — impossible on the
+    # eps-filled surface) is appended so ``stack`` stays a full permutation.
+    if qhead < n:
+        for i in range(n):
+            if out_deg[i] > 0:
+                queue[qhead] = i
+                qhead += 1
+    for t in range(n):
+        stack[n - 1 - t] = queue[t]
+
+
+# =============================================================================
 # In-house D8 single-flow router (fill-then-route) — the framework-free
 # replacement for fastscape's fortran ``SingleFlowRouter``
 # (``fs.flowroutingsingleflowdirection``). Same fill-then-route strategy as the
@@ -551,8 +962,8 @@ def d8_interior_mask(border_status, ny, nx):
     'core' and 'looped' are both plain interior for EVERY router (OQ-1(b),
     ratified): 'core' is non-periodic interior (periodicity is the separate wrap
     axis, keyed on 'looped' only), aligning the SFR mask with the D-inf
-    convention siim already shipped. ``border_status`` = [left, right, top,
-    bottom]; node index = ``j*nx + i``."""
+    convention siim already shipped. ``border_status`` = [left, right, bottom,
+    top] (``outputs.SIDES``); node index = ``j*nx + i``."""
     interior = np.ones(ny * nx, dtype=np.int8)
     bs = list(np.broadcast_to(border_status, 4))
     if bs[0] == 'fixed_value':
@@ -560,9 +971,9 @@ def d8_interior_mask(border_status, ny, nx):
     if bs[1] == 'fixed_value':
         interior[nx - 1::nx] = 0       # right column  (i = nx-1)
     if bs[2] == 'fixed_value':
-        interior[:nx] = 0              # top row       (j = 0)
+        interior[:nx] = 0              # bottom row    (j = 0)
     if bs[3] == 'fixed_value':
-        interior[nx * (ny - 1):] = 0   # bottom row    (j = ny-1)
+        interior[nx * (ny - 1):] = 0   # top row       (j = ny-1)
     return interior
 
 

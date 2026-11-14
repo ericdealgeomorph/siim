@@ -11,5 +11,6 @@ target-version = "py312"                                # minimum supported Pyth
 extend-exclude = ["**/archive/**", "**/_archive/**"]    # don't lint frozen code
 
 [lint]
-select = ["F", "E722", "BLE001", "S110", "S112", "RUF100"]   # correctness, swallowed exceptions, stale noqa
+select = ["F", "E722", "BLE001", "S110", "S112", "RUF100",   # correctness, swallowed exceptions, stale noqa
+          "NPY", "B006", "B008", "B023"]                      # NumPy 2 removals, shared defaults, loop closures
 ignore = ["E701", "E702", "E741", "E501", "E401"]

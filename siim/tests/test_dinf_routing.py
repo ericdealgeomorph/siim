@@ -71,6 +71,68 @@ def _pitted_plane(ny=15, nx=21, dx=100.0):
     return z
 
 
+def _heap_flood(z, ny, nx, interior, eps, wrap_y, wrap_x):
+    """The plain Dijkstra flood: every cell through one heap, lowest first,
+    each neighbour offered ``max(z, fill + eps)``."""
+    import heapq
+    fill = np.where(interior == 0, z, np.inf)
+    heap = [(z[c], c) for c in np.flatnonzero(interior == 0)]
+    heapq.heapify(heap)
+    done = np.zeros(ny * nx, dtype=bool)
+    while heap:
+        zc, c = heapq.heappop(heap)
+        if done[c]:
+            continue
+        done[c] = True
+        j, i = divmod(int(c), nx)
+        for dj in (-1, 0, 1):
+            for di in (-1, 0, 1):
+                jn, ii = j + dj, i + di
+                if (not wrap_y and not 0 <= jn < ny) or (not wrap_x and not 0 <= ii < nx):
+                    continue
+                n = (jn % ny) * nx + ii % nx
+                cand = max(z[n], zc + eps)
+                if not done[n] and cand < fill[n]:
+                    fill[n] = cand
+                    heapq.heappush(heap, (cand, n))
+    return fill
+
+
+@pytest.mark.pin
+@pytest.mark.parametrize('eps', [EPS, 0.0], ids=['eps', 'flat'])
+def test_priority_flood_is_the_heap_flood(eps):
+    """The fill is the plain heap flood's to the last bit, though the producer
+    keeps its heap to the depression rims: rough and tie-ridden surfaces (pits
+    and flats everywhere), outlets on the four edges, on two rows with x
+    looped, on two columns with y looped and at a single cell with both
+    looped; with eps and as the flat fill (eps = 0) of the erosion view."""
+    rng = np.random.default_rng(31)
+    raised = 0
+    for trial in range(48):
+        ny, nx = int(rng.integers(3, 22)), int(rng.integers(3, 22))
+        z = rng.random(ny * nx) * (1.0, 1e3, 1e-5)[trial % 3]
+        if trial % 2:
+            z = np.round(4 * z) / 4
+        wrap_y, wrap_x = ((False, False), (False, True), (True, False), (True, True))[trial % 4]
+        if not (wrap_y or wrap_x):
+            interior = _edges_interior(ny, nx)
+        elif not wrap_y:
+            interior = _rows_interior(ny, nx)
+        else:
+            interior = np.ones(ny * nx, dtype=np.int8)
+            if wrap_x:
+                interior[int(rng.integers(ny * nx))] = 0
+            else:
+                interior[::nx] = 0
+                interior[nx - 1::nx] = 0
+        z_fill = np.empty(ny * nx)
+        _priority_flood_eps(z, ny, nx, interior, eps, wrap_y, wrap_x, z_fill)
+        np.testing.assert_array_equal(z_fill, _heap_flood(z, ny, nx, interior, eps, wrap_y, wrap_x),
+                                      err_msg=f'trial {trial}')
+        raised += int((z_fill > z).sum())
+    assert raised > 500, "vacuous: nothing filled"
+
+
 def test_priority_flood_eps_fill():
     """Fill leaves unponded terrain untouched, raises basin cells to just
     above the spill with strictly positive drainage everywhere: every
@@ -139,15 +201,21 @@ def test_dinf_pit_source_exits_at_spill_side():
     np.testing.assert_allclose(field[left.ravel()].sum(), 1.0, rtol=1e-12)
 
 
+@pytest.mark.parametrize("slope_normalise", [False, True],
+                         ids=["gamma_off", "gamma_on"])
 @pytest.mark.parametrize("law", ["eff-exp", "power", "coulomb"])
-def test_mode_b_dinf_sfr_parity_cardinal_plane(law):
+def test_mode_b_dinf_sfr_parity_cardinal_plane(law, slope_normalise):
     """On terrain draining along a single cardinal direction, D-inf
     degenerates to one receiver with weight 1, so the D-inf mode-B kernel
     must reproduce the SFR mode-B kernel: same joint-walk H, same bed
     after erosion + border budget, same presented surface. Pins the
     weighted-effective-receiver reduction (S = (zs - Z̄)/L̄), the
     priority-flood erosion view against the SFR stack-walk fill, and the
-    border closure/cap/floor parity."""
+    border closure/cap/floor parity.
+
+    Run under BOTH arms of the gamma effective-slope normalisation: a single
+    receiver of weight 1 gives gamma == 1 identically, so the 2026-09-05
+    default flip must leave this oracle untouched."""
     from ._kernel_adapters import (
         glac_fast_solve_modeB, glac_fast_solve_power_modeB,
         glac_fast_solve_coulomb_modeB,
@@ -215,7 +283,7 @@ def test_mode_b_dinf_sfr_parity_cardinal_plane(law):
                                    dt, stack, nb_receivers, receivers,
                                    weights, lengths,
                                    0.0, ny, nx, dx, dx, bbu, hc,
-                                   False, False)
+                                   False, False, slope_normalise)
     elif law == 'power':
         glac_fast_solve_power_modeB_dinf(zb_d, ice, water, H_d, surf_d,
                                          Ko, ce, n_exp, nu, m,
@@ -223,7 +291,7 @@ def test_mode_b_dinf_sfr_parity_cardinal_plane(law):
                                          dt, stack, nb_receivers, receivers,
                                          weights, lengths,
                                          0.0, ny, nx, dx, dx, bbu, hc,
-                                         False, False)
+                                         False, False, slope_normalise)
     else:
         glac_fast_solve_coulomb_modeB_dinf(zb_d, ice, water, H_d, surf_d,
                                            Ko, ce, n_exp, nu, m,
@@ -232,7 +300,8 @@ def test_mode_b_dinf_sfr_parity_cardinal_plane(law):
                                            dt, stack, nb_receivers, receivers,
                                            weights, lengths,
                                            0.0, ny, nx, dx, dx, bbu, hc,
-                                           False, False)
+                                           False, False,
+                                           slope_normalise)
 
     assert H_d.max() > 1.0, "config must grow ice"
     np.testing.assert_allclose(H_d, H_s, rtol=1e-10, atol=1e-10)
@@ -257,7 +326,7 @@ def test_mode_b_dinf_integration_with_carve():
         # Isolate the carve: pin the mode-C standard flags off so the carve-on /
         # carve-off twins differ ONLY in carve_width (widening_rate is set on the
         # carve-on side below).
-        'trunk_surface': False, 'routing_relax': 0.0,
+        'trunk_surface': False,
     }
     for law, extra in (('eff-exp', {}), ('coulomb',
                                          {'lambda_c': 1e3, 'tau_c': 1.2e5})):

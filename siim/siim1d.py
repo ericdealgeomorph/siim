@@ -1,5 +1,6 @@
+import copy
 import warnings
-import matplotlib.pyplot as plt, numpy as np, tqdm, numba
+import numpy as np, tqdm, numba    # pyplot is imported where a plot is drawn
 from types import SimpleNamespace
 
 from .constants import (GRAVITY, KT, RHO_ICE, Co_power, derive_coulomb,
@@ -15,7 +16,7 @@ from ._core.solvers import (  # shared scalar Newton solvers / H-closures (unifi
 )
 from ._core.skeleton import (  # 1D joint walk + fill + implicit border step
     _diag_walk, _implicit_border_step, _lake_fill_1d)
-from ._core.eroders import _modeb_border_erosion  # border-bed glacial erosion rate
+from ._core.eroders import _linear_implicit, _modeb_border_erosion  # n = nu = 1 step; border-bed rate
 from ._core.params import GlacialParams
 
 
@@ -102,8 +103,9 @@ class siim:
         if user_params is None: user_params = {}
         elif not isinstance(user_params, dict): raise TypeError("params must be provided as a dictionary.")
 
-        # set parameters, using defaults for any that are not provided, and check for unexpected parameters
-        self.set_and_check_parameters(user_params)
+        # set parameters, using defaults for any that are not provided, and check for unexpected parameters;
+        # from a deep copy, so a caller mutating an input array later cannot change the run (as siim2d)
+        self.set_and_check_parameters(_constants.unwrap_0d(copy.deepcopy(user_params)))
 
         # composition: analytical solution (standalone class) and plotter.
         # Pass the analytical-relevant subset of user_params; coerce any
@@ -133,7 +135,7 @@ class siim:
         keys = ("P", "beta", "k_h", "d", "sigma", "n", "m", "Ko",
                 "Ac", "alpha_g", "lambda_p", "lambda_c", "mu", "nu", "lam",
                 "k", "sliding_law", "ce", "tau_c", "left_bc", "right_bc",
-                "xo", "L", "nx", "U", "zELA")
+                "xo", "L", "nx", "U", "zELA", "hc_over_H")
         return {k: getattr(self, k) for k in keys}
 
     def set_and_check_parameters(self, user_params):
@@ -152,7 +154,7 @@ class siim:
             # climate params
             "P": _constants.P,
             "beta": _constants.BETA,
-            "zELA": _constants.ZELA,
+            "zELA": None,   # None: constants.ZELA, unless zT is given
             "zT": None,
             "U": _constants.U,
             # Base level: the water-line (Dirichlet) datum. Scalar (default
@@ -385,8 +387,7 @@ class siim:
         self.flotation_gate = bool(params.flotation_gate)
         # Flotation-ramp width gamma (0 = hard binary gate, bit-for-bit).
         self.flotation_ramp = float(params.flotation_ramp)
-        if self.flotation_ramp < 0.0:
-            raise ValueError("flotation_ramp (gamma) must be >= 0.")
+        _constants.check_range('flotation_ramp (gamma)', self.flotation_ramp, 0.0, inclusive=True)
         if self.bl != 0.0:
             warnings.warn(
                 "Nonzero base level bl: the analytical steady-state reference "
@@ -395,6 +396,7 @@ class siim:
                 "profile yourself, or compare shapes.",
                 UserWarning, stacklevel=2)
 
+        _constants.check_range('beta', params.beta, 0.0)   # every zELA/zT conversion divides by it (audit #41)
         # if neither zELA or zT is user defined
         if params.zELA is None and params.zT is None:
             self.zELA = _constants.ZELA
@@ -530,10 +532,11 @@ class siim:
         # tracking with the channel-floor surface convention).
         # Mode 'B' is implemented for all three sliding laws (eff-exp, power, coulomb).
         self.mode = _constants.normalize_mode(params.mode)
-        if self.mode == 'C':
+        if self.mode in ('C', 'D'):
             raise ValueError(
-                "mode 'C' (sub-grid width carving) is 2D-only; the 1D model "
-                "has no width machinery — use mode='B'.")
+                f"mode {self.mode!r} (sub-grid width carving"
+                f"{', the channel/sheet reading' if self.mode == 'D' else ''}) is "
+                "2D-only; the 1D model has no width machinery — use mode='B'.")
         self._mode_B_active = (self.mode == 'B')
         self.floating_termini = bool(params.floating_termini)
 
@@ -541,14 +544,13 @@ class siim:
         # zs = zb + hc * H (hc = 1 is the historical mean-bed datum).
         self.hc_over_H = (float(_constants.HC_OVER_H) if params.hc_over_H is None
                    else float(params.hc_over_H))
-        if not self.hc_over_H > 0.0:
-            raise ValueError(f"hc_over_H must be > 0, got {params.hc_over_H!r}")
+        _constants.check_range('hc_over_H', self.hc_over_H, 0.0)   # finite, as in 2D
 
         # Ice thickness diffusivity (both modes); None disables.
         self.H_diffusivity = (None if params.H_diffusivity is None
                                           else float(params.H_diffusivity))
-        if self.H_diffusivity is not None and self.H_diffusivity < 0:
-            raise ValueError("H_diffusivity must be >= 0 or None.")
+        if self.H_diffusivity is not None:
+            _constants.check_range('H_diffusivity', self.H_diffusivity, 0.0, inclusive=True)
 
     @property
     def run_id(self):
@@ -657,7 +659,7 @@ class siim:
         # z_s = zb + hc_over_H*H jointly per node (tight closure), dispatched
         # by sliding law.
         if self._mode_B_active:
-            if self.sliding_law not in ("eff-exp", "power", "coulomb"):
+            if self.sliding_law not in _constants.SLIDING_LAWS:
                 raise ValueError(
                     f"Mode B not implemented for sliding_law='{self.sliding_law}'.")
             law_code, p = self._glacial_params_and_code()
@@ -1198,11 +1200,10 @@ class siim:
         """Compute RMS difference between the model's profile at output step
         ``i`` (default last) and its analytical SS solution.
 
-        Both sides use the channel-floor datum so a perfect model gives
-        ``bed_rms ~ 0``: the model bed is ``z - hc_over_H*H`` and the
-        analytical bed already carries the ``HC_OVER_H`` factor
-        (``a.bed = a.surface - HC_OVER_H*H``). Bedrock can be negative inside
-        thick glaciers and must not be clipped.
+        Both sides use the model's channel-floor datum so a perfect model gives
+        ``bed_rms ~ 0``: the model bed is ``z - hc_over_H*H``, and the
+        analytical is built on the same ``hc_over_H`` (forwarded, ED-183).
+        Bedrock can be negative inside thick glaciers and must not be clipped.
 
         Returns
         -------
@@ -1216,14 +1217,14 @@ class siim:
         z_num = self.z_out[:, i]
         H_num = self.H_out[:, i]
         zb_num = z_num - self.hc_over_H * H_num          # channel-floor datum (audit B4)
-        a_H_grid = a.surface - a.bed                    # = HC_OVER_H * H (analytical bed carries the factor)
         if (a.x.shape == self.x.shape) and np.allclose(a.x, self.x):
-            a_surf, a_H = a.surface, a_H_grid
+            a_surf, a_bed = a.surface, a.bed
         else:
+            # The model forwards nx, L and xo, so a.x is self.x unless the
+            # reference was re-solved on another grid (a.nx = ...; a.solve()).
             # x arrays decrease from L → 0; flip for np.interp's monotone-x rule.
             a_surf = np.interp(self.x[::-1], a.x[::-1], a.surface[::-1])[::-1]
-            a_H    = np.interp(self.x[::-1], a.x[::-1], a_H_grid[::-1])[::-1]
-        a_bed = a_surf - a_H                            # bedrock = surface − H
+            a_bed  = np.interp(self.x[::-1], a.x[::-1], a.bed[::-1])[::-1]
         surface_rms = float(np.sqrt(np.nanmean((z_num  - a_surf) ** 2)))
         bed_rms     = float(np.sqrt(np.nanmean((zb_num - a_bed ) ** 2)))
         return surface_rms, bed_rms
@@ -1231,7 +1232,7 @@ class siim:
 
 # Plotting class
 from .plotting._profiles import (ProfileMethods, PROFILE_FIELDS, profile_data,
-                                 data_limits, draw_panel, field_limits)
+                                 draw_panel, field_limits)
 from .plotting._style import COLORS, style_axes
 
 
@@ -1242,45 +1243,49 @@ class siim_plotter(ProfileMethods):
     def __init__(self, model):
         self.model = model
 
-    def analytical(self, ax=None, alpha_ice=0.15, alpha_zb=0.2,
-                   plot_analytical=True, bistable=True):
-        """Plot the analytical SS profile. Handles all flags 1–5; for the
-        bistable flags (4, 5), overlays the fluvial alt in light gray when
-        ``bistable=True``."""
+    _PROFILE_XLABEL = 'x (km)'      # the 1D grid coordinate, not a channel distance
+
+    def analytical(self, ax=None, bistable=True, basin_rank=0, ref=-1, *legacy,
+                   plot_analytical=None, alpha_ice=None, alpha_zb=None):
+        """Plot the analytical SS profile alone, drawn as ``profile`` draws
+        it (the same renderer, figure, orientation and colours). Handles all
+        flags 1–5; for the bistable flags (4, 5), the fluvial alternative is
+        dotted when ``bistable=True``. ``basin_rank`` and ``ref`` are accepted
+        for call compatibility with the 2D plotter and have no effect.
+        Returns the Axes, or None when there is no steady state to draw.
+
+        ``plot_analytical``, ``alpha_ice`` and ``alpha_zb`` are deprecated and
+        will be removed in 1.0. So is the pre-0.10 positional order
+        ``(ax, alpha_ice, alpha_zb, plot_analytical, bistable)``: a non-bool
+        second argument (or a fifth) is read that way, with a warning.
+        """
+        if legacy or not isinstance(bistable, (bool, np.bool_)):
+            if len(legacy) > 1:
+                raise TypeError('analytical() takes at most 5 positional arguments')
+            warnings.warn('analytical(ax, alpha_ice, alpha_zb, plot_analytical, '
+                          'bistable) positional arguments are deprecated and will be '
+                          'removed in 1.0; pass bistable= by keyword',
+                          DeprecationWarning, stacklevel=2)
+            if isinstance(ref, (bool, np.bool_)) and not ref:
+                return None                           # the old plot_analytical=False
+            bistable = bool(legacy[0]) if legacy else True
+        ignored = 'it is ignored: the fills follow profile()'
+        for name, value, advice in (
+                ('plot_analytical', plot_analytical, 'skip the call instead of passing False'),
+                ('alpha_ice', alpha_ice, ignored), ('alpha_zb', alpha_zb, ignored)):
+            if value is not None:
+                warnings.warn(f'analytical({name}=) is deprecated and will be removed '
+                              f'in 1.0; {advice}', DeprecationWarning, stacklevel=2)
+        if plot_analytical is not None and not plot_analytical:
+            return None
         m = self.model
-        if not plot_analytical:
-            return
-        analytical_surface, analytical_bed = m.analytical._analytical_profiles()
-
-        if analytical_surface is None or analytical_bed is None:
+        reference = self._analytical_overlay(bistable)
+        if reference is None:
             print('No analytical solution available for the current model setup.')
-            return
-
-        flag = m.analytical.glacier_flag
-        if flag == -1:
-            return
-        if ax is None:
-            fig, ax = plt.subplots(1, 1, figsize=(8, 3.04), layout='constrained')
-
-        # Plot on the analytical's own grid (m.x and m.analytical.x can have
-        # different nx when the user does not pass an explicit nx).
-        x_km = m.analytical.x / 1e3
-        ax.fill_between(x_km, np.zeros_like(x_km), analytical_bed,
-                        color=COLORS['bed'], alpha=alpha_zb)
-        ax.plot(x_km, analytical_bed, '--', color=COLORS['bed'], lw=1, label='Analytical bedrock')
-        if flag in (2, 3, 4, 5):
-            ax.fill_between(x_km, analytical_bed, analytical_surface,
-                            color=COLORS['ice_fill'], alpha=alpha_ice, edgecolor=None)
-            ax.plot(x_km, analytical_surface, '--', color=COLORS['ice'], lw=1.1, label='Analytical ice surface')
-        if bistable and flag in (4, 5) and m.analytical.surface_alt is not None:
-            ax.plot(x_km, m.analytical.surface_alt, "--",
-                    color="gray", alpha=0.5, lw=1, label="Analytical fluvial alt")
-        ax.set_ylim(*field_limits('elevation', analytical_bed, analytical_surface))
-        ax.set_xlim(0, m.analytical.L / 1e3)
-        ax.set_xlabel('Distance (km)')
-        ax.set_ylabel('Elevation (m)')
-        style_axes(ax)
-        return ax
+            return None
+        if m.analytical.glacier_flag == -1:
+            return None
+        return self._draw_analytical(ax, reference)
 
     def _water_display_1d(self, i):
         """Reconstruct the water DISPLAY layer for output frame ``i`` (the
@@ -1334,6 +1339,8 @@ class siim_plotter(ProfileMethods):
         surface, bed = m.analytical._analytical_profiles()
         if surface is None or bed is None:
             return None
+        # On the analytical's own grid: the model forwards nx, L and xo, so it
+        # is m.x unless the reference was re-solved on another grid.
         return profile_data(
             x=m.analytical.x / 1e3, surface=surface, bed=bed, ela=m.zELA,
             surface_alt=(m.analytical.surface_alt
@@ -1342,9 +1349,6 @@ class siim_plotter(ProfileMethods):
             Qg=m.analytical._analytical_ice_flux(),
             Qf=m.analytical._analytical_water_flux(),
         )
-
-    def _compute_field_ylims(self, fields):
-        return data_limits(self._profile_source(), fields)
 
     def _draw_profile_extra(self, ax, data, i, field):
         if field != 'elevation':
@@ -1383,7 +1387,7 @@ class siim_plotter(ProfileMethods):
         reference = self._analytical_overlay(bistable) if analytical else None
         draw_panel(ax, field, data, i, reference)
         self._draw_profile_extra(ax, data, i, field)
-        ax.set_xlabel('Distance (km)')
+        ax.set_xlabel(self._PROFILE_XLABEL)
         style_axes(ax, legend=legend)
 
     def _pick_side(self, side=None):
@@ -1490,10 +1494,9 @@ class siim_plotter(ProfileMethods):
             Draw the terminus position Lt as a thin dashed vertical line on each
             snapshot panel (default True; skipped on ice-free frames).
         analytical : bool or None
-            Overlay the analytical SS solution on each snapshot, as in
-            ``view()``. None defaults to True for the 'eff-exp' sliding law
-            (matching ``view``); ``bistable`` additionally overlays the fluvial
-            alt SS in regimes with flags 4, 5.
+            Overlay the analytical SS solution on each snapshot. None defaults
+            to True for the 'eff-exp' sliding law only; ``bistable``
+            additionally overlays the fluvial alt SS in regimes with flags 4, 5.
         save : bool
             If True, save a PNG via output_path ({run_id}_limit_cycle or path).
 
@@ -1503,8 +1506,9 @@ class siim_plotter(ProfileMethods):
             amplitude, cycle window, ...) from ``_detect_limit_cycle``.
         """
         import matplotlib.gridspec as gridspec
+        import matplotlib.pyplot as plt
         m = self.model
-        if analytical is None:  # match view(): default on for eff-exp
+        if analytical is None:  # default on for eff-exp only
             analytical = (m.sliding_law == 'eff-exp')
         info = self._detect_limit_cycle(side=side, n_settle=n_settle,
                                         prominence_frac=prominence_frac)
@@ -1531,7 +1535,7 @@ class siim_plotter(ProfileMethods):
         ax_t.set_title(
             f"Limit cycle: side {info['side']}, period = {info['period'] / 1e3:.2f} kyr, "
             f"amplitude = {info['amplitude'] / 1e3:.2f} km")
-        ax_t.legend(loc="best", fontsize=8)
+        ax_t.legend(loc="best")
         ax_t.grid(True, alpha=0.2)
 
         # --- snapshot grid spanning one cycle, max Lt -> next max Lt ---
@@ -1550,7 +1554,7 @@ class siim_plotter(ProfileMethods):
                            zorder=5, label="$L_t$")
                 if legend and k == 0:
                     ax.legend(loc="upper left")
-            ax.set_title(f"t = {t[idx] / 1e3:.1f} kyr", fontsize=9)
+            ax.set_title(f"t = {t[idx] / 1e3:.1f} kyr")
             if c != 0:
                 ax.set_ylabel("")
             if r + 1 != nrows:
@@ -1653,6 +1657,7 @@ class siim_plotter(ProfileMethods):
             analytical ``ss_point`` (x_ss, y_ss).
         """
         from matplotlib.collections import LineCollection
+        import matplotlib.pyplot as plt
         m = self.model
         if not hasattr(m, "Lt_out") or m.Lt_out.size == 0:
             raise ValueError("No simulation output available; run the model first.")
@@ -1728,7 +1733,7 @@ class siim_plotter(ProfileMethods):
         ax.set_xlabel(self._PHASE_AXES[xaxis][0])
         ax.set_ylabel(self._PHASE_AXES[yaxis][0])
         ax.set_title(f"Limit-cycle phase portrait (side {side})")
-        ax.legend(loc="lower right", fontsize=8)
+        ax.legend(loc="lower right")
         ax.grid(True, alpha=0.2)
         if colorbar:
             fig.colorbar(lc, ax=ax, label="Time (kyr)")
@@ -1937,18 +1942,18 @@ def _linear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, didx_l, didx_r):
         for i in range(1, didx_l + 1):
             Gi = Kg * Qg[i]**mu
             if Gi > 0:
-                z[i] = (zo[i] + Gi * z[i-1]) / (1 + Gi)
+                z[i] = _linear_implicit(zo[i], z[i-1], Gi)
             else:
                 Fi = Kf * Qf[i]**m
-                z[i] = (zo[i] + Fi * z[i-1]) / (1 + Fi)
+                z[i] = _linear_implicit(zo[i], z[i-1], Fi)
     if didx_r < nx:
         for i in range(nx-2, didx_r - 1, -1):
             Gi = Kg * Qg[i]**mu
             if Gi > 0:
-                z[i] = (zo[i] + Gi * z[i+1]) / (1 + Gi)
+                z[i] = _linear_implicit(zo[i], z[i+1], Gi)
             else:
                 Fi = Kf * Qf[i]**m
-                z[i] = (zo[i] + Fi * z[i+1]) / (1 + Fi)
+                z[i] = _linear_implicit(zo[i], z[i+1], Fi)
 
 @numba.njit(cache=True)
 def _nonlinear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, n, nu, didx_l, didx_r):

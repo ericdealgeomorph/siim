@@ -6,7 +6,7 @@ shape mountain topography over geologic time. It ships three coordinated front
 ends over one physical core:
 
 - **`siim.siim1d`** — fast 1D longitudinal-profile model
-- **`siim.siim2d`** — full 2D landscape-evolution model (in-house driver, D8/D-inf
+- **`siim.siim2d`** — full 2D landscape-evolution model (in-house driver, D8/MFD/D-inf
   routing, FFT flexure, ADI hillslope diffusion)
 - **`siim.analytical`** — closed-form steady-state profiles and regime diagrams
   from the underlying theory

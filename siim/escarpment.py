@@ -32,11 +32,14 @@ Usage::
 import numpy as np
 from types import SimpleNamespace
 
+from . import constants as _constants
+from .constants import check_range as _check_range
 from .siim2d import siim
-from ._core.step import plateau_profile, plateau_surface, uplift_mask, wave_uplift
+from ._core.step import plateau_profile, plateau_surface, uplift_mask, wave_rate
 
 
-def plateau_topography(nx, ny, Lx, zo=1000.0, frac=0.8, w=10e3, dz=1.0):
+def plateau_topography(nx, ny, Lx, zo=_constants.PLATEAU_ZO, frac=_constants.PLATEAU_FRAC,
+                       w=_constants.PLATEAU_W, dz=_constants.PLATEAU_DZ):
     """Plateau initial surface for plain ``siim2d`` runs, with its own base level.
 
     Returns ``(topo, bl)``: the ``(ny, nx)`` surface — exactly 0 at the left
@@ -91,17 +94,17 @@ class siim_escarpment(siim):
             # uplift: 'block' (default) or 'wave' (moving-Gaussian WaveUplift)
             "uplift_type": "block",
             "delta_h": None,
-            "wave_width": 200e3,
-            "wave_velocity": 15e-3,
-            "x_escarpment": 0.0,
-            "wave_calibration": 1.0,
-            "U_inf": 0.0,
+            "wave_width": _constants.WAVE_WIDTH,
+            "wave_velocity": _constants.WAVE_VELOCITY,
+            "x_escarpment": _constants.X_ESCARPMENT,
+            "wave_calibration": _constants.WAVE_CALIBRATION,
+            "U_inf": _constants.U_INF,
             # initial topography: 'sloped' (default) or 'plateau' (PlateauSurface)
             "init_type": "sloped",
             "plateau_zo": None,
-            "plateau_dz": 1.0,
-            "plateau_frac": 0.8,
-            "plateau_w": 10e3,
+            "plateau_dz": _constants.PLATEAU_DZ,
+            "plateau_frac": _constants.PLATEAU_FRAC,
+            "plateau_w": _constants.PLATEAU_W,
         })
         return d
 
@@ -124,12 +127,16 @@ class siim_escarpment(siim):
             self.delta_h = float(params.delta_h)
             self.wave_width = float(params.wave_width)
             self.wave_velocity = float(params.wave_velocity)
+            # the wave's rate scales with velocity / width: a zero width was 0/0, and a
+            # zero or negative velocity deposited nothing or subsided (audit #29)
+            _check_range('wave_width', self.wave_width, 0.0)
+            _check_range('wave_velocity', self.wave_velocity, 0.0)
             self.x_escarpment = float(params.x_escarpment)
             self.wave_calibration = float(params.wave_calibration)
             self.U_inf = float(params.U_inf)
             # Representative scalar uplift for the analytical reference: the
-            # average rate the wave deposits over the run.
-            self.U = self.U_inf + self.delta_h / self.T
+            # average rate the wave deposits over the run (its length, T - to).
+            self.U = self.U_inf + self.delta_h / (self.T - self.to)
 
         # --- init_type dispatch ---
         self.init_type = params.init_type
@@ -202,20 +209,39 @@ class siim_escarpment(siim):
             x, y, shape, self.boundary_status, self.seed, self.noise_amplitude,
             self.plateau_zo, self.plateau_dz, self.plateau_frac, self.plateau_w)
 
+    @property
+    def _border_follows_wave(self):
+        """Under the wave with no border_bed_uplift given, a border bed rises at the
+        wave's local rate each step: the run-average U (the analytical reference's)
+        had them rising at up to ~8x the wave's peak, wherever the wave was (audit #25).
+        Mode B/C only: mode A has no border-bed budget."""
+        return self.uplift_type == "wave" and self.border_bed_uplift is None and self.mode != "A"
+
+    def _make_border_bed_uplift(self):
+        # None: the per-step wave rate (adapter: the border_bed_uplift group
+        # WaveUplift publishes to; standalone: _driver_bbu_fn)
+        return None if self._border_follows_wave else super()._make_border_bed_uplift()
+
+    def _driver_wave_rate(self):
+        """``rate(k, dt) -> (ny, nx)``: the wave's local rate on the in-house
+        clock, t[k] - t[0] = step_start - sim_start (the shell's runtime args),
+        so time counts from the run's start; midpoint-sampled at + dt/2."""
+        x = np.linspace(0, self.Lx, self.grid_nx)
+        y = np.linspace(0, self.Ly, self.grid_ny)
+        t = self.t
+        return lambda k, dt: wave_rate(x, y, dt, t[k] - t[0], self.delta_h,
+                                       self.wave_width, self.wave_velocity,
+                                       self.x_escarpment, self.wave_calibration,
+                                       self.U_inf)
+
+    def _driver_bbu_fn(self):
+        if not self._border_follows_wave:
+            return super()._driver_bbu_fn()
+        return self._driver_wave_rate()
+
     def _driver_uplift_fn(self):
         if self.uplift_type != "wave":
             return super()._driver_uplift_fn()
-        shape = (self.grid_ny, self.grid_nx)
-        x = np.linspace(0, self.Lx, self.grid_nx)
-        y = np.linspace(0, self.Ly, self.grid_ny)
-        mask = uplift_mask(self.boundary_status, shape)
-        t = self.t
-
-        def fn(k, dt):
-            # step_start = t[k] (the xsimlab runtime arg the shell receives);
-            # wave_uplift midpoint-samples at t[k] + dt/2 internally.
-            return wave_uplift(x, y, shape, mask, dt, t[k], self.delta_h,
-                               self.wave_width, self.wave_velocity,
-                               self.x_escarpment, self.wave_calibration,
-                               self.U_inf)
-        return fn
+        mask = uplift_mask(self.boundary_status, (self.grid_ny, self.grid_nx))
+        rate = self._driver_wave_rate()
+        return lambda k, dt: rate(k, dt) * mask * dt     # the adapter's WaveUplift arithmetic

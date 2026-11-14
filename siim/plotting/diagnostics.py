@@ -84,14 +84,14 @@ def _draw_steady_state(data, z_max, ax, fig_width):
             panel.axvline(time[data.index], color=COLORS['alternative'], ls=':', lw=1)
         style_axes(panel, scientific=panel is axes[1])
     if owns_fig:
-        fig.suptitle(_format_steady_state(data), fontsize=11)
+        fig.suptitle(_format_steady_state(data))
 
 
 class DiagnosticsMixin:
     """Convergence diagnostics."""
 
     def steady_state(self, tol_E=0.05, tol_z=0.1, window=5, z_max=None, *,
-                     plot=True, verbose=False, ax=None, fig_width=10):
+                     plot=True, verbose=False, ax=None, fig_width=12):
         """First output where erosion and elevation trend satisfy the tolerances.
 
         Spatial-mean erosion must match mean uplift within ``tol_E`` (relative),

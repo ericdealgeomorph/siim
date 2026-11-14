@@ -11,11 +11,16 @@ so the numerical core stays importable without the fastscape stack.
 All public entry points are ``@numba.njit(cache=True)`` and topology-agnostic:
 scalar (or small fixed-size) inputs, called per-node by the skeleton kernels.
 The ``_*_func`` / ``_dz*_func`` helpers are the per-law residuals and their
-derivatives used by the bracketed Newton iterations.
+derivatives used by the bracketed Newton iterations. The one plain-numpy
+entry point, :func:`ice_speeds`, runs those closures backwards on stored
+output (post-hoc ice speed for display).
 """
 import math
 
 import numba
+import numpy as np
+
+from ..constants import RHO_ICE_G, cg_prefactor
 
 # Sliding-law dispatch codes for the law_code skeleton kernels (one real-file
 # @njit kernel per mode x routing branches on these; per-law physics lives in
@@ -170,34 +175,33 @@ def _solver_nonlinear_dinf(zo_i, n_rec, receivers_i, weights_i, lengths_i,
     eff-exp / power glacial branches pass their own ``(A, p)``. Returns the
     updated node elevation ``z_i``.
 
-    Allocation-free (audit N31): the D-inf pack carries at most 2 receivers
-    per cell (``receivers`` is (n, 2)), so the per-receiver prefactors live in
-    scalars instead of per-call heap arrays -- same arithmetic, same order,
-    bit-for-bit with the array form it replaced.
+    Genuinely k-ary: the per-receiver prefactors and receiver surfaces are
+    gathered into two small fixed-size locals (``n_rec`` slots, i.e. 2 under
+    D-inf and 8 under MFD), so EVERY active receiver enters the residual, its
+    derivative and the bracket's lower bound. The earlier allocation-free form
+    (audit N31) held only the first and the last active receiver in scalar
+    pairs, which is exact at the D-inf arity it was written for but silently
+    dropped receivers ``1 .. k-2`` at k > 2 -- under-eroding, and (when a
+    dropped middle receiver held the lowest surface) bracketing the root out of
+    reach entirely. Same arithmetic in the same order at k <= 2, so the D-inf
+    path is bit-for-bit with the scalar form it replaced.
     """
-    G0 = 0.0
-    G1 = 0.0
-    zr0 = 0.0
-    zr1 = 0.0
+    G = np.empty(n_rec)
+    ZR = np.empty(n_rec)
     n_active = 0
     for k in range(n_rec):
         L = lengths_i[k]
         if L <= 0.0:
             continue
-        g = weights_i[k] * (dt / L ** p) * A
-        zr = z_flat[receivers_i[k]]
-        if n_active == 0:
-            G0 = g
-            zr0 = zr
-        else:
-            G1 = g
-            zr1 = zr
+        G[n_active] = weights_i[k] * (dt / L ** p) * A
+        ZR[n_active] = z_flat[receivers_i[k]]
         n_active += 1
     if n_active == 0:
         return zo_i
-    lo = zr0
-    if n_active > 1 and zr1 < lo:
-        lo = zr1
+    lo = ZR[0]
+    for k in range(1, n_active):
+        if ZR[k] < lo:
+            lo = ZR[k]
     if zo_i <= lo:
         return zo_i
     hi = zo_i
@@ -205,15 +209,11 @@ def _solver_nonlinear_dinf(zo_i, n_rec, receivers_i, weights_i, lengths_i,
     for _ in range(max_iter):
         F = zik - zo_i
         dF = 1.0
-        dz = zik - zr0
-        if dz > 0.0:
-            F  += G0 * dz ** p
-            dF += p * G0 * dz ** (p - 1.0)
-        if n_active > 1:
-            dz = zik - zr1
+        for k in range(n_active):
+            dz = zik - ZR[k]
             if dz > 0.0:
-                F  += G1 * dz ** p
-                dF += p * G1 * dz ** (p - 1.0)
+                F  += G[k] * dz ** p
+                dF += p * G[k] * dz ** (p - 1.0)
         if F > 0.0:
             hi = zik
         elif F < 0.0:
@@ -390,10 +390,6 @@ def _solver_glacial_coulomb(zio, zr, Qg, A_pre, ell, t,
         return zik                                      # already at the root
 
     for _ in range(max_iter):
-        dz = zik - zr
-        if dz <= 0.0:
-            return zik
-
         step = F / dF
 
         # Armijo backtracking: halve until zik_new > zr AND |F_new| < |F|.
@@ -672,9 +668,12 @@ def _modeb_closure(law_code, from_slope, x, qi, L, hc_over_H,
                    cg, lambda_p, lambda_c, tau_c, rho_g_g, clamp):
     """Dispatch the mode-B joint-walk H-closure on ``law_code``.
 
-    The skeleton calls this at the three closure sub-sites (interior,
-    border-normal, border-degenerate); the inactive law's constants are passed
-    as 0.0 by the thin wrappers and reach only the unused branch.
+    Called at each skeleton's interior closure: from ``a`` in the mode-B walks
+    (2D and 1D), from the surface slope in mode A, whose border cells also
+    close this way (``step._H_from_QS_modeA``). A mode-B border copies its
+    dominant donor's thickness (zero gradient) and calls no closure. The
+    inactive law's constants are passed as 0.0 by the thin wrappers and reach
+    only the unused branch.
     """
     if law_code == LAW_EFFEXP:
         return _modeb_closure_effexp(from_slope, x, qi, L, hc_over_H, cg, lambda_p)
@@ -683,3 +682,56 @@ def _modeb_closure(law_code, from_slope, x, qi, L, hc_over_H,
     else:
         return _modeb_closure_coulomb(from_slope, x, qi, L, hc_over_H,
                                       cg, lambda_c, tau_c, rho_g_g, clamp)
+
+
+def ice_speeds(H, Qg, sliding_law, alpha_g, Ac, lambda_p, lambda_c, tau_c,
+               receivers=None):
+    """Ice speeds (m/yr) recovered post hoc from a closure pair (H, Qg).
+
+    No velocity is stored; it is implied exactly by the flux closure when the
+    closure solved this H from this Qg (the pair
+    :func:`siim._core.outputs.closure_pair` reads off a run). With the
+    channel width W = alpha_g*H
+    the cross-section mean speed is ``U = Qg / (alpha_g*H**2)`` under every
+    law. The depth-mean deformation speed is ``ud = (2*Ac/5)*kt*tau**3*H``
+    (n = 3), sliding is ``ub = U - ud``, and the surface speed is
+    ``us = ub + (5/4)*ud``, so ``U <= us <= 1.25*U``.
+
+    - ``'power'``: ``ud = U*H**2/(lambda_p**2 + H**2)``, closed form.
+    - ``'coulomb'``: the closure ``U = ud*(1 + lambda_c/(H*(1 - y)))`` with
+      ``y = (tau/tau_c)**3`` is a quadratic in y with exactly one root in
+      [0, 1); it is taken in its cancellation-free form.
+    - ``'eff-exp'``: the law has no deformation/sliding split, so ``us = U``.
+
+    Exact only where H is the closure's own: not after
+    ``H_diffusivity`` smoothing, and not at an outlet (self-receiving) cell,
+    whose H is its dominant donor's copied thickness rather than a solve
+    with its own Qg. Pass the frame's flat-index ``receivers`` to return 0
+    at outlets (NaN receivers count as outlets). Cells with H <= 0 or
+    Qg <= 0 also return 0. Returns ``(us, U)``, arrays shaped like H.
+    """
+    H = np.asarray(H, dtype=float)
+    Qg = np.asarray(Qg, dtype=float)
+    icy = (H > 0.0) & (Qg > 0.0)
+    if receivers is not None:
+        rec = np.asarray(receivers, dtype=float).reshape(H.shape)
+        idx = np.arange(H.size).reshape(H.shape)
+        icy &= (rec != idx) & ~np.isnan(rec)    # outlet: self or NaN receiver
+    Hs = np.where(icy, H, 1.0)
+    U = np.where(icy, Qg / (alpha_g * Hs * Hs), 0.0)
+    if sliding_law == 'power':
+        ud = U * Hs * Hs / (lambda_p * lambda_p + Hs * Hs)
+    elif sliding_law == 'coulomb':
+        # U = a*y + b*y/(1 - y)  <=>  a*y**2 - (a + b + U)*y + U = 0;
+        # cg/(alpha_g (rho g)^3) = kt*(2A/5), the depth-mean Glen factor
+        k = cg_prefactor(alpha_g, Ac) / (alpha_g * RHO_ICE_G ** 3) * tau_c ** 3
+        a, b = k * Hs, k * lambda_c
+        # discriminant (a+b+U)^2 - 4aU written as a sum of non-negatives
+        disc = (a - U) ** 2 + b * b + 2.0 * b * (a + U)
+        y = 2.0 * U / (a + b + U + np.sqrt(disc))
+        ud = a * y
+    elif sliding_law == 'eff-exp':
+        ud = np.zeros_like(U)
+    else:
+        raise ValueError(f"unknown sliding_law {sliding_law!r}")
+    return U + 0.25 * ud, U          # ud = 0 wherever U = 0

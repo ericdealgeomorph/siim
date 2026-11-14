@@ -24,6 +24,9 @@ dependencies:
   - matplotlib
   - pandas
   - numba
+  # numba's TBB threading layer, which siim picks when numba can load it
+  # (bit-for-bit, faster); optional, workqueue otherwise.
+  - tbb
   - tqdm
   - fastscape
   - fastscapelib-f2py

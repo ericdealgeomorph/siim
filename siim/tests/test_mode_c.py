@@ -61,7 +61,7 @@ def _cfg(**ov):
         # Pin the mode-C standard flags off: these gates isolate the citizen /
         # carve behaviour, so the carve-on and carve-off twins differ only in
         # carve_width (Gate A is already carve-off; Gate B compares carve twins).
-        trunk_surface=False, routing_relax=0.0)
+        trunk_surface=False)
     base.update(ov)
     return base
 

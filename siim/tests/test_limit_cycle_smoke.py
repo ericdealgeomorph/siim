@@ -39,6 +39,8 @@ def test_m44_limit_cycle_and_phase_smoke():
         progress_bar=False))
     m.run()
 
+    # gate: the merged API makes these research helpers private; the figure,
+    # period, amplitude and phase-data expectations below are retained.
     assert not hasattr(m.plot, 'limit_cycle')
     assert not hasattr(m.plot, 'limit_cycle_phase')
     fig, info = m.plot._limit_cycle()

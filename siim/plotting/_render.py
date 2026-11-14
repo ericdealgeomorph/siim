@@ -1,51 +1,67 @@
 """Shared rendering backend for the siim plotting package.
 
 Hosts the one notebook slider viewer (``_slider_view``), the colorbar helper,
-and the numba glacier-field rendering backend — rasterizers, soft hillshade,
-glacier-path tracing, priority-flood lakes, variable-sigma smoothing, the
-diagnostic path overlay, and the footprint ice-surface / smoothed-mask helpers —
-relocated here from the old ``siim2d_plotting`` module. See
-``docs/guides/outputs_and_io.md`` for the public plotting contract.
+the receiver-network helpers, and the numba glacier-field rendering backend:
+rasterizers, soft hillshade, glacier-path tracing, priority-flood lakes,
+variable-sigma smoothing, the diagnostic path overlay, and the footprint
+ice-surface / smoothed-mask helpers. See ``docs/guides/outputs_and_io.md`` for
+the public plotting contract.
 
 numpy/numba/scipy + the carve kernels at import; matplotlib/ipywidgets stay
 lazy inside the viewer/colorbar so the slider path imports light.
 """
 
+import functools
+
 import numpy as np
 import numba
 from scipy.ndimage import map_coordinates, gaussian_filter
 
-from .._output import output_path
 from ..constants import HC_OVER_H
+from .._palette import COLORS
 from .._core.carve import _carve_offsets, _power_dt_2d, _power_dt_2d_periodic
+from .._core.outputs import _donor_lists, _sanitized_receivers
 
 __all__ = [
-    "_slider_view", "_profile_slider", "_add_colorbar", "output_path",
+    "_slider_view", "_profile_slider", "_add_colorbar",
+    "_sanitized_receivers", "_donor_lists",
     "_smoothed_glacier_paths", "_trace_paths_arrays", "_footprint_ice_surface",
-    "_smooth_ice_mask", "_field_ice_mask", "_clean_ice_mask", "_mean_recent_H",
-    "_priority_flood", "_shade_rgb_soft", "_ice_ramp", "ICE_RAMP_STOPS",
+    "_smooth_ice_mask", "_field_ice_mask", "_clean_ice_mask",
+    "_priority_flood", "_shade_rgb_soft", "_shade_stretch", "_ice_ramp",
+    "ICE_RAMP_STOPS", "_water_flux_ramp",
     "_channel_closure", "_trunk_ribbons",
 ]
 
 # The glacier ramp of the depth-graded ('veil') ice shading: thin apron ->
-# trunk core. Deliberately avoids both ends of the bed map (gist_earth's navy
-# lowlands and white summits), so ice never reads as terrain.
+# trunk core. Blues only: the default bed map (turku, ``_colormaps``) has none,
+# so ice never reads as terrain. Every depth-coded ice map uses it
+# (``map(field='ice')`` and ``flux('ice')`` too).
 ICE_RAMP_STOPS = ('#eaf3fa', '#c5dff0', '#8ec4e3', '#4e9fd0', '#1f6fb0')
-_ICE_RAMP_CACHE = {}
+
+
+@functools.cache
+def _ramp(name, stops):
+    """A ``LinearSegmentedColormap`` from ``stops``, built lazily (matplotlib
+    stays out of this module's import) and cached — ``animate_landscape``
+    asks per frame."""
+    from matplotlib.colors import LinearSegmentedColormap
+    return LinearSegmentedColormap.from_list(name, list(stops))
 
 
 def _ice_ramp():
-    """The ``ICE_RAMP_STOPS`` colormap, built lazily (matplotlib stays out of
-    this module's import) and cached — ``animate_landscape`` asks per frame."""
-    if 'cmap' not in _ICE_RAMP_CACHE:
-        from matplotlib.colors import LinearSegmentedColormap
-        _ICE_RAMP_CACHE['cmap'] = LinearSegmentedColormap.from_list(
-            'siim_glacier', list(ICE_RAMP_STOPS))
-    return _ICE_RAMP_CACHE['cmap']
+    """The ``ICE_RAMP_STOPS`` colormap."""
+    return _ramp('siim_glacier', tuple(ICE_RAMP_STOPS))
+
+
+def _water_flux_ramp():
+    """``flux('water')``'s sequential map: a pale tint up to the profile
+    panels' water-flux hue, ``COLORS['water_flux']``, so a river reads in one
+    colour on maps and profiles."""
+    return _ramp('siim_water_flux', ('#fbefe6', COLORS['water_flux']))
 
 
 # =====================================================================
-# Glacier-field rendering backend (relocated verbatim from siim2d_plotting)
+# Glacier-field rendering backend
 # =====================================================================
 
 @numba.njit(cache=True)
@@ -139,11 +155,12 @@ def _rasterize_glacier_vertices_payload(H_raster, payload_raster,
 
 
 @numba.njit(cache=True)
-def _shade_rgb_soft_kernel(rgb, z, dx, dy, ve, Lx, Ly, Lz):
-    """In-place soft-light hillshade matching ``LightSource.shade_rgb(
-    blend_mode='soft')``. Two passes: gradient + intensity + min/max,
-    then full-range normalize + Pegtop blend.
-    """
+def _illumination(z, dx, dy, ve, Lx, Ly, Lz):
+    """``(intensity, imin, imax)``: the Lambertian illumination n.L of ``z``
+    (central differences inside, one-sided at the edges, as
+    ``np.gradient``) and its range, NaN ignored. The one home of the
+    hillshade's light geometry: the kernel shades with it and a movie
+    freezes its range (:func:`_shade_stretch`)."""
     ny, nx = z.shape
     intensity = np.empty((ny, nx), dtype=np.float64)
     inv_dx = 1.0 / dx
@@ -175,44 +192,76 @@ def _shade_rgb_soft_kernel(rgb, z, dx, dy, ve, Lx, Ly, Lz):
                 imin = d
             if d > imax:
                 imax = d
+    return intensity, imin, imax
+
+
+@numba.njit(cache=True)
+def _shade_rgb_soft_kernel(rgb, z, dx, dy, ve, Lx, Ly, Lz, lo, hi):
+    """In-place soft-light hillshade matching ``LightSource.shade_rgb(
+    blend_mode='soft')``: the illumination, normalized over its range,
+    then the Pegtop blend. ``lo < hi`` replaces the intensity's own
+    min/max with that fixed stretch; NaN keeps it.
+    """
+    intensity, imin, imax = _illumination(z, dx, dy, ve, Lx, Ly, Lz)
+    if hi > lo:
+        imin = lo
+        imax = hi
     # Match matplotlib's shade_normals: contrast-stretch only when the span is
-    # resolvable (> 1e-6); otherwise CLIP the raw intensity to [0, 1] so a flat
-    # field blends at t = sin(alt) (~0.707, a light brightening) instead of the
-    # old t = 0 darkening + noise amplification (audit m29).
+    # resolvable (> 1e-6), and clip to [0, 1] either way, so a flat field
+    # blends at t = sin(alt) (~0.707, a light brightening) instead of the old
+    # t = 0 darkening + noise amplification (audit m29).
     span = imax - imin
     normalize = span > 1e-6
     inv_span = 1.0 / span if normalize else 0.0
+    ny, nx = z.shape
     for i in range(ny):
         for j in range(nx):
-            if normalize:
-                t = (intensity[i, j] - imin) * inv_span
-            else:
-                t = intensity[i, j]
-                if t < 0.0:
-                    t = 0.0
-                elif t > 1.0:
-                    t = 1.0
+            t = (intensity[i, j] - imin) * inv_span if normalize else intensity[i, j]
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
             two_t = 2.0 * t
             for c in range(3):
                 r = rgb[i, j, c]
                 rgb[i, j, c] = two_t * r + r * r * (1.0 - two_t)
 
 
-def _shade_rgb_soft(rgb, z, dx, dy, ve, azdeg, altdeg):
-    """Numba drop-in for ``LightSource(azdeg, altdeg).shade_rgb(
-    rgb, z, vert_exag=ve, dx=dx, dy=dy, blend_mode='soft')``. Returns
-    a fresh shaded RGB array. dy is negated to match matplotlib's
-    image-row convention so output matches bit-for-bit."""
+def _light_vector(azdeg, altdeg):
+    """Unit vector towards the light (x east, y north, z up)."""
     az = np.radians(azdeg)
     alt = np.radians(altdeg)
-    Lx = np.sin(az) * np.cos(alt)
-    Ly = np.cos(az) * np.cos(alt)
-    Lz = np.sin(alt)
+    return np.sin(az) * np.cos(alt), np.cos(az) * np.cos(alt), np.sin(alt)
+
+
+def _shade_rgb_soft(rgb, z, dx, dy, ve, azdeg, altdeg, stretch=None):
+    """Soft-light hillshade of ``rgb`` by ``z`` laid out as the map draws it
+    (``origin='lower'``: row ``i + 1`` lies NORTH of row ``i``), lit from
+    ``azdeg`` clockwise from north. It equals matplotlib's
+    ``np.flipud(LightSource(azdeg, altdeg).shade_rgb(np.flipud(rgb),
+    np.flipud(z), vert_exag=ve, dx=dx, dy=dy, blend_mode='soft'))``:
+    LightSource takes row 0 as the TOP row. Returns a fresh shaded RGB array.
+
+    The illumination is stretched to its own [min, max] per call, as
+    matplotlib does; ``stretch=(imin, imax)`` fixes that range instead
+    (see :func:`_shade_stretch`), so the shading of one hill does not
+    change with relief elsewhere (a movie freezes it)."""
+    Lx, Ly, Lz = _light_vector(azdeg, altdeg)
+    lo, hi = (np.nan, np.nan) if stretch is None else stretch
     out = np.ascontiguousarray(rgb, dtype=np.float64).copy()
     z_c = np.ascontiguousarray(z, dtype=np.float64)
-    _shade_rgb_soft_kernel(out, z_c, float(dx), float(-dy), float(ve),
-                           Lx, Ly, Lz)
+    _shade_rgb_soft_kernel(out, z_c, float(dx), float(dy), float(ve),
+                           Lx, Ly, Lz, float(lo), float(hi))
     return out
+
+
+def _shade_stretch(z, dx, dy, ve, azdeg, altdeg):
+    """(min, max) of the illumination :func:`_shade_rgb_soft` computes on
+    ``z`` (same layout and differences): the range it stretches per call."""
+    _, imin, imax = _illumination(np.ascontiguousarray(z, dtype=np.float64),
+                                  float(dx), float(dy), float(ve),
+                                  *_light_vector(azdeg, altdeg))
+    return float(imin), float(imax)
 
 
 def _trace_paths_arrays(rec_2d, H_2d, area_2d, nx, ny, Lx, Ly, channel_threshold):
@@ -236,12 +285,7 @@ def _trace_paths_arrays(rec_2d, H_2d, area_2d, nx, ny, Lx, Ly, channel_threshold
     dx_grid = Lx / (nx - 1)
     dy_grid = Ly / (ny - 1)
 
-    # NaN receivers (zarr round-trip artifacts at boundary nodes) map to
-    # SELF, not node 0 — nan_to_num's 0 is the corner cell, which could
-    # grow a bogus path segment from nodes near the corner.
-    rec_flat = rec_2d.flatten()
-    rec = np.where(np.isnan(rec_flat), np.arange(rec_flat.size),
-                   rec_flat).astype(int)
+    rec = _sanitized_receivers(rec_2d)
     H = H_2d.flatten()
     area = area_2d.flatten()
     nn = rec.size
@@ -252,11 +296,7 @@ def _trace_paths_arrays(rec_2d, H_2d, area_2d, nx, ny, Lx, Ly, channel_threshold
 
     is_active = (H > 0) & (area >= channel_threshold)
 
-    donor_list = [[] for _ in range(nn)]
-    for j in range(nn):
-        r = rec[j]
-        if r != j:
-            donor_list[r].append(j)
+    donor_list = _donor_lists(rec)
 
     heads = [j for j in range(nn)
              if is_active[j] and not any(is_active[d] for d in donor_list[j])]
@@ -542,16 +582,6 @@ def _smoothed_glacier_paths(rec_2d, H_2d, area_2d, nx, ny, Lx, Ly,
     return paths_xy
 
 
-def _sanitized_receivers(rec_in):
-    """Flat int receiver array with NaNs mapped to SELF — the zarr round-trip
-    artefact at boundary nodes that ``_trace_paths_arrays`` and
-    ``_footprint_ice_surface`` both guard against (``nan_to_num``'s 0 is the
-    corner cell, which would grow a bogus path from every such node)."""
-    rec_flat = np.asarray(rec_in, dtype=float).ravel()
-    return np.where(np.isnan(rec_flat), np.arange(rec_flat.size),
-                    rec_flat).astype(np.int64)
-
-
 def _channel_closure(H_2d, rec_in, seed_mask):
     """Trunk class: the DOWNSTREAM CLOSURE of ``seed_mask`` along the receivers.
 
@@ -605,7 +635,9 @@ def _trunk_ribbons(rec_2d, H_2d, area_2d, zs_2d, cells, nx, ny, Lx, Ly,
     ``H`` — the carve convention) and the FLAT source ice surface
     ``zs = zb + hc_over_H*H`` carried along the path, so the render shades the
     glacier's own free surface rather than the bed under it. Ice-free pixels
-    keep depth 0.
+    keep depth 0, and their surface is an unset 0: read it only where
+    ``depth > 0``. ``hc_over_H`` is the scalar datum or a per-cell field
+    (mode D's ``hc_cell``), interpolated along the path.
     """
     H_2d = np.asarray(H_2d, dtype=float)
     dx_grid = Lx / (nx - 1)
@@ -625,6 +657,7 @@ def _trunk_ribbons(rec_2d, H_2d, area_2d, zs_2d, cells, nx, ny, Lx, Ly,
     paths, xc, yc, H_flat = _trace_paths_arrays(
         rec_2d, H_cls, area_2d, nx, ny, Lx, Ly, 0.0)
     zs = np.asarray(zs_2d, dtype=float).ravel()
+    hc = np.broadcast_to(np.asarray(hc_over_H, dtype=float), H_2d.shape).ravel()
 
     seg = {k: [] for k in ('x1', 'y1', 'x2', 'y2', 'h1', 'h2',
                            'w1', 'w2', 'z1', 'z2')}
@@ -662,7 +695,7 @@ def _trunk_ribbons(rec_2d, H_2d, area_2d, zs_2d, cells, nx, ny, Lx, Ly,
         py_d = pin * py_d + (1.0 - pin) * py_raw
 
         pw_d = np.maximum(pw_d, width_floor)
-        ph_d = hc_over_H * ph_d
+        ph_d = np.interp(s_d, s, hc[idx]) * ph_d
 
         for key, arr in (('x', px_d), ('y', py_d), ('h', ph_d),
                          ('w', pw_d), ('z', pz_d)):
@@ -695,8 +728,8 @@ def _trunk_ribbons(rec_2d, H_2d, area_2d, zs_2d, cells, nx, ny, Lx, Ly,
         off_x, off_y = off_x[crosses], off_y[crosses]
         if src.size:
             H_flat_cls = H_cls.ravel()
-            h_s = hc_over_H * H_flat_cls[src]
-            h_r = hc_over_H * H_flat_cls[rcv]
+            h_s = hc[src] * H_flat_cls[src]
+            h_r = hc[rcv] * H_flat_cls[rcv]
             w_s = np.maximum(np.minimum(alpha_g * H_flat_cls[src], max_width),
                              width_floor)
             w_r = np.maximum(np.minimum(alpha_g * H_flat_cls[rcv], max_width),
@@ -736,7 +769,7 @@ def _trunk_ribbons(rec_2d, H_2d, area_2d, zs_2d, cells, nx, ny, Lx, Ly,
 def _footprint_ice_surface(H_in, zb_in, rec_in, alpha_g, dy, dx,
                            wrap_y, wrap_x, H_threshold=0.0,
                            area_in=None, area_threshold=0.0,
-                           hc_over_H=HC_OVER_H):
+                           hc_over_H=HC_OVER_H, value=None):
     """Glacier-footprint ice surface for display — the rendering dual of
     the sub-grid width carve, built from the SAME machinery (union of
     discs R = alpha_g*H/2, power-diagram attribution; seam-aware along
@@ -769,16 +802,18 @@ def _footprint_ice_surface(H_in, zb_in, rec_in, alpha_g, dy, dx,
     the ice-filled surface (max of terrain and footprint ice surface),
     the cells under ice (footprint fill OR carrying H > H_threshold
     themselves), and the local ice column z_filled - zb_in (at a source
-    cell exactly HC_OVER_H*H)."""
+    cell exactly HC_OVER_H*H).
+
+    With a per-cell ``value`` (e.g. ice speed) a fourth array is returned:
+    each ice cell carries the value of the cell whose ice surface it shows —
+    the attributed source where that source's ice is on top, else its own —
+    and 0 off the ice."""
     ny, nx = H_in.shape
     # consistently-timed presented surface (bare cells: zs = bed)
     zs = zb_in + hc_over_H * H_in
-    # NaN receivers (zarr round-trip artifacts at boundary nodes) map to
-    # SELF — same sanitization as _trace_paths_arrays; self-receiving
-    # cells are excluded as seeds, mirroring the carve.
-    rec_flat = np.asarray(rec_in, dtype=float).ravel()
-    rec = np.where(np.isnan(rec_flat), np.arange(rec_flat.size),
-                   rec_flat).astype(np.int64)
+    # NaN receivers map to SELF; self-receiving cells are excluded as seeds,
+    # mirroring the carve.
+    rec = _sanitized_receivers(rec_in)
     # Seed/own-ice gate: column thickness AND (optionally) upstream drainage
     # area. Area gates only SOURCES — it never vetoes a cell that lies under a
     # larger glacier's footprint (that cell is attributed, not a seed).
@@ -793,9 +828,11 @@ def _footprint_ice_surface(H_in, zb_in, rec_in, alpha_g, dy, dx,
     n_seed = _carve_offsets(H_seed.ravel(), rec, float(alpha_g),
                             offsets.ravel(), seed_mask)
     ice_cells = seed_ok
+    shown = None if value is None else np.where(ice_cells, value, 0.0)
     if n_seed == 0:
         depth = np.where(ice_cells, hc_over_H * H_in, 0.0)
-        return zs.copy(), ice_cells, depth
+        out = (zs.copy(), ice_cells, depth)
+        return out if shown is None else out + (shown,)
     D = np.empty((ny, nx))
     SRC = np.empty((ny, nx), dtype=np.int64)
     if wrap_y or wrap_x:
@@ -806,9 +843,13 @@ def _footprint_ice_surface(H_in, zb_in, rec_in, alpha_g, dy, dx,
     ice_top = np.full((ny, nx), -np.inf)
     ice_top[inside] = zs.flat[SRC[inside]]
     z_filled = np.maximum(zs, ice_top)
-    ice_mask = (ice_top > zs + 1e-9) | ice_cells
+    on_top = ice_top > zs + 1e-9
+    ice_mask = on_top | ice_cells
     depth = np.where(ice_mask, np.maximum(z_filled - zb_in, 0.0), 0.0)
-    return z_filled, ice_mask, depth
+    if shown is None:
+        return z_filled, ice_mask, depth
+    shown[on_top] = np.asarray(value, dtype=float).flat[SRC[on_top]]
+    return z_filled, ice_mask, depth, shown
 
 
 def _smooth_ice_mask(mask_nat, Y, X, sigma):
@@ -927,36 +968,28 @@ def _clean_ice_mask(mask, min_native_cells, oversample, wrap_y=False,
     return m
 
 
-def _mean_recent_H(H_out, i, k):
-    """Trailing-mean ice thickness over the last ``k`` output frames ending at
-    frame ``i`` (``ice_time_avg``), clamped at the start of the run.
+def _add_colorbar(mappable, ax, label='', location='right', size='4%', pad=0.05,
+                  divider=None, **kwargs):
+    """Use the figure layout engine, or a matched-height axes divider.
 
-    Display-only smoothing for the ICE layer (mask + depth/fill inputs); the
-    model state is untouched. ``i`` is normalised to a non-negative index first,
-    so ``i = -1`` averages the window ending at the last frame. ``k <= 1`` returns
-    frame ``i`` unchanged (identity)."""
-    H_out = np.asarray(H_out)
-    n = H_out.shape[0]
-    i = int(i) % n
-    k = max(1, int(k))
-    lo = max(0, i - k + 1)
-    return H_out[lo:i + 1].mean(axis=0)
-
-
-def _add_colorbar(mappable, ax, label='', location='right', size='4%', pad=0.05):
-    """Use the figure layout engine, or a matched-height axes divider."""
+    A caller stacking several bars beside one axes passes its own ``divider``
+    (``make_axes_locatable(ax)``), which they then share whatever the layout
+    engine; ``kwargs`` (``extend``, ...) go to ``Figure.colorbar``."""
     # AxesDivider positions its colorbar after constrained layout has solved
     # the figure, so labels can land outside the canvas. Let that layout engine
     # own the bar; plain/custom landscape layouts still use the matched divider.
-    if ax.figure.get_constrained_layout():
+    if divider is None and ax.figure.get_constrained_layout():
         return ax.figure.colorbar(mappable, ax=ax, label=label, location=location,
-                                   fraction=float(size.rstrip('%')) / 100, pad=pad)
-    from mpl_toolkits.axes_grid1 import make_axes_locatable
-    cax = make_axes_locatable(ax).append_axes(location, size=size, pad=pad)
-    return ax.figure.colorbar(mappable, cax=cax, label=label)
+                                   fraction=float(size.rstrip('%')) / 100, pad=pad,
+                                   **kwargs)
+    if divider is None:
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        divider = make_axes_locatable(ax)
+    cax = divider.append_axes(location, size=size, pad=pad)
+    return ax.figure.colorbar(mappable, cax=cax, label=label, **kwargs)
 
 
-def _slider_view(make_draw, sliders, *, figsize, fmt=None):
+def _slider_view(make_draw, sliders, *, figsize):
     """The one notebook slider viewer — used by every ``view_*``.
 
     A persistent ``ipympl`` canvas built **once** and redrawn in place via
@@ -966,10 +999,9 @@ def _slider_view(make_draw, sliders, *, figsize, fmt=None):
     inline on later cells; other (static) plots are unaffected.
 
     The caller supplies ``make_draw(fig)``, called once to set up ``fig`` and
-    return a ``draw(*idxs)`` that renders the frame(s). ``sliders`` is a list of
-    ``(n, label, start)`` tuples — one ``IntSlider`` each (``start < 0`` counts
-    from the end). ``fmt(*idxs) -> str`` optionally labels a row above the canvas
-    (profile viewers draw their own in-plot title instead and pass ``fmt=None``).
+    return a ``draw(*idxs)`` that renders the frame(s), its title included.
+    ``sliders`` is a list of ``(n, label, start)`` tuples — one ``IntSlider``
+    each (``start < 0`` counts from the end).
 
     Displays the viewer in place and returns ``None`` — returning the slider
     would make the notebook cell auto-display a duplicate of it.
@@ -1014,20 +1046,15 @@ def _slider_view(make_draw, sliders, *, figsize, fmt=None):
                 min=0, max=n - 1, value=v or 0, step=1, description=label,
                 continuous_update=False, readout=False,
                 layout=widgets.Layout(width='98%')))
-        tag = widgets.Label()
 
         def show(*_):
-            idxs = [s.value for s in sl]
-            draw(*idxs)
-            if fmt is not None:
-                tag.value = fmt(*idxs)
+            draw(*[s.value for s in sl])
             fig.canvas.draw_idle()
 
         for s in sl:
             s.observe(show, names='value')
         show()
-        children = list(sl) + ([tag] if fmt is not None else []) + [fig.canvas]
-        display(widgets.VBox(children))
+        display(widgets.VBox(list(sl) + [fig.canvas]))
         Gcf.figs.pop(fig.canvas.manager.num, None)  # detach: no static re-render
     except BaseException:
         if fig is not None:
@@ -1038,17 +1065,17 @@ def _slider_view(make_draw, sliders, *, figsize, fmt=None):
     # No return: returning the slider would make the cell auto-display a duplicate.
 
 
-def _profile_slider(frame, n_frames, n_panels, times, *, fig_width=12,
-                    aspect=0.27, legend=False, start=-1, legend_loc='upper left'):
+def _profile_slider(frame, n_frames, n_panels, *, fig_width=12, aspect=0.27,
+                    legend=False):
     """Shared profile slider (1D + 2D ``view_profile``): persistent canvas,
-    fixed aspect, despined, integer-kyr title at the right, and an OFF-by-default
+    fixed aspect, despined, opening on the last frame, and an OFF-by-default
     **static** legend (same entries every frame, so they don't pop in/out as ice
     comes and goes).
 
     ``frame(axes, idx)`` draws every panel for output step ``idx`` into the given
-    axes (clearing + setting limits itself). ``n_panels`` is the stack height;
-    ``times`` is the output-time vector (yr); ``fig_width`` sets the on-screen
-    size and ``aspect`` the per-panel height/width ratio.
+    axes (clearing + setting limits + its time title itself). ``n_panels`` is
+    the stack height; ``fig_width`` sets the on-screen size and ``aspect`` the
+    per-panel height/width ratio.
     """
     import copy
     figsize = (fig_width, fig_width * aspect * n_panels)
@@ -1075,10 +1102,10 @@ def _profile_slider(frame, n_frames, n_panels, times, *, fig_width=12,
                 if cur is not None:
                     cur.remove()
                 if legend:
-                    ax.legend(*static[k], loc=legend_loc, frameon=False, fontsize=8)
+                    ax.legend(*static[k], loc='upper left', frameon=False)
         return draw
 
-    return _slider_view(make_draw, [(n_frames, 'Snapshot', start)],
+    return _slider_view(make_draw, [(n_frames, 'Snapshot', -1)],
                         figsize=figsize)
 
 

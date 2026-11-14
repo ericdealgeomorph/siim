@@ -101,23 +101,8 @@ def test_initial_topography_seeded_and_edges():
 
 
 # ---------------------------------------------------------------------------
-# 4. Routing surface: EMA thickness + hc reconstruction
+# 4. Routing surface: hc reconstruction
 # ---------------------------------------------------------------------------
-def test_ema_thickness_raw_passthrough_at_r_zero():
-    H = np.arange(6.0)
-    out = step.ema_thickness(H, None, 0.0)
-    assert out is H                                     # bit-for-bit: same object
-
-
-def test_ema_thickness_seed_and_update():
-    H = np.array([2.0, 4.0, 6.0])
-    seed = step.ema_thickness(H, None, 0.5)             # first step seeds at H
-    np.testing.assert_array_equal(seed, H)
-    prev = np.array([1.0, 1.0, 1.0])
-    out = step.ema_thickness(H, prev, 0.5)
-    np.testing.assert_array_equal(out, 0.5 * prev + 0.5 * H)
-
-
 def test_routing_surface():
     bed = np.array([[0.0, 1.0], [2.0, 3.0]])
     H = np.array([[10.0, 20.0], [0.0, 5.0]])

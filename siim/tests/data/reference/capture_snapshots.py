@@ -22,7 +22,7 @@ regenerated. Their fidelity to live fortran is re-certified by the conda
 directly (never a regenerated surface — plan decision note 12).
 
 Frozen artifacts are IMMUTABLE outside an explicitly decision-noted sanctioned
-regeneration (five to date; see the plan). CI writes them only with
+regeneration (six to date; see the plan and _memory/decisions/2026-09-23-battery-regeneration-6.md). CI writes them only with
 ``--if-absent`` so a committed reference is never silently overwritten;
 ``test_reference_snapshots.py`` is the reproduce/gate.
 
@@ -70,8 +70,8 @@ import numpy as np
 # Cross-platform float differences (libm, FMA codegen) amplify through the
 # autogenic dynamics to O(1) by the final frame (measured on macOS/arm64,
 # 2026-07-13 — plan doc, S0 platform addendum). ``SIIM_S0_REF_DIR`` points the
-# freeze/gate at a LOCAL battery (convention:
-# ``siim/tests/data/reference_local/``, gitignored) so every platform gates
+# freeze/gate at a LOCAL battery (captured fresh per check, e.g. into
+# ``.scratch/reference_local/``, gitignored) so every platform gates
 # bit-for-bit against references frozen on that platform; the committed
 # ``.npz`` stay immutable and authoritative in CI.
 REF_DIR = Path(os.environ.get('SIIM_S0_REF_DIR') or Path(__file__).resolve().parent)
@@ -122,7 +122,7 @@ def _bl_series():
 
 
 def matrix():
-    """Return ``{key: config}`` for the ~14-config deterministic battery:
+    """Return ``{key: config}`` for the 16-config deterministic battery:
     {mode A, B, C} x {SFR, dinf} x {flexure off; flexure on, ice_load} + a
     bl(t) forcing case on each routing (mode B). Carve is NOT an independent
     axis: mode C = B + carve (DEFAULT_MODE_2D='C')."""
@@ -139,6 +139,14 @@ def matrix():
     for routing in ('single', 'dinf'):
         cfgs[f"B_{routing}_blstep"] = _base(
             mode='B', flow_routing=routing, bl=_bl_series())
+    # MFD in valleys (sanctioned regeneration #6, 2026-09-23): mode C under the
+    # multiple-flow-direction router — the carve and the routing-only trunk V at
+    # the router-derived dip (constants.TRUNK_DIP_K_MFD).
+    for flex in (False, True):
+        ov = dict(mode='C', flow_routing='mfd')
+        if flex:
+            ov.update(flexure=True, ice_load=True, e_thickness=20e3)
+        cfgs[f"C_mfd_{'flexon' if flex else 'flexoff'}"] = _base(**ov)
     return cfgs
 
 

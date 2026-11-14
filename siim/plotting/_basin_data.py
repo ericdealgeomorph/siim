@@ -6,10 +6,12 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from .._core.outputs import _donor_lists, _sanitized_receivers
+
 try:
     from numpy.exceptions import RankWarning as _RankWarning
 except ImportError:
-    _RankWarning = np.RankWarning
+    _RankWarning = np.RankWarning  # noqa: NPY201 numpy < 1.25 has no numpy.exceptions; this branch only runs there
 
 
 def _basin_count(value):
@@ -104,19 +106,11 @@ def basin_history_data(m, n_basins, ref, t_start, t_end, n_samples, channel_thre
     for k, t in enumerate(steps):
         sigma_values = m.strahler_order(i=t, channel_threshold=channel_threshold).sigma
         sigma_ts[k] = float(np.mean(sigma_values)) if len(sigma_values) else np.nan
-        rec_t = m.receivers_out[t].flatten()
-        rec_t = np.where(np.isnan(rec_t), np.arange(rec_t.size), rec_t).astype(int)
         area_t = m.area_out[t].flatten()
         lengths_t = m.lengths_out[t].flatten()
         z_flat = m.z_out[t].flatten()
         H_flat = m.H_out[t].flatten()
-        nn = rec_t.size
-
-        donor_list = [[] for _ in range(nn)]
-        for j in range(nn):
-            r_node = rec_t[j]
-            if r_node != j:
-                donor_list[r_node].append(j)
+        donor_list = _donor_lists(_sanitized_receivers(m.receivers_out[t]))
 
         for r, outlet in enumerate(outlets):
             path = [int(outlet)]

@@ -16,8 +16,8 @@ m.plot.map(field='bedrock')      # raster field; or m.plot.landscape() for relie
 
 The 2D model takes the same kind of parameter dict as the 1D model. This is the
 default carved configuration — `'bedrock+ice_thickness'` mode with sub-grid
-glacier-width carving, single-flow routing, and the mode-C routing helpers
-(trunk-surface routing and routing relaxation) — also spelled `mode='C'`. Those
+glacier-width carving, single-flow routing, the mode-C routing helper
+(trunk-surface routing) and the mode-B/C ice damping — also spelled `mode='C'`. Those
 choices are covered in {doc}`../guides/configuring_a_run`; every accepted key is
 listed in {doc}`../guides/parameter_reference`; plotting and saving runs are in
 {doc}`../guides/outputs_and_io`.

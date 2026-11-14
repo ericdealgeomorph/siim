@@ -28,9 +28,7 @@ uv.lock
 
 # Model outputs (large, local)
 model_outputs/
-
-# Escarpment init topos (local)
-escarpment_code/init_topos/*
+docs/dev/ice_sheet_dome_probes/out/
 
 # Cycle-dynamics research scratch (kept local only)
 notebooks/cycle_dynamics/
@@ -79,9 +77,8 @@ notebooks/model_outputs/
 # coverage artifacts
 .coverage
 
-# Locally-frozen S0 reference battery (platform-bound bit-for-bit refs; the
-# committed battery in siim/tests/data/reference/ is the CI/linux one)
-siim/tests/data/reference_local/
-
 # Ephemeral agent scratch (delegated runs write here; never staged).
 .scratch/
+
+# Assessment-suite run outputs (the suite, fixtures and references are tracked).
+assessment/results/

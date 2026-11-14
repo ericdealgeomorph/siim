@@ -37,12 +37,40 @@ It is not needed for simulations, static plots, or interactive viewers.
 
 ## Numba threading
 
-On import, SIIM uses `os.environ.setdefault` to select Numba's `workqueue`
-threading layer when `NUMBA_THREADING_LAYER` is not already set. This
-process-wide default avoids a known macOS interaction between alternate
-threading runtimes and the NumPy/SciPy stack. To choose another installed Numba
-threading layer, set the environment variable **before** importing SIIM; an
-explicit user value is never overwritten.
+On import, SIIM sets Numba's threading-layer priority
+(`NUMBA_THREADING_LAYER_PRIORITY="tbb workqueue omp"`, through
+`os.environ.setdefault`): Numba runs its TBB layer when it can load the TBB
+library, and its own `workqueue` layer otherwise. Results are bit-for-bit the
+same on either layer. TBB is faster: the level-scheduled eroder
+(`parallel_erode`) opens one parallel region per drainage level, and TBB starts
+each one several times more cheaply. Under MFD routing, mode D's default, the
+parallel eroder is on by default only under TBB (see `parallel_erode` in {doc}`../guides/parameter_reference`). On
+Apple silicon the eroder's per-level loops use as many threads as the Mac has
+performance cores; every other parallel kernel uses Numba's full thread count.
+On a 4 + 6 core laptop with TBB, a 101 x 101 grid steps 1.3-1.9x faster in
+modes B and C and 1.1-1.4x faster in mode D than release 0.9.10 did.
+
+The conda environment (`environment.yml`) installs TBB. With pip,
+`python -m pip install 'siim-lem[tbb]'` adds it where PyPI has a `tbb` wheel
+(x86_64 Linux, Windows, Intel Macs); on Apple silicon the extra installs
+nothing and SIIM runs on `workqueue`. In a Linux virtual environment the
+extra alone is not enough: pip puts `libtbb` in the environment's `lib`
+directory, which the system loader does not search, so Numba does not find it
+(tested with Numba 0.68). Point the loader there before starting Python:
+
+```bash
+export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Numba falls back to `workqueue` silently when it cannot load the library;
+`numba.threading_layer()` names the layer in use once a model has run, and
+`python -m numba -s` reports whether TBB is available. Windows and Intel Macs
+are untested.
+
+To choose a layer yourself, set `NUMBA_THREADING_LAYER` (or your own
+`NUMBA_THREADING_LAYER_PRIORITY`) **before** importing SIIM; an explicit user
+value is never overwritten. `NUMBA_NUM_THREADS` and `numba.set_num_threads`
+cap every kernel, the eroder included.
 
 ## Optional: the fastscape adapter (conda)
 

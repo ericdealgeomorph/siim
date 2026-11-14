@@ -36,7 +36,7 @@ def test_import_siim2d_without_stack():
 
 
 def test_full_modeC_run_without_stack():
-    """A full default (mode C: carve + trunk-surface + routing-relax standard)
+    """A full default (mode C: carve + trunk-surface standard)
     run — in-house driver, in-house D8 router, in-house flexure — completes and
     produces finite outputs with the stack absent."""
     from siim.siim2d import siim as siim2d

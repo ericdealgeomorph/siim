@@ -7,16 +7,62 @@ Every model carries a plotter at `m.plot`:
 - **1D** — `m.plot.profile()` draws the long profile and returns
   `(fig, axes)`.
 - **2D raw fields** — `m.plot.map(field='bedrock')` displays one stored raster
-  without terrain smoothing and returns the `Axes`.
+  without terrain smoothing and returns the `Axes`; `view_map` is its notebook
+  slider and `animate_map` its movie.
 - **2D channel profiles** — `m.plot.profile()` extracts a channel and returns
-  `(fig, axes)`.
+  `(fig, axes)`. `m.plot.analytical()` draws the analytical steady-state
+  reference alone, fitted to the channel `profile` draws (`basin_rank`, `ref`),
+  with `profile`'s renderer, figure and axes. The 1D `analytical()` takes the
+  same arguments, `(ax=None, bistable=True, basin_rank=0, ref=-1)`, and ignores
+  `basin_rank` and `ref`.
+  `view_xsection` is a notebook viewer of one raster row, with sliders for the
+  snapshot and the row's y.
+- **2D flux maps** — `m.plot.flux(which='ice')` maps the ice flux, `'water'`
+  the water flux and `'area'` the catchment area on a log scale, and returns
+  the `Axes`. It and the basin maps share `map`'s km coordinates, so a km
+  overlay drawn on any of them lands in the same place.
 - **2D cartography** — `m.plot.landscape()` returns `(fig, ax)` and has the
   display presets described below.
 
 All take an output index `i` (default `-1`, the last frame). `map` and
 `profile` use `field_min` / `field_max`; `landscape` uses `z_min` / `z_max`
-for terrain and `H_min` / `H_max` for ice colour. See {doc}`../api/model1d` and
+for terrain (`z_min` defaults to −500 m; a bed below it takes the lowest
+colour, and the bed colorbar gets an arrow at each end the map saturates past;
+`animate_landscape` decides the arrows once for the whole movie) and
+`H_min` / `H_max` for ice colour. `map` spans its field's data range over all
+outputs, while `landscape` fixes the bed scale's floor at `z_min`, so its bed
+colours compare across runs. See {doc}`../api/model1d` and
 {doc}`../api/model2d` for the method signatures.
+
+Each quantity has one colour wherever it is drawn. The bed is a grey line over
+one translucent fill (the analytical package's `draw_profile`, the paper
+renderer behind `GeneralProfile.plot` and `SteadyStateProfile.plot`, keeps its
+depth-faded fill, in the same grey); ice lines and fills share one blue pair;
+the ELA has one colour, the analytical plots included. Depth-coded ice maps
+(`landscape`'s veil, `map(field='ice')`, `flux('ice')`) use one glacier ramp,
+and `flux('water')` a ramp up to the water-flux colour of the profile panels.
+`landscape`'s lakes (the `lake_color` default) and the 1D profile's ponds
+share one standing-water colour. The colours live in `siim._palette.COLORS`,
+which needs no matplotlib.
+
+Grid coordinates read `x (km)` and `y (km)`, the 1D profile's included;
+distance along an extracted 2D channel reads `Distance from divide (km)`.
+`Mean ice thickness` is the width-mean `H` the physics consumes, and
+`Ice column depth` the drawn column `hc_over_H*H` (the landscape bar and the
+analytical `plot_profile` panel).
+
+New figures are 12 inches wide for multi-panel figures and `landscape`, and
+6 inches for single panels (`map`, `flux`, `hacks_law`, `analytical` and a
+one-field `profile`). Every figure but `landscape`, which places its panels
+itself, uses Matplotlib's constrained layout.
+
+The bed colormap of `landscape` and `map(field='bedrock')` is Fabio Crameri's
+turku with its darkest 20 % trimmed, from his *Scientific colour maps*
+(version 8.0, [doi:10.5281/zenodo.8035877](https://doi.org/10.5281/zenodo.8035877)),
+as cmcrameri distributes it under the MIT licence. Its colour table ships
+inside siim, with that notice, so cmcrameri is not needed;
+`cmap_bed` (`landscape`) or `cmap` (`map`) overrides it. Every plot takes its
+font sizes from the active Matplotlib rcParams, so a house style sets them.
 
 ### Shared profile behavior
 
@@ -32,13 +78,14 @@ ordered and positive on a log axis.
 ```python
 fig, axes = m.plot.profile(
     fields={'elevation': None, 'ice_thickness': (0, 800)},
-    fig_width=8, aspect=0.38, legend=True,
+    fig_width=12, aspect=0.25, legend=True,
 )
 ```
 
-`fig_width` is inches; `aspect` is each panel's height/width. Profiles default
-to 8-inch figures with legends outside the data panel. The viewer defaults to
-no legend. Bedrock, ice, water and ELA share colors; analytical references are
+`fig_width` is inches; `aspect` is each panel's height/width. One field
+defaults to a 6-inch figure at aspect 0.38, a stack of fields to 12 inches at
+0.25 (panels about 3 inches tall), with legends outside the data panel. The
+viewer and `view_xsection` take the same defaults and default to no legend. Bedrock, ice, water and ELA share colors; analytical references are
 dashed and current ELA is solid. Basin comparisons instead use a fixed palette
 to identify basins across maps and histories, with fainter lines for bedrock.
 All snapshots use the same year/kyr/Myr time format.
@@ -74,8 +121,8 @@ ss_step = m.plot.steady_state(plot=False)
 `ref` has the same meaning throughout the plotting API: it selects the output
 frame used to extract a reference channel or choose basin outlets. Histories
 keep those outlet identities across the run. The old `i_ref` keyword remains
-accepted by both history methods, with a `DeprecationWarning`; use `ref` in
-new calls. Positional reference arguments retain their meaning. Pass one
+accepted by both history methods, with a `DeprecationWarning`, until its
+removal in 1.0; use `ref` in new calls. Positional reference arguments retain their meaning. Pass one
 spelling; the legacy alias can override the default `ref=-1`.
 
 `hacks_law(i=..., ref=..., basin_rank=...)` displays area at `i` on the channel
@@ -94,7 +141,7 @@ and fitted-curve arrays (`fit_distance_km`, `fit_area_km2`). Basin history resul
 also expose `xt_over_L` and `zo_over_zELA`. Data times stay in years even when
 displayed axes use kyr or Myr.
 
-Public summary plots share fonts, semantic colors and readable time units.
+Public summary plots share semantic colors and readable time units.
 They use constrained layouts and `fig_width` in inches. Supply `ax` to compose
 them into your own figure: a pair for `largest_basins` or `steady_state`, nine
 axes in row order for `largest_basins_history`, and one Axes for `hacks_law`.
@@ -115,6 +162,9 @@ paths. All three accept `frames` — a slice, a range or a sequence of
 saved-frame indices, negatives counting from the end — and encode just those,
 in the order given. A movie `path` may include `.mp4`; it is added only once. Existing `run_id`
 filename conventions are preserved and take precedence over `path`.
+`animate_landscape(quality='draft')` is for research movies that will soon be
+replaced: at most `oversample=2` and x264's `veryfast` preset, about 1.6-1.7x
+faster than the default `quality='high'`, the still render's full look.
 
 Plotter-created movie figures close even if encoding fails. Supplied landscape
 figures/axes stay open; unrelated axes are preserved. All supplied axes must
@@ -124,20 +174,31 @@ Sliders redraw on release to avoid queuing expensive renders while dragging.
 ## Smooth and raw landscape views
 
 `landscape` defaults to `style='smooth'`, an atlas-style presentation. With no
-other arguments it uses an 8-inch figure and shows bedrock **and** ice (`field='bedrock+ice'`); terrain is
+other arguments it uses a 12-inch figure and shows bedrock **and** ice (`field='bedrock+ice'`); terrain is
 supersampled 4×, Gaussian-de-staircased, hillshaded, and contoured, and the
 same preset:
 
 - draws ice across the claimed sub-grid valley width (`ice_extent='footprint'`);
-- shades it as a depth-graded translucent veil (`ice_shading='veil'`);
-- fills the resolved trunk glaciers as true-width ribbons over that veil
-  (`trunk_display='ribbons'`);
+- shades it as a depth-graded translucent veil (`ice_shading='veil'`), whose
+  opacity is an S-curve in column depth, 50 % at half `ice_opaque_depth`
+  (default 100 m) and opaque from it down, its steepness set by
+  `ice_alpha_sharpness` (default 2, so 20 m of ice is 6 % opaque);
+- draws no trunk ribbons (`trunk_display='none'`);
 - hides nothing by thickness (`H_threshold=0`) — the veil already fades
   thin ice out, so a gate would only delete real glacierets;
-- smooths the ice outline by two sub-grid pixels, and outlines the current ice
-  margin (`show_margin`, formerly `show_trimline`) — the ribbons only, when
-  they are drawn; and
-- leaves connected-component removal and time averaging off.
+- smooths the ice outline by half a model cell (`ice_sigma_cells` defaults to
+  half the oversample: two sub-grid pixels at the default 4), which can erase a
+  glacier that occupies a single grid cell (`ice_sigma_cells=0` keeps it), and
+  outlines the current ice margin (`show_margin`, formerly `show_trimline`) —
+  the ribbons only, when they are asked for; and
+- leaves connected-component removal off.
+
+The hillshade is lit from `azdeg` degrees clockwise from north (default 315,
+the NW) at `altdeg` above the horizon. Its relief is exaggerated by `ve`
+(default 4) for the shading only. A cross-section panel is sized for `section_ve` (default 4) over
+`z_min`..`z_max`, between 0.8 and 2.6 in tall, and prints the exaggeration it
+got; the ice colorbar, like the bed's, gets an arrow where the model's ice
+column `hc_over_H*H` runs past its `H_min`/`H_max` (`extend_ice`).
 
 This is intentionally a cartographic view, not an unmodified-cell view:
 
@@ -145,26 +206,30 @@ This is intentionally a cartographic view, not an unmodified-cell view:
 m.plot.landscape()
 ```
 
-Pass `field='bedrock'` for the bare bed. The veil normalises column depth on
-`H_max`, which defaults to the run-global `hc_over_H * max H_out`, so a still and
+Pass `field='bedrock'` for the bare bed. The veil's colour normalises column
+depth on `H_max`, which defaults to the run-global `hc_over_H * max H_out`
+(the largest `hc_cell_out * H_out` in mode D), so a still and
 every frame of an animation put the same colour on the same depth;
 `ice_shading='flat'` restores a single opaque `ice_color`, and an explicit
 `ice_cmap` overrides both.
 
-A **trunk** cell is any icy cell downstream of one whose claimed width
+`trunk_display='ribbons'` adds an optional layer over the veil. A **trunk**
+cell is any icy cell downstream of one whose claimed width
 `W = alpha_g*H` already spans `trunk_width_cells` grid cells (default `1.0`,
 the width the grid can just resolve), the class carried along the receivers to
 the terminus so a thinning tongue stays a trunk down to its toe; those cells
 are traced and drawn at their true width, at a minimum opacity of
 `trunk_alpha` (deep ice keeps the depth ramp's own higher value), over a
-veil built from the sub-resolution ice that is left. Pass
-`trunk_display='none'` for the veil alone, or raise `trunk_width_cells` to
-reserve the ribbons for the widest glaciers.
+veil built from the sub-resolution ice that is left. Raise
+`trunk_width_cells` to reserve the ribbons for the widest glaciers. They are
+off by default: the footprint already draws the carve's cross-section wherever
+a glacier spans more than about two cells, and on sheet runs the ribbons drew
+rings, because their trunk class reads sheet ice as channel.
 
 For inspection use `style='raw'`. It selects `field='bedrock+ice'` with flat
 ice (`ice_shading='flat'`), renders one pixel per cell, disables terrain/ice
-smoothing, hillshade, contours, the margin outline and the trunk ribbons
-(`trunk_display='none'`), and shows channel-cell ice (`ice_extent='cells'`).
+smoothing, hillshade, contours and the margin outline, and shows channel-cell
+ice (`ice_extent='cells'`).
 Both presets leave `H_threshold=0`; the raw preset
 additionally applies an upstream-area gate of
 `1e6 m²` to suppress small-catchment specks. To display every ice-bearing cell,
@@ -175,16 +240,9 @@ m.plot.landscape(style='raw', area_threshold=0)
 ```
 
 Every explicit keyword overrides its preset value. `animate_landscape`
-inherits the smooth preset; for densely sampled animation output, an optional
-anti-flicker recipe is:
-
-```python
-m.plot.animate_landscape(field='bedrock+ice',
-                         H_threshold=50, ice_sigma_cells=3, ice_time_avg=2)
-```
-
-`fps` and `frames` are movie knobs rather than `landscape` ones — encode the
-last twenty saved frames at ten frames per second with:
+inherits the smooth preset. `fps` and `frames` are movie knobs rather than
+`landscape` ones — encode the last twenty saved frames at ten frames per
+second with:
 
 ```python
 m.plot.animate_landscape(fps=10, frames=slice(-20, None))
@@ -196,10 +254,11 @@ the combined veil/ribbon mask once, so connected parts count as one glacier.
 With `ice_smoothing='field'`, the veil retains thickness near the threshold
 until the smoothed field is thresholded; ribbon-source gating is separate.
 `sigma_cells` and `ice_sigma_cells`
-are subgrid pixels, so their native-grid strength changes with `oversample`.
+are subgrid pixels; both default to follow `oversample` (`sigma_cells` equal to
+it, `ice_sigma_cells` half of it), so an explicit value's native-grid strength
+changes with `oversample` while the defaults' does not.
 
-`ice_time_avg` changes only the displayed ice layer, not terrain or stored
-state. `min_ice_cells=6` can remove small components, but it can also hide real
+`min_ice_cells=6` can remove small components, but it can also hide real
 small glaciers and is therefore never enabled by a preset.
 
 `cross_section` adds the section and hypsometry panels. A `y` in km reads that
@@ -219,6 +278,54 @@ water table:
 ```python
 m.plot.landscape(cross_section='mean')
 ```
+
+The hypsometry shares the section's elevation axis (`z_min`..`z_max`): bed
+outside it is off the panel, and the bars are percentages of the whole area.
+`hyp_max` (default 15 %) fixes the percent-area scale; a taller bar runs off
+it. A `y` outside the domain warns and draws the edge row.
+`animate_landscape` freezes the colour scales and the hillshade's contrast
+stretch over the movie.
+
+### Ice surface speed
+
+`field='bedrock+speed'` draws the same ice as `'bedrock+ice'`, coloured by
+ice surface speed in m/yr over grey hillshaded terrain, on a log scale
+(`speed_min=20`, `speed_max=1000`, `speed_cmap='magma_r'`). Ice slower than
+`speed_min` is left transparent, and faster ice saturates. `animate_landscape`
+takes the same field and keywords:
+
+```python
+m.plot.landscape(field='bedrock+speed')
+m.plot.animate_landscape(field='bedrock+speed', speed_max=2000)
+```
+
+Speed is not stored. `m.ice_speed(i)` recomputes it by running the flux
+closure backwards on the flux and thickness the closure solved at output `i`,
+and returns the surface speed `us` and the cross-section mean
+`U = Q/(alpha_g*H**2)`. That pair is `Qg_out` and `H_out` unless the run
+stores the closure's own, which it does only with `save_closure_pair=True`
+(off by default; the rows add about 10 % to the saved output in modes B and C
+and about 19 % in mode D): a transect `closure_flux` (the mode B/C/D default)
+closes on the transect flux, kept as `closure_Qg_out`, and `inner_relax < 1`
+commits a blend of passes, so the closure's thickness is kept as
+`closure_H_out`. The split is
+`us = ub + (5/4)*ud`, with depth-mean deformation `ud` and sliding
+`ub = U - ud`, so `U <= us <= 1.25*U`. `'eff-exp'` has no sliding split, so
+there `us = U`. Outlet (self-receiving) cells read 0: their thickness is
+copied from the upstream cell, not solved from their own flux. A run with
+`H_diffusivity` smooths H inside the kernel after the closure solve, so its
+speeds are approximate, and so are those of a run that needs the closure
+rows but did not save them (the default); `ice_speed` warns in both cases. In the
+footprint view each pixel takes the speed of the source
+cell whose ice surface it shows. `trunk_display='ribbons'` draws trunk
+ribbons, each carrying the speed of the
+cells along its path.
+
+Two things to keep in mind when reading the map. Every icy cell is a channel
+of width `W = alpha_g*H`, so thick interior ice that covers its cell as a sheet
+(`W > dx`) reads slow: the same flux through the cell width would move about
+`W/dx` times faster. Under `'coulomb'`, a few thin-ice cells near the yield stress `tau_c`
+can show very large speeds; the colour scale saturates them.
 
 ### Two ice thicknesses
 
@@ -268,7 +375,7 @@ NumPy views of that dataset and have shape `(time, y, x)` unless noted.
 | `Qf_out` | `glacial_flow__water_flux` | water flux |
 | `erosion_rate_out` | `glacial_spl__erosion_rate` | erosion rate |
 | `denudation_out` | `glacial_spl__denudation` | per-step rock removed: Δ`zb` in B/C including carving, or Δ`zs` in A |
-| `receivers_out` | `glacial_flow__receivers_2d` | receiver graph |
+| `receivers_out` | `glacial_flow__receivers_2d` | receiver graph (the largest-weight receiver under a multi-receiver router) |
 | `stack_out` | `glacial_flow__stack_2d` | topological routing stack |
 | `basin_out` | `glacial_flow__basin_ids` | basin identifiers |
 | `lengths_out` | reconstructed from receivers/grid | node-to-receiver distance |
@@ -277,6 +384,10 @@ NumPy views of that dataset and have shape `(time, y, x)` unless noted.
 | `eroded_volume_out` | `sediment__cumulative` | cumulative eroded volume; present when `track_sediment` reports by basin |
 | `sediment_edge_flux_out` | `sediment__edge_flux` | volume leaving the domain across each edge, shaped `(time, side)`; present when `track_sediment` reports by edge |
 | `sediment_edge_cumulative_out` | `sediment__edge_cumulative` | its running total, shaped `(time, side)` |
+| `hc_cell_out` | `glacial_spl__hc_cell` | per-cell channel-floor ratio, `hc_over_H` (1.5) on valley cells to `1` on sheet cells; present in mode D (otherwise `None`) |
+| `channel_out` | `glacial_spl__channel` | mode D's channel/sheet class, `True` on icy cells read channel, read on the frame's own thickness (bool; stored as int32); present in mode D (otherwise `None`, and `None` for mode-D runs saved before 0.10.0) |
+| `closure_Qg_out` | `glacial_spl__closure_ice_flux` | the flux the thickness closure solved H from (last pass); present with `save_closure_pair=True` when `closure_flux` is a transect (otherwise `None`) |
+| `closure_H_out` | `glacial_spl__closure_ice_thickness` | the kernel's thickness before the `inner_relax` blend (last pass; after any `H_diffusivity` smoothing); present with `save_closure_pair=True` when `inner_relax < 1`, as under the default damping of modes B, C and D (otherwise `None`) |
 
 `track_sediment` chooses what the routed sediment is reported as: `False`
 (off, the default), `True` or `'basin'` (the per-node rasters above),
@@ -293,17 +404,39 @@ or `'looped'` edge reads `NaN` rather than zero: nothing can leave there, which
 is not the same as nothing leaving. With every side `'fixed_value'`, the four
 entries sum to the whole domain's denuded volume for that step.
 
+### Primary-path diagnostics under multiple-flow routing
+
+`receivers_out` carries one receiver per cell, so under `flow_routing='dinf'`
+and especially `flow_routing='mfd'` it is the largest-weight link, not the whole
+flow graph. Everything built on it -- `extract_channel`, `channel_statistics`
+(Strahler order and the Horton ratios), the basin plots and the trunk ribbons --
+is therefore a PRIMARY-PATH diagnostic under MFD: it describes the dominant
+network. At the default `mfd_exponent = 1.0` the dominant link typically carries
+under half of a cell's flux, so those views understate how much water and ice
+travel off the primary path. `basin_out` is likewise the D8 chain on the same
+eps-filled surface (the deterministic labeling both multi-receiver producers
+reuse), and may disagree with the MFD largest-weight graph. The mass-carrying
+fields -- `area_out`, `Qg_out`, `Qf_out` and everything the kernels compute --
+use the full weighted graph and are unaffected.
+
 Mode B/C stores the bed as `topography__elevation` and reconstructs the ice
-surface as `z = zb + 1.5*H`. Mode A stores the ice surface as topography and a
-separate bed field. `1.5` is the channel-floor ratio `HC_OVER_H`; `H` remains
-the width-mean thickness used by the physics.
+surface as `z = zb + hc_over_H*H`. Mode A stores the ice surface as topography
+and a separate bed field. `hc_over_H` is the channel-floor ratio (default 1.5,
+`constants.HC_OVER_H`); `H` remains the width-mean thickness used by the
+physics. In mode D the
+ratio is per cell and the reconstruction is `z = zb + hc_cell_out*H`, the
+surface the model balanced on; `landscape` draws its ice columns on the same
+datum.
 
 ## The true-state output convention
 
 Outputs report the true `(zb, H)` everywhere; base level is not a presentation
 floor in stored state. With nonzero `bl`, a drowned or relict bed may lie below
-the waterline. That is bed memory, not a failed clamp. Ocean and lake surfaces
-are display layers used by `landscape`, not substitutions in the output arrays.
+the waterline. That is bed memory, not a failed clamp. Lakes are a display
+layer of `landscape` (`field='bedrock+lakes'`): closed depressions in the bed,
+flooded to their spill level and drawn only where the same preset would draw
+no ice. No sea or ocean surface is drawn, and the lakes are not substituted
+into the output arrays.
 
 ## Files and output locations
 

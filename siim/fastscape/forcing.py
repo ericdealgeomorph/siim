@@ -23,7 +23,8 @@ except ImportError as e:
         "env instead: `conda env create -f environment.yml`."
     ) from e
 
-from .._core.step import uplift_mask, wave_uplift, plateau_surface
+from .. import constants as _constants
+from .._core.step import uplift_mask, wave_rate, plateau_surface
 
 
 @xs.process
@@ -31,7 +32,7 @@ class WaveUplift:
     """Moving Gaussian uplift wave (replaces fastscape's BlockUplift).
 
     rate(x, t) = U_inf + U0 * exp(-(x - wave_center(t))^2 / wave_width^2),
-    wave_center(t) = x[0] + x_escarpment + t * wave_velocity,
+    wave_center(t) = x[0] + x_escarpment + (t - t0) * wave_velocity, t0 the run's start,
     U0 = wave_calibration * delta_h * wave_velocity / (wave_width * sqrt(pi)).
     """
 
@@ -39,8 +40,8 @@ class WaveUplift:
     wave_width = xs.variable(description='1/e half-width of wave in space (m)')
     wave_velocity = xs.variable(description='wave propagation velocity (m/yr)')
     x_escarpment = xs.variable(description='initial wave-center position relative to left edge (m)')
-    wave_calibration = xs.variable(default=1.0, description='calibration factor on U0 (1.0 integrates to exactly delta_h as the wave passes)')
-    U_inf = xs.variable(default=0.0, description='steady background uplift (m/yr)')
+    wave_calibration = xs.variable(default=_constants.WAVE_CALIBRATION, description='calibration factor on U0 (1.0 integrates to exactly delta_h as the wave passes)')
+    U_inf = xs.variable(default=_constants.U_INF, description='steady background uplift (m/yr)')
 
     x = xs.foreign(RasterGrid2D, 'x')
     y = xs.foreign(RasterGrid2D, 'y')
@@ -53,6 +54,12 @@ class WaveUplift:
         groups=['bedrock_forcing_upward', 'surface_forcing_upward'],
         description='Imposed vertical uplift this step (m)',
     )
+    border_rate = xs.variable(
+        dims=('y', 'x'),
+        intent='out',
+        groups=['border_bed_uplift'],
+        description="The wave's local rate (m/yr), unmasked: the default border-bed uplift, so the border follows the wave",
+    )
 
     def initialize(self):
         # zero uplift on 'fixed_value' borders, mirroring fastscape's
@@ -60,15 +67,17 @@ class WaveUplift:
         # uplifting them would let the boundary drift upward over the run.
         self._mask = uplift_mask(self.status, self.shape)
 
-    @xs.runtime(args=['step_delta', 'step_start'])
-    def run_step(self, dt, t):
-        # Midpoint-sampled moving-Gaussian wave — body extracted framework-free
-        # (siim._core.step.wave_uplift) so the shell and the in-house driver
-        # share one implementation.
-        self.uplift = wave_uplift(
-            self.x, self.y, self.shape, self._mask, dt, t, self.delta_h,
-            self.wave_width, self.wave_velocity, self.x_escarpment,
-            self.wave_calibration, self.U_inf)
+    @xs.runtime(args=['step_delta', 'step_start', 'sim_start'])
+    def run_step(self, dt, t, t0):
+        # Midpoint-sampled moving-Gaussian wave: the framework-free rate
+        # (siim._core.step.wave_rate) the in-house driver uses too, masked and
+        # times dt as the in-house driver does, the rate kept for the border. Time from
+        # the run's start, so x_escarpment is the initial position (audit #27).
+        rate = wave_rate(self.x, self.y, dt, t - t0, self.delta_h,
+                         self.wave_width, self.wave_velocity, self.x_escarpment,
+                         self.wave_calibration, self.U_inf)
+        self.uplift = rate * self._mask * dt
+        self.border_rate = rate
 
 
 @xs.process
@@ -91,9 +100,9 @@ class PlateauSurface:
     )
 
     plateau_zo = xs.variable(description='plateau elevation (m)')
-    plateau_dz = xs.variable(default=1.0, description='slope across plateau (m); seeds divide')
-    plateau_frac = xs.variable(default=0.8, description='fraction of x occupied by plateau')
-    plateau_w = xs.variable(default=10e3, description='escarpment transition width (m)')
+    plateau_dz = xs.variable(default=_constants.PLATEAU_DZ, description='slope across plateau (m); seeds divide')
+    plateau_frac = xs.variable(default=_constants.PLATEAU_FRAC, description='fraction of x occupied by plateau')
+    plateau_w = xs.variable(default=_constants.PLATEAU_W, description='escarpment transition width (m)')
 
     x = xs.foreign(RasterGrid2D, 'x')
     y = xs.foreign(RasterGrid2D, 'y')

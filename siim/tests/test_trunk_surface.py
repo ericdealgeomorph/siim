@@ -1,16 +1,20 @@
 """Fabricated trunk-surface routing (the ``trunk_surface`` flag).
 
 Regression gates for fabricated trunk-surface routing:
-accumulation on a fabricated ice surface (linear cross-valley dip toward the
+routing on a fabricated ice surface (linear cross-valley dip toward the
 centerline) converge trunk flow onto the centerline chain, so the centerline's
 RAW flux is the full cross-section discharge — consolidation by routing, not the
 Qc gather. The kernel is untouched (fabricated elevation reaches only the router
-graph + the mass-balance surface); the runaway firewall is that no geometric
-value enters a closure.
+graph; the in-house pin is test_sheet_knobs.py::
+test_trunk_surface_reaches_the_router_alone); the runaway firewall is that no
+geometric value enters a closure.
 """
+import math
+
 import numpy as np
 import pytest
 
+from siim import constants as _constants
 from siim._core.step import _fabricate_trunk_surface
 
 
@@ -72,17 +76,23 @@ def _straight_valley(ny=21, nx=40, dx=200.0, Sv=0.025, wall=8.0,
     return zb, H, jc
 
 
+def _fabricate(zb, H, dx, k_dip, alpha_g=10.0):
+    """The fabricated V on a square grid whose four edges are borders."""
+    ny, nx = zb.shape
+    border = np.zeros((ny, nx), bool)
+    border[0, :] = border[-1, :] = border[:, 0] = border[:, -1] = True
+    off = np.empty((ny, nx)); D = np.empty((ny, nx)); SRC = np.empty((ny, nx), np.int64)
+    return _fabricate_trunk_surface(zb + _constants.HC_OVER_H * H, zb, H, border,
+                                    alpha_g, dx, dx, k_dip,
+                                    _constants.TRUNK_DIP_FLOOR, off, D, SRC,
+                                    False, False)
+
+
 def _capture(zb, H, jc, dx, k_dip=0.6, alpha_g=10.0, col=8):
     """Fabricate → D8 route → accumulate a uniform ice input; return the fraction
     of the cross-section flux that lands on the centerline chain at column ``col``."""
     ny, nx = zb.shape
-    hc = 1.5
-    zs_dyn = zb + hc * H
-    border = np.zeros((ny, nx), bool)
-    border[0, :] = border[-1, :] = border[:, 0] = border[:, -1] = True
-    off = np.empty((ny, nx)); D = np.empty((ny, nx)); SRC = np.empty((ny, nx), np.int64)
-    fab = _fabricate_trunk_surface(zs_dyn, zb, H, border, alpha_g, dx, dx,
-                                   k_dip, 1e-3, off, D, SRC, False, False)
+    fab = _fabricate(zb, H, dx, k_dip, alpha_g)
     rec = _d8_route(fab, dx, dx)
     ice_in = np.zeros((ny, nx))
     ice_in[jc - 7:jc + 8, 3:nx - 1] = 1.0
@@ -129,13 +139,7 @@ def _capture_dinf(zb, H, jc, dx, k_dip=0.6, alpha_g=10.0, col=8):
     from .test_dinf_routing import _route_full, _edges_interior
     from siim._core.routing import _flow_accumulate_dinf
     ny, nx = zb.shape
-    hc = 1.5
-    zs_dyn = zb + hc * H
-    border = np.zeros((ny, nx), bool)
-    border[0, :] = border[-1, :] = border[:, 0] = border[:, -1] = True
-    off = np.empty((ny, nx)); D = np.empty((ny, nx)); SRC = np.empty((ny, nx), np.int64)
-    fab = _fabricate_trunk_surface(zs_dyn, zb, H, border, alpha_g, dx, dx,
-                                   k_dip, 1e-3, off, D, SRC, False, False)
+    fab = _fabricate(zb, H, dx, k_dip, alpha_g)
     interior = _edges_interior(ny, nx)
     _, receivers, weights, lengths, nb_receivers, stack = _route_full(
         fab, dx, dx, interior)
@@ -160,6 +164,56 @@ def test_channel_persistence_dinf():
     frac0 = _capture_dinf(zb, H, jc, 200.0, k_dip=0.0)
     assert frac0 < 0.2, f"un-dipped dinf capture {frac0:.3f} unexpectedly high"
     assert frac > 3 * frac0
+
+# ---------------------------------------------------------------------------
+# The closed-form leak condition behind the router-derived dip
+# (constants.TRUNK_DIP_K_MFD; docs/dev/mfd_valleys_e1e2.md section 9.1). On the
+# V the axis cell's only off-axis candidates are the two down-valley diagonals,
+# slope S_v(1-k)/sqrt2; the first-flank cell adds the down-valley cardinal and
+# the outward diagonal. LEAK = the share of a cell's outgoing weight to
+# receivers that neither stay on the axis nor turn toward it.
+# ---------------------------------------------------------------------------
+def _leak_closed_form(k):
+    """(MFD axis, MFD flank, D-inf axis, D-inf flank) at p = 1."""
+    s = max(1.0 - k, 0.0) / math.sqrt(2.0)     # outward diagonal, gone at k >= 1
+    u = max(k - 1.0, 0.0) / math.sqrt(2.0)     # inward-upstream diagonal, downhill past k = 1
+    return (2.0 * s / (1.0 + 2.0 * s),
+            (1.0 + s) / (k + 1.0 + (1.0 + k) / math.sqrt(2.0) + s + u),
+            0.0,
+            max(1.0 - 4.0 / math.pi * math.atan(k), 0.0))
+
+
+def _leak(receivers, weights, nb_receivers, i, nx, jc):
+    d = abs(i // nx - jc)
+    w = weights[i, :nb_receivers[i]]
+    away = np.abs(receivers[i, :nb_receivers[i]] // nx - jc) >= max(d, 1)
+    return w[away].sum() / w.sum()
+
+
+@pytest.mark.pin
+@pytest.mark.parametrize("k,want", [
+    (1.0, (0.000, 0.293, 0.000, 0.000)),     # TRUNK_DIP_K_MFD
+    (0.6, (0.361, 0.426, 0.000, 0.312)),     # TRUNK_DIP_K (D8, D-inf)
+])
+def test_trunk_leak_matches_the_closed_form(k, want):
+    """The shipped MFD (p = 1) and D-inf routers on the fabricated V leak
+    exactly the closed form, at a mid-trunk axis cell and its first flank: at
+    k = 1 MFD's axis leak is zero and its flank leak is 1/(2 + sqrt2),
+    while D-inf's clamps to zero at both; at the shipped 0.6 MFD leaks 36 % off
+    the axis."""
+    from siim._core.step import route_dinf, route_mfd
+    zb, H, jc = _straight_valley()
+    ny, nx = zb.shape
+    dx = 200.0
+    fab = _fabricate(zb, H, dx, k)
+    fixed = ['fixed_value'] * 4
+    mfd = route_mfd(fab, (ny, nx), dx, dx, fixed, _constants.MFD_EXPONENT)
+    dinf = route_dinf(fab, (ny, nx), dx, dx, fixed)
+    axis, flank = jc * nx + 20, (jc + 1) * nx + 20
+    got = [_leak(r[0], r[1], r[3], i, nx, jc)
+           for r in (mfd, dinf) for i in (axis, flank)]
+    assert np.allclose(got, want, atol=0.005), got
+    assert np.allclose(_leak_closed_form(k), want, atol=0.0005)
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +270,7 @@ def test_flag_off_bit_for_bit():
     from siim.siim2d import siim as siim2d
     cfg = dict(_BASE, sliding_law='power', zELA=600.0,
                initial_max_elevation=800, T=6e5, nt=13, nt_out=4,
-               trunk_surface=False, routing_relax=0.0, widening_rate=1.0)
+               trunk_surface=False, widening_rate=1.0)
     a = siim2d({**cfg, 'mode': 'C'}); a.run()
     b = siim2d({**cfg, 'mode': 'B', 'carve_width': True}); b.run()
     np.testing.assert_array_equal(a.zb_out, b.zb_out)
@@ -240,3 +294,30 @@ def test_conservation_ice_plus_water(law):
     water = m.ds_out['glacial_flow__water_flux'].values
     assert np.isfinite(ice).all() and np.isfinite(water).all()
     assert (ice >= -1e-6).all() and (water >= -1e-6).all()
+
+
+@pytest.mark.pin
+def test_fabricated_surface_commutes_with_a_seam_shift():
+    """On a looped y axis the V does not depend on where the seam falls: rolling
+    the inputs k rows rolls the fabricated surface k rows. np.gradient's
+    one-sided edge rows made a trunk on the seam dig deeper than anywhere else
+    (110 m on this fixture; audit #0)."""
+    ny, nx, dx = 24, 20, 250.0
+    j = np.arange(ny)
+    dist = np.minimum(j, ny - j) * dx                       # periodic distance to row 0
+    zb = (2000.0 - 20.0 * np.arange(nx)[None, :]) + 0.05 * dist[:, None] ** 1.2
+    H = np.where(dist[:, None] <= 2 * dx, 150.0, 0.0) * np.ones((1, nx))
+    border = np.zeros((ny, nx), bool)
+    border[:, 0] = border[:, -1] = True                     # x not looped: base-level columns
+
+    def fab(zb_, H_):
+        off = np.empty((ny, nx)); D = np.empty((ny, nx)); SRC = np.empty((ny, nx), np.int64)
+        return _fabricate_trunk_surface(zb_ + _constants.HC_OVER_H * H_, zb_, H_, border,
+                                        10.0, dx, dx, 0.6, _constants.TRUNK_DIP_FLOOR,
+                                        off, D, SRC, True, False)
+
+    base = fab(zb, H)
+    assert not np.array_equal(base, zb + _constants.HC_OVER_H * H), "the V is not live"
+    for k in (1, 3, 7):
+        np.testing.assert_allclose(fab(np.roll(zb, k, 0), np.roll(H, k, 0)),
+                                   np.roll(base, k, 0), rtol=0, atol=1e-9)

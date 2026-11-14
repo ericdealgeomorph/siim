@@ -23,6 +23,7 @@ ADVERTISED = {
     "GlacialSPLModeC", "GlacialSurfaceToErode", "TrunkSurfaceToErode",
     "SedimentTracker", "GlacialFlexure", "DinfFlowRouter",
     "D8FlowRouter", "GlacialBlockUplift", "HillslopeDiffusion", "InitialTopography",
+    "MfdFlowRouter",
 }
 
 
@@ -55,6 +56,8 @@ def test_glacial_processes_assembles(mode, carve, citizen_slot):
 
 def test_routing_and_optional_slots():
     assert F.glacial_processes(routing='dinf')['flow'] is F.DinfFlowRouter
+    assert F.glacial_processes(routing='infinite')['flow'] is F.DinfFlowRouter
+    assert F.glacial_processes(routing='multiple', mode='B')['flow'] is F.MfdFlowRouter
     assert 'flexure' in F.glacial_processes(flexure=True)
     assert 'sediment' in F.glacial_processes(sediment=True)
 
@@ -70,6 +73,13 @@ def test_case_insensitive_mode_and_validation():
         F.glacial_processes(routing='nonsense')
 
 
+def test_glacial_processes_accepts_the_legible_mode_names():
+    """Upper-cased before normalize_mode, the legible names were refused by the
+    very error that lists them (audit #53); siim2d accepts them."""
+    assert F.glacial_processes(mode='ice_surface') == F.glacial_processes(mode='A')
+    assert F.glacial_processes(mode='bedrock+ice_thickness') == F.glacial_processes(mode='B')
+
+
 def test_glacial_model_builds():
     m = F.glacial_model(mode='B', carve=False)
     assert 'glacial_spl' in m and 'surf2erode' in m
@@ -79,23 +89,10 @@ def test_siim2d_uses_the_helper():
     """siim2d's private assembly must equal the public helper for the same
     config — the single-source-of-truth guarantee."""
     from siim.siim2d import siim
-    m = siim({'mode': 'B', 'carve_width': False, 'flow_routing': 'single'})
+    m = siim({'mode': 'B', 'carve_width': False, 'flow_routing': 'single',
+              'inner_passes': 1, 'inner_relax': 1.0})   # the adapter's one pass
     assert m._process_overrides() == F.glacial_processes(
         mode='B', carve=False, routing='single')
-
-
-@pytest.mark.parametrize("mode,relax_name", [
-    ('C', 'MODE_C_ROUTING_RELAX'),   # TrunkSurfaceToErode redeclares the default
-    ('B', 'ROUTING_RELAX'),          # GlacialSurfaceToErode keeps the plain one
-])
-def test_surf2erode_routing_relax_default_seen_by_xsimlab(mode, relax_name):
-    """The routing_relax default an un-set input resolves to, read through
-    xsimlab itself (create_setup's default fill), not the class attribute —
-    the subclass redeclaration must reach the model."""
-    import xsimlab as xs
-    from siim import constants
-    ds = xs.create_setup(model=F.glacial_model(mode=mode), clocks={'t': [0, 1]})
-    assert ds['surf2erode__routing_relax'].item() == getattr(constants, relax_name)
 
 
 

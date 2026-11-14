@@ -2,12 +2,10 @@
 
 import numpy as np
 
-COLORS = {
-    'bed': '#555a60', 'ice': '#23658a', 'ice_fill': '#8ec4e3',
-    'water': '#56b4e9', 'ela': '#a56d18', 'uplift': '#42464b',
-    'erosion': '#b34f36', 'ice_flux': '#0072b2', 'water_flux': '#d55e00',
-    'shear': '#9467a6', 'velocity': '#00876c', 'alternative': '#90969b',
-}
+# The colour roles live in matplotlib-free siim._palette, so the analytical
+# package shares them; re-exported here for every plotting caller.
+from .._palette import COLORS as COLORS
+
 # A basin keeps its color across maps, profiles and histories.
 BASIN_COLORS = ('#0072b2', '#d55e00', '#009e73', '#cc79a7',
                 '#56b4e9', '#a56d18', '#6f63a5', '#42464b')
@@ -51,9 +49,7 @@ def summary_axes(ax, shape, fig_width, aspect, sharex=False):
 def style_axes(ax, legend=True, scientific=False):
     ax.spines[['top', 'right']].set_visible(False)
     ax.spines[['left', 'bottom']].set_color('#a0a5aa')
-    ax.tick_params(labelsize=9, color='#a0a5aa')
-    ax.xaxis.label.set_size(10)
-    ax.yaxis.label.set_size(10)
+    ax.tick_params(color='#a0a5aa')
     ax.set_axisbelow(True)
     ax.grid(axis='y', alpha=0.15, linewidth=0.6)
     if scientific:
@@ -62,4 +58,4 @@ def style_axes(ax, legend=True, scientific=False):
             ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4), useMathText=True)
     if legend and ax.get_legend_handles_labels()[1]:
         ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1),
-                  borderaxespad=0, frameon=False, fontsize=8)
+                  borderaxespad=0, frameon=False)

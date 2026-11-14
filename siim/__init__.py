@@ -23,18 +23,30 @@ nothing eagerly so the optional adapter never affects a standard import.
 """
 
 import os as _os
+import sys as _sys
 
-# Numba threading layer: default to 'workqueue' (numba's own fork-safe thread
-# pool) BEFORE any submodule imports numba. This avoids the macOS crash where
-# the default TBB/OpenMP layer collides with Accelerate-backed numpy/scipy and
-# the flexure FFT under a Jupyter kernel (Eric, 2026-07-07: reliably kills
-# flexure runs, rare otherwise). setdefault so an explicit user
-# NUMBA_THREADING_LAYER (e.g. 'tbb' for the last few % on parallel kernels)
-# always wins; the choice is correctness-neutral (bit-identical results) and
-# within process noise on siim's non-nested prange kernels.
-_os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
+# Numba threading layer, set BEFORE any submodule imports numba: TBB when numba
+# can load it (conda-forge's tbb, or the optional `siim-lem[tbb]` extra), else
+# numba's own workqueue pool; OpenMP is never reached (workqueue always loads).
+# The level-scheduled eroder opens one parallel region per drainage level, far
+# cheaper to start on TBB (docs/getting_started/install.md), and every result
+# is bit-for-bit on either layer. TBB with the flexure FFT ran clean under a
+# Jupyter kernel on 2026-11-12; the 2026-07-07 crash that pinned workqueue was
+# numba 0.65. An explicit NUMBA_THREADING_LAYER, or the user's own priority
+# (setdefault), always wins.
+_os.environ.setdefault("NUMBA_THREADING_LAYER_PRIORITY", "tbb workqueue omp")
+# A numba imported before siim has already read its environment, and launching
+# its thread pool does not read it again (only a compile does): without this
+# its own priority, OpenMP ahead of workqueue, would stand. numba re-reads its
+# whole configuration here, as it would at its next compile anyway (the
+# environment changed): doing it now keeps what the user sets on numba.config
+# after this import, where writing the one setting lost it at that compile.
+# What was set on numba.config BEFORE this import is reset either way, when
+# the setdefault above added the variable.
+if "numba" in _sys.modules:
+    _sys.modules["numba"].config.reload_config()
 
-__version__ = "0.9.10"
+__version__ = "0.10.0"
 
 
 _LAZY = ("analytical_steady_state_solution", "GeneralProfile",

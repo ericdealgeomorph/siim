@@ -82,9 +82,14 @@ def test_smoke_sfr_dinf_x_sliding_laws(sliding_law, flow_routing):
 
 
 def test_unknown_flow_routing_rejected():
-    """flow_routing must be 'single' or 'dinf'; anything else raises."""
+    """An unknown flow_routing name raises."""
     with pytest.raises(ValueError, match="flow_routing must be"):
-        siim2d(_small_2d(flow_routing='multiple'))
+        # gate: 'multiple' is now a valid name (MFD); an unknown name still raises
+        siim2d(_small_2d(flow_routing='steepest'))
+
+
+def test_flow_routing_name_reaches_the_model():
+    assert siim2d(_small_2d(flow_routing='multiple')).flow_routing == 'mfd'
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +226,7 @@ def test_rms_vs_analytical_perfect_model_is_zero():
     a = m.analytical
     assert a.surface is not None, "config must have an analytical SS"
     m.run()
-    a_H_grid = a.surface - a.bed                          # = HC_OVER_H * H
+    a_H_grid = a.surface - a.bed                          # = a.hc_over_H * H
     a_surf = np.interp(m.x[::-1], a.x[::-1], a.surface[::-1])[::-1]
     a_H    = np.interp(m.x[::-1], a.x[::-1], a_H_grid[::-1])[::-1]
     assert (a_H > 0).any(), "config must have ice for the datum test to bite"
@@ -350,14 +355,14 @@ def test_flexure_off_by_default():
     # _process_overrides() builds the xsimlab slot dict (adapter assembly); the
     # standalone physics of flexure=False/True is covered by
     # test_denudation.test_flexure_acts_on_topography + test_standalone_no_fastscape.
-    m = siim2d(_small_2d())
+    m = siim2d(_small_2d(inner_passes=1, inner_relax=1.0))   # the adapter's one pass
     assert m.flexure is False
     assert 'flexure' not in m._process_overrides()
 
 
 @pytest.mark.adapter
 def test_flexure_on_runs_and_acts():
-    p = _small_2d(U=2e-3)
+    p = _small_2d(U=2e-3, inner_passes=1, inner_relax=1.0)   # the adapter's one pass
     off = siim2d(p);                                      off.run()
     on = siim2d({**p, 'flexure': True, 'e_thickness': 20e3}); on.run()
     assert 'flexure' in on._process_overrides()

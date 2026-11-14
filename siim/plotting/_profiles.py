@@ -115,6 +115,15 @@ def resolve_limits(fields, auto, field_min=None, field_max=None):
     return result
 
 
+def panel_shape(n_panels, fig_width=None, aspect=None):
+    """The house widths: 6 in for one panel (height 0.38 of the width), 12 in
+    for a stack (panels 0.25 of the width, about 3 in tall, as at the old
+    8 in). An explicit ``fig_width`` or ``aspect`` wins. Returns both."""
+    single = n_panels == 1
+    return ((6 if single else 12) if fig_width is None else fig_width,
+            (0.38 if single else 0.25) if aspect is None else aspect)
+
+
 def uplift_at_outputs(model, nodes=None):
     """2D forcing at saved steps; supports scalar, spatial, time and time-space U.
 
@@ -140,30 +149,50 @@ def uplift_at_outputs(model, nodes=None):
     return np.broadcast_to(values, (nt, count))
 
 
-def draw_panel(ax, field, data, idx, analytical=None):
-    """Draw equivalent scientific quantities with identical semantic styles."""
+def draw_panel(ax, field, data, idx, analytical=None, floor=None):
+    """Draw equivalent scientific quantities with identical semantic styles.
+
+    The bed is a ``COLORS['bed']`` line over one translucent fill down to
+    ``floor`` (the panel's lower limit; default sea level or the deepest bed).
+    ``data=None`` draws the elevation reference alone (``analytical()``), which
+    then takes the bed and ice fills.
+    """
     spec = PROFILE_FIELDS[field]
-    x = data.x
+    if data is None and field != 'elevation':
+        raise ValueError(f"draw_panel draws a reference alone only for 'elevation', "
+                         f"not {field!r}")
+    x = analytical.x if data is None else data.x
     if field == 'elevation':
-        ice = data.H[idx] > 0
-        ax.fill_between(x, data.zb[idx], data.z[idx], where=ice,
+        if data is None:
+            bed, surface = analytical.bed, analytical.surface
+            ice = surface > bed + 1e-9
+        else:
+            bed, surface = data.zb[idx], data.z[idx]
+            ice = data.H[idx] > 0
+        floor = min(0.0, float(np.nanmin(bed))) if floor is None else floor
+        ax.fill_between(x, floor, bed, color=COLORS['bed'], alpha=0.2, lw=0)
+        ax.fill_between(x, bed, surface, where=ice,
                         color=COLORS['ice_fill'], alpha=0.3)
-        ax.plot(x, data.zb[idx], color=COLORS['bed'], lw=1.3, label='Bedrock')
-        ax.plot(x, np.where(ice, data.z[idx], np.nan), color=COLORS['ice'],
-                lw=1.5, label='Ice surface')
+        if data is not None:
+            ax.plot(x, bed, color=COLORS['bed'], lw=1.3, label='Bedrock')
+            ax.plot(x, np.where(ice, surface, np.nan), color=COLORS['ice'],
+                    lw=1.5, label='Ice surface')
         if analytical is not None:
-            ax.plot(analytical.x, analytical.surface, '--', color=COLORS['ice'],
-                    lw=1.1, label='Analytical ice surface')
-            if not np.allclose(analytical.bed, analytical.surface, equal_nan=True):
-                ax.plot(analytical.x, analytical.bed, '--', color=COLORS['bed'],
-                        lw=1, label='Analytical bedrock')
+            # an ice-free (fluvial) reference is all bed: one bed line. The
+            # same test as the reference-only fill above, so line and fill agree.
+            if np.any(analytical.surface > analytical.bed + 1e-9):
+                ax.plot(analytical.x, analytical.surface, '--', color=COLORS['ice'],
+                        lw=1.1, label='Analytical ice surface')
+            ax.plot(analytical.x, analytical.bed, '--', color=COLORS['bed'],
+                    lw=1, label='Analytical bedrock')
             if analytical.surface_alt is not None:
                 ax.plot(analytical.x, analytical.surface_alt, ':',
                         color=COLORS['alternative'], lw=1, label='Analytical fluvial alt')
-            if analytical.ela != data.ela[idx]:
+            if data is None or analytical.ela != data.ela[idx]:
                 ax.axhline(analytical.ela, color=COLORS['ela'], ls='--', lw=1,
                            label='Analytical ELA')
-        ax.axhline(data.ela[idx], color=COLORS['ela'], lw=1, label='ELA')
+        if data is not None:
+            ax.axhline(data.ela[idx], color=COLORS['ela'], lw=1, label='ELA')
     else:
         values = getattr(data, spec.attribute)[idx] * spec.scale
         label = {'shear_stress': 'Basal shear stress', 'ice_thickness': 'Mean ice thickness'}.get(
@@ -184,7 +213,7 @@ def draw_panel(ax, field, data, idx, analytical=None):
             ax.plot(x, uplift, '--', color=COLORS['uplift'], lw=1, label='Uplift rate')
             if not np.any(np.asarray(getattr(data, spec.attribute)[idx]) > 0):
                 ax.text(0.02, 0.05, 'No positive erosion in this snapshot',
-                        transform=ax.transAxes, fontsize=8, color=COLORS['erosion'])
+                        transform=ax.transAxes, color=COLORS['erosion'])
         if field == 'shear_stress' and data.tau_c is not None:
             ax.axhline(data.tau_c * spec.scale, color=COLORS['uplift'], ls='--',
                        lw=1, label=r'$\tau_c$')
@@ -194,6 +223,9 @@ def draw_panel(ax, field, data, idx, analytical=None):
 
 class ProfileMethods:
     """Common public methods. Subclasses supply _profile_source and reference data."""
+
+    # 2D extracted channels; the 1D plotter draws its grid coordinate, 'x (km)'
+    _PROFILE_XLABEL = 'Distance from divide (km)'
 
     def _profile_setup(self, fields, field_min, field_max, basin_rank, ref,
                        analytical, bistable):
@@ -209,38 +241,56 @@ class ProfileMethods:
 
     def _draw_profile(self, axes, data, idx, resolved, reference, legend=True):
         for ax, (field, limits) in zip(axes, resolved.items()):
-            draw_panel(ax, field, data, idx, reference)
+            draw_panel(ax, field, data, idx, reference, floor=limits[0])
             self._draw_profile_extra(ax, data, idx, field)
             ax.set_ylim(*limits)
             style_axes(ax, legend=legend)
-        axes[-1].set_xlabel('Distance (km)')
+        axes[-1].set_xlabel(self._PROFILE_XLABEL)
         title = time_label(data.times[idx])
         if data.context:
             title += ' · ' + data.context
-        axes[0].set_title(title, loc='right', fontsize=10)
+        axes[0].set_title(title, loc='right')
 
     @staticmethod
-    def _profile_axes(nf, ax=None, fig_width=8, aspect=0.38):
+    def _profile_axes(nf, ax=None, fig_width=None, aspect=None):
         import matplotlib.pyplot as plt
         if ax is not None:
             if nf != 1:
                 raise ValueError('ax= is only valid for a single field')
             return ax.figure, np.array([ax])
+        fig_width, aspect = panel_shape(nf, fig_width, aspect)
         fig, axes = plt.subplots(nf, 1, sharex=True, squeeze=False,
                                  figsize=(fig_width, fig_width * aspect * nf),
                                  layout='constrained')
         return fig, axes[:, 0]
 
+    def _draw_analytical(self, ax, reference):
+        """``analytical()``: the reference alone, through ``draw_panel``, on
+        ``profile()``'s single-panel figure, limits and x axis."""
+        own_axes = ax is None
+        if own_axes:
+            _, (ax,) = self._profile_axes(1)
+        limits = field_limits('elevation', reference.surface, reference.bed,
+                              reference.surface_alt, reference.ela)
+        draw_panel(ax, 'elevation', None, None, reference,
+                   floor=limits[0] if own_axes else ax.get_ylim()[0])
+        if own_axes:                 # a supplied (e.g. profile()) axes keeps its limits
+            ax.set_ylim(*limits)
+        ax.set_xlabel(self._PROFILE_XLABEL)
+        style_axes(ax)
+        return ax
+
     def profile(self, fields='elevation', i=-1, field_min=None, field_max=None,
                 basin_rank=0, ref=-1, analytical=True, bistable=True, ax=None, *,
-                fig_width=8, aspect=0.38, legend=True):
+                fig_width=None, aspect=None, legend=True):
         """Snapshot profile. Fields: name, list or {name: (min, max)|None}.
 
         Automatic limits cover finite data and references across all outputs.
         ``i`` selects the snapshot; ``ref`` selects the channel extraction frame
         and ``basin_rank`` its basin in 2D. In 1D those two arguments are accepted
         for call compatibility and have no effect. Figure width is in inches;
-        aspect is panel height/width. Supplied axes retain existing artists.
+        aspect is panel height/width. One field defaults to 6 in at 0.38, a
+        stack to 12 in at 0.25. Supplied axes retain existing artists.
         Coordinates follow the source order (descending in 1D, ascending along
         extracted 2D channels). Returns ``(fig, axes)``.
         """
@@ -252,24 +302,26 @@ class ProfileMethods:
 
     def view_profile(self, fields='elevation', field_min=None, field_max=None,
                      basin_rank=0, ref=-1, analytical=True, bistable=True,
-                     fig_width=8, aspect=0.38, legend=False):
-        """Notebook slider with the same fields, limits and styles as profile()."""
+                     fig_width=None, aspect=None, legend=False):
+        """Notebook slider with the same fields, limits, sizes and styles as
+        profile()."""
         from ._render import _profile_slider
         data, resolved, reference = self._profile_setup(
             fields, field_min, field_max, basin_rank, ref, analytical, bistable)
+        fig_width, aspect = panel_shape(len(resolved), fig_width, aspect)
 
         def frame(axes, idx):
             for ax in axes:
                 ax.clear()
             self._draw_profile(axes, data, idx, resolved, reference, legend=False)
 
-        return _profile_slider(frame, len(data.times), len(resolved), data.times,
+        return _profile_slider(frame, len(data.times), len(resolved),
                                fig_width=fig_width, aspect=aspect, legend=legend)
 
     def animate_profile(self, fields='elevation', path=None, run_id=None,
                         field_min=None, field_max=None, basin_rank=0, ref=-1,
                         analytical=True, bistable=True, fps=20, interval=42, *,
-                        fig_width=8, aspect=0.38, legend=True, frames=None):
+                        fig_width=None, aspect=None, legend=True, frames=None):
         """MP4 with profile() styling. Explicit fps wins over interval (ms/frame).
 
         Pass fps=None to derive the encoded frame rate from interval.

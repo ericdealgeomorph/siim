@@ -223,7 +223,8 @@ def _power_dt_2d_periodic(offsets, dy, dx, D, SRC, wrap_y, wrap_x):
 
 @numba.njit(cache=True)
 def _carve_subgrid_width(zb_flat, zb_kern, zb_pre, H_flat, surface_out,
-                         rec, D, SRC, offsets, widening_factor, hc_over_H):
+                         rec, D, SRC, offsets, widening_factor, hc_over_H,
+                         s_src):
     """Apply the sub-grid width carve (see block comment above) to every
     footprint cell whose bed stands above its target — bare valley walls
     AND thin-ice cells inside a bigger glacier's footprint ("nodes that
@@ -246,6 +247,13 @@ def _carve_subgrid_width(zb_flat, zb_kern, zb_pre, H_flat, surface_out,
         The -R^2 seed array the power transform consumed — R^2 is
         read back from it (R2 = -offsets[s]) so footprint definition
         and carve targets cannot disagree.
+    s_src : ndarray
+        Per-cell confinedness of mode D's valley <-> sheet map
+        (``constants.HC_SHEET``), read at the SOURCE: the widening
+        factor becomes ``widening_factor*s_src[s]`` (exact at 1; a source at
+        0 carves nothing — the early skip below is a shortcut: a zero factor
+        leaves the pre-step bed, which never undercuts). All ones outside
+        mode D.
 
     A self-attributed cell's target is its own bed — a structural no-op
     (the skip is a shortcut); border (self-receiving) cells are skipped as
@@ -265,6 +273,9 @@ def _carve_subgrid_width(zb_flat, zb_kern, zb_pre, H_flat, surface_out,
         E_dt = zb_pre[s] - zb_kern[s]         # the kernel's bed drop at s
         if E_dt <= 0.0:                       # floating / no erosion at source
             continue
+        ws = s_src[s]                         # the source's confinedness
+        if ws <= 0.0:                         # a sheet source carves nothing
+            continue
         # No surface gate: terrain standing above the source's ice surface
         # IS consumed (ridge-eating is the capture mechanism — the whole
         # point); the parabola rims AT the ice surface zs_s, so the
@@ -273,7 +284,7 @@ def _carve_subgrid_width(zb_flat, zb_kern, zb_pre, H_flat, surface_out,
         R2 = -offsets.flat[s]                 # the seed's own R^2 (> 0)
         d2 = D.flat[i] + R2                   # squared distance to source
         target = zb_kern[s] + hc_over_H * H_s * (d2 / R2)
-        lowered = zb_pre[i] - widening_factor * E_dt
+        lowered = zb_pre[i] - (widening_factor * ws) * E_dt
         if target > lowered:
             lowered = target
         if lowered < zb_flat[i]:

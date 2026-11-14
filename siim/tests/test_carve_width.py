@@ -162,7 +162,8 @@ def test_carve_seam_invariance_looped_x():
         D = np.empty((ny, nx)); SRC = np.empty((ny, nx), np.int64)
         _power_dt_2d_periodic(offsets, dx, dx, D, SRC, False, True)
         _carve_subgrid_width(zb_flat, zb_flat.copy(), zb_pre, H.ravel(),
-                             surf, rec, D, SRC, offsets, np.inf, HC)
+                             surf, rec, D, SRC, offsets, np.inf, HC,
+                             np.ones(ny * nx))      # outside mode D: s = 1
         return zb_flat.reshape(ny, nx), surf.reshape(ny, nx)
 
     zb0, surf0 = carve(0)
@@ -303,7 +304,7 @@ def test_carve_semantics_straight_channel():
     surf = zb_flat + HC * H.ravel()
     _carve_subgrid_width(zb_flat, zb_flat.copy(), zb_pre.ravel(),
                          H.ravel(), surf, rec, D, SRC,
-                         offsets, np.inf, HC)
+                         offsets, np.inf, HC, np.ones(ny * nx))
     z2 = zb_flat.reshape(ny, nx)
 
     R = 0.5 * alpha_g * 200.0
@@ -343,7 +344,7 @@ def test_carve_semantics_straight_channel():
     surf2 = zb_flat2 + HC * H.ravel()
     _carve_subgrid_width(zb_flat2, zb_flat2.copy(), zb_pre.ravel(),
                          H.ravel(), surf2, rec, D, SRC,
-                         offsets, 2.0, HC)
+                         offsets, 2.0, HC, np.ones(ny * nx))
     z3 = zb_flat2.reshape(ny, nx)
     np.testing.assert_allclose(z3[3, 4], 120.0 - 2.0 * 0.5)
     # (5,4) already eroded 0.2 by its own kernel: total descent from the
@@ -369,7 +370,7 @@ def test_carve_width_integration():
         'carve_width': True, 'widening_rate': 0.0,
         # Isolate the carve from the mode-C standard: the carve-on / carve-off
         # twins below differ ONLY in carve_width.
-        'trunk_surface': False, 'routing_relax': 0.0,
+        'trunk_surface': False,
     }
     m = siim2d.siim(params)
     m.run()

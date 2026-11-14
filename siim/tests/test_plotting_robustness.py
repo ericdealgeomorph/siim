@@ -12,6 +12,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _REPO_ROOT not in sys.path:
@@ -34,10 +35,49 @@ def test_m29_flat_hillshade_matches_matplotlib():
     for z in (np.zeros((ny, nx)),                       # flat
               1e-8 * np.random.default_rng(0).random((ny, nx))):  # near-flat noise
         got = _shade_rgb_soft(rgb.copy(), z, dx, dx, 1.0, az, alt)
-        want = ls.shade_rgb(rgb.copy(), z, vert_exag=1.0, dx=dx, dy=dx,
-                            blend_mode='soft')[..., :3]
+        # gate: the map draws origin='lower' (row 0 = south) and LightSource
+        # takes row 0 as the top, so the reference is the flipped shade (C1)
+        want = np.flipud(ls.shade_rgb(np.flipud(rgb), np.flipud(z),
+                                      vert_exag=1.0, dx=dx, dy=dx,
+                                      blend_mode='soft'))[..., :3]
         np.testing.assert_allclose(got, want, atol=1e-6)
         assert got.mean() > 0.6                          # brightened, not darkened
+
+
+@pytest.mark.pin
+def test_hillshade_lights_a_dome_from_the_nw():
+    """The default light, azdeg=315, comes from the NW: on a dome the NW
+    quadrant is the brightest. The map draws origin='lower' (row i+1 lies
+    north), and the kernel took its y slope on -dy, matplotlib's row-0-at-top
+    convention, so every azimuth acted as 180 - azdeg and the light came from
+    the SW (audit C1)."""
+    from types import SimpleNamespace
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+    from siim.plotting import siim_plotter
+    n = 41
+    yy, xx = np.mgrid[0:n, 0:n].astype(float)       # row = y (north up), col = x
+    dome = 2000.0 - ((xx - 20) ** 2 + (yy - 20) ** 2)
+    model = SimpleNamespace(
+        zb_out=dome[None], z_out=dome[None], H_out=np.zeros((1, n, n)),
+        area_out=np.full((1, n, n), 1e8),
+        receivers_out=np.arange(n * n, dtype=float).reshape(1, n, n),
+        output_times=np.array([0.0]), _zELA_output=np.array([1e5]),
+        Lx=40e3, Ly=40e3, hc_over_H=1.5, alpha_g=8.0, grid_nx=n, grid_ny=n,
+        boundary_status=['fixed_value'] * 4)
+    fig, ax = siim_plotter(model).landscape(
+        field='bedrock', oversample=1,
+        sigma_cells=0, contour_interval=0, hillshade=True, colorbar=False,
+        cmap_bed=ListedColormap(['#808080']))          # one grey: shading only
+    shade = np.asarray(ax.get_images()[0].get_array(), dtype=float)[..., 0]
+    plt.close(fig)
+    h = n // 2
+    quadrant = {'SW': shade[:h, :h].mean(), 'SE': shade[:h, h + 1:].mean(),
+                'NW': shade[h + 1:, :h].mean(), 'NE': shade[h + 1:, h + 1:].mean()}
+    ranked = sorted(quadrant, key=lambda k: quadrant[k])
+    assert ranked[-1] == 'NW' and ranked[0] == 'SE', quadrant
 
 
 # --- m31: 1D ice_thickness ylim scales with data ----------------------------
@@ -54,14 +94,20 @@ def _glac1d(**ov):
 
 
 def test_m31_ice_thickness_ylim_grows_with_data():
+    from siim.plotting._profiles import data_limits
     m = siim1d(_glac1d()); m.run()
+
+    def ice_top():
+        # gate: the test-only 1D _compute_field_ylims wrapper is gone (Phase C
+        # cruft); this is the call it made, so the pinned limits are unchanged.
+        return data_limits(m.plot._profile_source(), ['ice_thickness'])['ice_thickness'][1]
     # thick ice (dome regime): the limit grows past the 500 m floor
     m.H_out = np.full_like(m.H_out, 800.0)
-    hi = m.plot._compute_field_ylims(['ice_thickness'])['ice_thickness'][1]
+    hi = ice_top()
     assert hi == max(500.0, 800.0 * 1.05)
     # thin ice: floored at 500 m
     m.H_out = np.full_like(m.H_out, 100.0)
-    hi = m.plot._compute_field_ylims(['ice_thickness'])['ice_thickness'][1]
+    hi = ice_top()
     assert hi == 500.0
 
 

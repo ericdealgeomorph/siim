@@ -55,7 +55,7 @@ from dataclasses import dataclass
 import numpy as np
 import scipy.special as _sp
 
-from .core import incomplete_beta_compl
+from .core import _b_small, incomplete_beta_compl
 
 __all__ = ['RegimeMap', 'SaddleNodeBoundary']
 
@@ -256,12 +256,13 @@ class RegimeMap:
         scalar solves). Closed forms where they are exact: the marginal
         Coulomb case a = 1/2, b = 0 is (2/k) arcosh(u^(-k/2)) (pinned
         against the kernel by the test suite); b > 0 is scipy's scalar
-        betainc. Anything else falls back to the kernel."""
+        betainc for b >= core._b_small(a) (below it the reflection cancels;
+        audit #56). Anything else falls back to the kernel."""
         if u >= 1.0:
             return 0.0
         if self._b == 0.0 and self._a == 0.5:
             return (2.0 / self.k) * math.acosh(u ** (-self.k / 2.0))
-        if self._b > 0.0:
+        if self._b >= _b_small(self._a):
             eps = u ** self.k
             return (_sp.beta(self._a, self._b)
                     * (1.0 - _sp.betainc(self._b, self._a, eps))) / self.k

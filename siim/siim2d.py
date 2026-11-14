@@ -1,6 +1,9 @@
+import copy
+import numbers
 import numpy as np
 import os
 import pickle
+import sys
 import tempfile
 import warnings
 from datetime import datetime, timezone
@@ -9,21 +12,33 @@ from types import SimpleNamespace
 # gate: persistence records the producing version from the package's single source.
 from . import __version__ as _SIIM_VERSION
 from . import constants as _constants
+from .constants import check_range as _check_range
 from .constants import (GRAVITY, KT, RHO_ICE, derive_coulomb,
                         derive_power)
 from .analytical import analytical_steady_state_solution
 from ._output import output_path
 from .plotting import siim_plotter
+from ._core.outputs import _donor_lists, _sanitized_receivers
 from ._core import driver as _driver
 from ._core import outputs as _outputs
 from ._core.flexure import flexure as _inhouse_flexure
+from ._core.router import (DONOR_FIRST_ROUTERS as _DONOR_FIRST_ROUTERS,
+                           SLOPE_NORMALISED_ROUTERS as _SLOPE_NORMALISED_ROUTERS,
+                           check_mfd_config as _check_mfd_config,
+                           check_inner_loop_config as _check_inner_loop_config,
+                           check_routing_filter_config
+                           as _check_routing_filter_config,
+                           resolve_trunk_dip_k as _resolve_trunk_dip_k)
+from ._core.regime import check_regime_grid as _check_regime_grid
+from ._core import threads as _threads
+from ._core.solvers import ice_speeds
 from ._core.step import (build_glacial_params, initial_topography,
                          uplift_mask, block_uplift)
 
 try:  # numpy >= 1.25
     from numpy.exceptions import RankWarning as _RankWarning
 except ImportError:  # numpy < 1.25 (np.RankWarning removed in numpy 2)
-    _RankWarning = np.RankWarning
+    _RankWarning = np.RankWarning  # noqa: NPY201 reached only on numpy < 1.25; the try branch serves numpy 2
 
 
 _SAVE_FORMAT = "siim.model-state.pickle"
@@ -32,6 +47,44 @@ _SAVE_REQUIRED_KEYS = frozenset({
     "save_format", "schema_version", "siim_version", "model_identity",
     "_user_params", "ds_out",
 })
+# Parameters this version removed, each with what to use instead: passing one
+# raises (set_and_check_parameters); a saved model carrying one loads without
+# it, with a warning (load).
+_REMOVED_PARAMS = {
+    'routing_relax': (
+        "modes B, C and D damp the ice itself (inner_damping, default "
+        f"{_constants.MODE_BCD_INNER_DAMPING!r}); drop the key, or pass "
+        "inner_relax=1.0, inner_passes=1 for the undamped model"),
+}
+
+
+_BOUNDARY_KINDS = ('fixed_value', 'core', 'looped')
+
+
+def _check_boundary_status(boundary_status):
+    """The 4-list [left, right, bottom, top] of a scalar or 4-sequence
+    boundary_status, validated at the user boundary (audit #1, #15, #16, #32):
+    each side one of _BOUNDARY_KINDS (a typo used to close the edge silently),
+    'looped' on both sides of an axis or neither (the wrap flags read one side
+    only), and at least one 'fixed_value' side, the outlet (without one the
+    priority flood has no seed and nothing drains)."""
+    try:
+        bs = [str(s) for s in np.broadcast_to(np.asarray(boundary_status, dtype=object), 4)]
+    except ValueError:
+        raise ValueError("boundary_status must be one value or four "
+                         f"[left, right, bottom, top], got {boundary_status!r}") from None
+    bad = sorted(set(bs) - set(_BOUNDARY_KINDS))
+    if bad:
+        raise ValueError(f"boundary_status sides must be one of {_BOUNDARY_KINDS}, "
+                         f"got {bad} in {bs}")
+    for (i, j), axis in (((0, 1), 'left/right'), ((2, 3), 'bottom/top')):
+        if (bs[i] == 'looped') != (bs[j] == 'looped'):
+            raise ValueError(f"boundary_status: 'looped' pairs the two sides of an "
+                             f"axis, got {bs[i]!r}/{bs[j]!r} for {axis}")
+    if 'fixed_value' not in bs:
+        raise ValueError("boundary_status needs at least one 'fixed_value' side "
+                         f"(the outlet), got {bs}")
+    return bs
 
 
 def _model_identity(model_cls):
@@ -166,11 +219,12 @@ def _load_initial_topography(src):
 def _ibc_from_border_status(border_status):
     """Encode ``border_status`` for the in-house flexure/diffusion kernels.
 
-    The retained boundary code is ``left*1 + right*100 + top*1000 +
-    bottom*10``, with a digit 1 per ``'fixed_value'`` edge. It matches the
-    historical Fastscape convention used by these numerical kernels.
+    The retained boundary code is ``left*1 + right*100 + bottom*1000 +
+    top*10`` in siim's side names (``bottom`` is row 0), with a digit 1 per
+    ``'fixed_value'`` edge. It matches the historical Fastscape convention
+    used by these numerical kernels.
     """
-    bs = list(np.broadcast_to(border_status, 4))   # [left, right, top, bottom]
+    bs = list(np.broadcast_to(border_status, 4))   # [left, right, bottom, top]
     arr_bc = np.array([1 if s == 'fixed_value' else 0 for s in bs])
     return int(sum(arr_bc * np.array([1, 100, 1000, 10])))
 
@@ -214,27 +268,46 @@ class siim:
             raise TypeError("params must be provided as a dictionary.")
 
         # Stash a copy so _set_analytical_grid can rebuild the analytical with
-        # channel-fitted geometry overrides (called by extract_channel).
-        self._user_params = dict(user_params)
+        # channel-fitted geometry overrides (called by extract_channel). A deep
+        # copy, and the run reads it, so a caller mutating an input array later
+        # cannot change the run (audit #35).
+        user_params = self._user_params = _constants.unwrap_0d(copy.deepcopy(user_params))
         self.set_and_check_parameters(user_params)
 
         # Standalone analytical (siim.analytical.analytical_steady_state_solution).
         # Constructed from a curated subset of user_params; see _analytical_user_params.
-        self.analytical = analytical_steady_state_solution(
+        # None on a non-eroding bed (ce or Ko = 0; see _build_analytical).
+        self.analytical = self._build_analytical(
             self._analytical_user_params(user_params)
         )
-        # Plotter aliases — preserve the pre-strip API where the plotter reads
-        # m.x / m.L for the 1D analytical reference grid.
-        self.x = self.analytical.x
-        self.L = self.analytical.L
-        # Hack geometry mirrors the analytical reference (extract_channel re-fits
-        # these per basin); siim2d has no k_h/d/sigma/xo params of its own.
-        self.xo = self.analytical.xo
-        self.k_h = self.analytical.k_h
-        self.d = self.analytical.d
-        self.sigma = self.analytical.sigma
+        if self.analytical is None:
+            # No reference grid; the Hack geometry keeps the analytical's defaults
+            # (siim2d takes no xo/k_h/d of its own; extract_channel re-fits them).
+            self.x, self.L = None, self.Lx
+            self.xo, self.k_h = _constants.XO, _constants.KH
+            self.d, self.sigma = _constants.D_HACK, _constants.SIGMA
+        else:
+            # Plotter aliases — preserve the pre-strip API where the plotter reads
+            # m.x / m.L for the 1D analytical reference grid.
+            self.x = self.analytical.x
+            self.L = self.analytical.L
+            # Hack geometry mirrors the analytical reference (extract_channel re-fits
+            # these per basin); siim2d has no k_h/d/sigma/xo params of its own.
+            self.xo = self.analytical.xo
+            self.k_h = self.analytical.k_h
+            self.d = self.analytical.d
+            self.sigma = self.analytical.sigma
 
         self.plot = siim_plotter(self)
+
+    def _build_analytical(self, params):
+        """The 1D analytical steady-state reference, or None when ``ce`` or
+        ``Ko`` is 0: that steady state balances uplift against glacial and
+        fluvial erosion and divides by both, so a non-eroding (frozen) bed has
+        none to build. The run itself accepts 0 (no erosion)."""
+        if self.ce == 0 or self.Ko == 0:
+            return None
+        return analytical_steady_state_solution(params)
 
     def _analytical_user_params(self, user_params):
         """Filter user_params down to keys the standalone analytical accepts and
@@ -265,8 +338,9 @@ class siim:
         out["U"] = self.U
         out["zELA"] = self.zELA
         out["P"] = self.P
+        out["hc_over_H"] = self.hc_over_H       # the reference's bed on the run's datum (ED-183)
         out["L"] = self.Lx
-        out["nx"] = 3000
+        out["nx"] = _constants.ANALYTICAL_NX_2D
         out["left_bc"] = "reflecting"
         out["right_bc"] = "base_level"
         return out
@@ -290,7 +364,7 @@ class siim:
             # climate
             "P": _constants.P,
             "beta": _constants.BETA,
-            "zELA": _constants.ZELA,
+            "zELA": None,   # None: constants.ZELA, unless zT is given
             "zT": None,
             "U": _constants.U,
             # Base level: the water-line (Dirichlet) datum for mode B. Scalar
@@ -324,7 +398,10 @@ class siim:
             # run the erosion step level-scheduled across threads (topological
             # levels of the flow graph). BIT-FOR-BIT identical to the serial
             # eroder at any thread count (pinned by test_parallel_erode);
-            # default ON. False = the serial eroder.
+            # default ON (under flow_routing='mfd': on under the TBB
+            # threading layer only, constants.MFD_PARALLEL_ERODE_LAYERS).
+            # False = the serial eroder. Its per-level loops run at the performance-core thread
+            # count (_core.threads.level_threads).
             "parallel_erode": _constants.PARALLEL_ERODE,
             # fluvial
             "n": _constants.N_FLUVIAL,
@@ -333,6 +410,9 @@ class siim:
             # glacial
             "Ac": _constants.AC,
             "alpha_g": _constants.ALPHA_G,
+            # Channel-floor datum: zs = zb + hc_over_H*H. None = constants.HC_OVER_H
+            # (the parabola's max/mean depth ratio); 1 = the sheet datum.
+            "hc_over_H": None,
             "lambda_p": _constants.LAMBDA_P,  # eff-exp/power critical ice thickness [m]
             # Default per-law-derived from nu. For exact power/Coulomb numerics
             # an explicit override is analytical-only and warns.
@@ -350,18 +430,59 @@ class siim:
             "width_hack_k": _constants.WIDTH_HACK_K,
             "width_hack_p": _constants.WIDTH_HACK_P,
 
-            # Flow routing: 'single' (D8 single-flow, default) or
-            # 'dinf' (Tarboton 1997 D-infinity). Both produce stable SS with the
-            # area-based width-amplified mass balance.
+            # Flow routing: 'single' (D8 single-flow, default), 'infinite'
+            # (Tarboton 1997 D-infinity) or 'multiple' (multiple-flow-direction);
+            # the router codes 'dinf' / 'mfd' are accepted as aliases
+            # (constants.normalize_flow_routing).
+            # The first two produce stable SS with the area-based
+            # width-amplified mass balance.
             # - 'single' (D8): each cell drains to one steepest neighbor. Cheapest,
             #   fastest, recommended default. Use with coulomb or power for paper
             #   figures.
-            # - 'dinf' (Tarboton): flux split between the two neighbors that bracket
+            # - 'infinite' / 'dinf' (Tarboton): flux split between the two neighbors that bracket
             #   the steepest-facet direction, with continuous angle-based weights.
             #   Useful for finer routing geometry (confluence resolution, drainage
             #   pattern visualizations). All three sliding laws (eff-exp, power,
-            #   coulomb) work under either routing.
+            #   coulomb) work under either routing. Since 2026-09-05 the gamma
+            #   effective-slope normalisation is ON by default here (see
+            #   `slope_normalise`), so the closure/eroder slope is |grad zs|
+            #   rather than its projection on the two-receiver direction;
+            #   `slope_normalise=False` restores the older behaviour.
+            # - 'multiple' / 'mfd': flux split over ALL strictly
+            #   downhill 8-neighbours with weights (S_k/S_max)^mfd_exponent, and
+            #   the gamma effective-slope normalisation turned on so the
+            #   thickness closure and the eroders still see |grad zs|. Built for
+            #   the ice-sheet regime, where D8/D-inf make the flow graph a step
+            #   function of the surface; runs in valleys too (mode C, the carve
+            #   and the trunk surface; dip per resolve_trunk_dip_k). REQUIRES
+            #   mode 'B' or 'C', a transect closure_flux and dx == dy (each
+            #   raises otherwise). An unset `parallel_erode` then follows the
+            #   threading layer, on under TBB alone (MFD raises the
+            #   topological level count 151 -> 400 at 201^2, so the
+            #   level-scheduled eroder's fork/join cost roughly triples on
+            #   workqueue; measured in mode D).
             "flow_routing": "single",
+
+            # MFD spreading exponent p in w_k = (S_k/S_max)^p (flow_routing='mfd'
+            # only; positive, finite up to constants.MFD_EXPONENT_MAX = 50, or
+            # inf). Default constants.MFD_EXPONENT = 1.0 —
+            # Budd & Warner's split and the only exponent whose weighted receiver
+            # vector is exactly parallel to the surface gradient on a square
+            # 8-stencil. p = 2 concentrates; p = inf is the steepest link alone,
+            # and a finite p above 50 is routed as inf with a warning. Inert
+            # under 'single' / 'dinf'.
+            "mfd_exponent": _constants.MFD_EXPONENT,
+
+            # gamma effective-slope normalisation. None (default) resolves per
+            # router from _core.router.SLOPE_NORMALISED_ROUTERS: ON for every
+            # MULTI-receiver router ('dinf', 'mfd'), OFF for 'single'. An
+            # explicit True/False wins, so the pre-2026-09-05 D-inf behaviour is
+            # reachable as slope_normalise=False. Under 'single' the flag is a
+            # NO-OP (one receiver => gamma == 1 identically); under 'mfd' an
+            # explicit False RAISES (MFD without it is 17-24 % low by
+            # construction). See constants.MFD_GAMMA_FLOOR and
+            # docs/dev/dinf_slope_normalisation.md.
+            "slope_normalise": None,
 
             # Single-flow routing backend (see constants.ROUTER_DEFAULT).
             # 'inhouse_d8' = siim's numba D8 fill-then-route
@@ -395,7 +516,9 @@ class siim:
             #     aliases (constants.normalize_mode maps to the internal code).
             #     One-breath taxonomy: A = ice-surface state; B = bedrock+ice
             #     state (bed memory, NO carving); C = B + sub-grid width carving
-            #     (2D only; equivalent to mode='B', carve_width=True). The 2D
+            #     (2D only; equivalent to mode='B', carve_width=True); D = C with
+            #     the channel/sheet reading choosing valley or sheet rules per cell
+            #     (2D, standalone driver; constants.MODE_D_*). The 2D
             #     DEFAULT is mode C (the flagship carved config); an unqualified
             #     mode='B' does NOT carve. Single scalar; applies to the run.
             "mode": _constants.DEFAULT_MODE_2D,
@@ -430,30 +553,63 @@ class siim:
             # wrap-pads along looped axes (nearest periodic image; exact).
             "carve_width": None,
             "widening_rate": _constants.DEFAULT_WIDENING_RATE,
-            # Fabricated trunk-surface routing (mode B/C). Route + accumulate on
+            # Fabricated trunk-surface routing (mode B/C). Route on
             # a fabricated ice surface with a linear cross-valley dip toward the
             # centerline, so flow CONVERGES onto the trunk chain and its raw flux
-            # is the full cross-section. Also evaluates mass balance at the
-            # trunk-surface elevation (re-tune zELA before comparing to
-            # non-trunk-surface runs). See ``docs/guides/concepts.md``.
-            # Knob: trunk_dip_k (0.6).
+            # is the full cross-section. The V builds the router graph ONLY
+            # (FIREWALL: see siim._core.driver). See
+            # ``docs/dev/trunk_surface_routing.md``.
+            # Knob: trunk_dip_k — None (default) is router-derived, see
+            # _core.router.resolve_trunk_dip_k.
             # Default None = the mode-C STANDARD (resolved after mode
             # normalization): ON for mode C (mode B + carve), OFF for plain
             # mode B and mode A. An explicit True/False always wins.
             "trunk_surface": None,
-            "trunk_dip_k": _constants.TRUNK_DIP_K,
-            # Routing-surface EMA relaxation (mode B/C anti-flicker). r in
-            # [0, 1): the surf2erode routing + mass-balance surface is built from
-            # H_eff = r*H_eff_prev + (1-r)*H_lag instead of the raw lagged H,
-            # damping the discrete-D8 per-step planview ice flicker.
-            # Routing/accumulation only — the kernel/carve/outputs stay on raw
-            # state (the runaway firewall). Default
-            # None = the mode-C STANDARD (constants.MODE_C_ROUTING_RELAX for
-            # mode C, 0.0 for plain mode B / mode A). An explicit value wins.
-            "routing_relax": None,
+            "trunk_dip_k": None,
+            # EXPERIMENTAL (branch closure-transect-flux): which ice flux the
+            # thickness closure + erosion laws see. 'cell' = the cell's own
+            # routed flux; 'transect' = the routed flux crossing
+            # a line one closure-width (alpha_g*H) long through the cell,
+            # perpendicular to its flow (a trunk sees its own Q, a cell inside a
+            # broad sheet sees the flux of the whole width the closure assumes);
+            # 'transect_min' = same, but a neighbour contributes at most the
+            # cell's own flux. Default None resolves per mode: constants.
+            # CLOSURE_FLUX ('transect_min') for mode B/C, 'cell' for mode A
+            # (which has no transect path); an explicit value always wins, and
+            # an explicit 'cell' is the pre-branch closure bit-for-bit. See
+            # constants.CLOSURE_FLUX and docs/dev/closure_transect_results.md.
+            "closure_flux": None,
+            # Within-step damped iteration (mode B/C sheet knobs). inner_passes
+            # = n >= 1 evaluations of the diagnostic ice map per landscape step,
+            # the first n-1 at dt = 0 (rehearsals); after EVERY pass the
+            # thickness iterate moves x <- x + omega*(F(x) - x) with omega =
+            # inner_relax in (0, 1]. omega < 1 retains 1 - omega of the previous
+            # iterate (a numerical ice memory of ~1/(omega*n) steps). Modes
+            # B/C/D resolve their own defaults (set_and_check_parameters). See
+            # constants.INNER_PASSES.
+            "inner_passes": _constants.INNER_PASSES,
+            "inner_relax": _constants.INNER_RELAX,
+            # How the passes commit: 'omega' (the uniform omega above) or an
+            # adaptive preset damping only the flickering cells, down to the
+            # preset's floor (constants.INNER_DAMPING_FLOORS). None = the
+            # mode's default: constants.MODE_BCD_INNER_DAMPING in modes B/C/D,
+            # except 'omega' when inner_relax is set; 'omega' in mode A.
+            "inner_damping": None,
+            # Routing-surface spatial filter (mode B/C sheet knob). f > 0 builds
+            # the ROUTER GRAPH alone from a smoothed routing surface
+            # (_core.step.filter_routing_surface), so a filtered run is a
+            # different model, not a filtered view of one. f = 2 is the measured
+            # setting; 0 = off, bit-for-bit today. See
+            # constants.ROUTING_FILTER_FACTOR.
+            "routing_filter_factor": _constants.ROUTING_FILTER_FACTOR,
+            # Mode D's bed bar kB (constants.REGIME_BED_BAR): a cell reads
+            # channel only where its bed lies below the bed around it by at
+            # least (kB - 1) times the surrounding ice thickness. None = the
+            # default (mode D only); 0 = no bar.
+            "channel_bed_bar": None,
 
             # hillslope diffusivity
-            "D": 1e-3,
+            "D": _constants.HILLSLOPE_D,
             # boundary conditions: [left, right, bottom, top]
             # each is 'fixed_value', 'core', or 'looped'.
             # Default = left/right fixed base level, top/bottom periodic. OQ-1(b)
@@ -468,9 +624,9 @@ class siim:
             # initial topography: if `initial_topography` is None, build a
             # tent that ramps from 0 at fixed_value edges up to
             # initial_max_elevation at the farthest interior point.
-            "initial_max_elevation": 1000,
+            "initial_max_elevation": _constants.INITIAL_MAX_ELEVATION,
             "initial_topography": None,
-            "noise_amplitude": 100,
+            "noise_amplitude": _constants.NOISE_AMPLITUDE,
             "seed": None,
             # run options
             "progress_bar": True,
@@ -484,7 +640,8 @@ class siim:
             # TRUE rock removed — delta-zb incl. sub-grid carve in mode B, delta-zs
             # in mode A) AND
             # (when ice_load=True, the default) the per-step glacial ice load — the
-            # mass-conserving channel cross-section alpha_g*H^2/L (= Qg/V, hc-free) —
+            # channel cross-section alpha_g*H^2/L (= Qg/V, hc-free; a slab H on
+            # mode D's sheet cells) —
             # i.e. true glacial isostatic adjustment: ice loading +
             # erosional/tectonic unloading + elastic rebound. Hillslope diffusion
             # of the ice surface is deliberately left out of the load (an accepted
@@ -494,7 +651,7 @@ class siim:
             # Include the ice load in flexure (true GIA). False = erosional/tectonic
             # unloading only (the pre-GIA behaviour; isolate the ice contribution or
             # reproduce runs saved before the ice load). Only consulted when flexure=True.
-            "ice_load": True,
+            "ice_load": _constants.ICE_LOAD,
             # Route per-step eroded volume down the flow graph and report it.
             # False (off — skips the accumulation pass), True / 'basin': the
             # per-node throughput (sediment_flux_out) + its running total
@@ -502,9 +659,13 @@ class siim:
             # 'fixed_value' domain edge (sediment_edge_flux_out + its running
             # total), a (time, side) pair instead of rasters; 'both'.
             "track_sediment": False,
-            "lithos_density": 2800,   # lithospheric rock density (kg/m^3); scalar or (ny,nx)
-            "asthen_density": 3200,   # asthenospheric density (kg/m^3)
-            "e_thickness": 35e3,      # effective elastic plate thickness Te (m)
+            # Store the closure's own (flux, thickness) rows, closure_Qg_out /
+            # closure_H_out, where they differ from Qg_out / H_out: ice_speed
+            # is exact with them, approximate (and warns) without.
+            "save_closure_pair": _constants.SAVE_CLOSURE_PAIR,
+            "lithos_density": _constants.LITHOS_DENSITY,   # lithospheric rock density (kg/m^3); scalar or (ny,nx)
+            "asthen_density": _constants.ASTHEN_DENSITY,   # asthenospheric density (kg/m^3)
+            "e_thickness": _constants.E_THICKNESS,      # effective elastic plate thickness Te (m)
         }
 
     #: ``bl`` dict keys, in boundary_status order (the ``side`` output coord).
@@ -516,8 +677,9 @@ class siim:
         one per ``fixed_value`` side (unspecified sides default to
         ``constants.BL``), ``None`` for the others. Only ``fixed_value`` sides
         are base-level outlets, so a datum on any other side is a contradiction
-        rather than a no-op and raises."""
-        bs = list(np.broadcast_to(boundary_status, 4))
+        rather than a no-op and raises. ``boundary_status`` is the checked
+        4-list (``_check_boundary_status``, which also guarantees an outlet)."""
+        bs = boundary_status
         unknown = sorted(set(bl) - set(self._BL_SIDES))
         if unknown:
             raise ValueError(
@@ -530,10 +692,6 @@ class siim:
                     f"bl[{side!r}] given but that side's boundary_status is "
                     f"{status!r}: only 'fixed_value' sides are base-level "
                     "outlets and carry a water datum.")
-        if 'fixed_value' not in bs:
-            raise ValueError(
-                "per-side bl given but no boundary_status side is "
-                "'fixed_value': there is no base-level outlet to place it on.")
         sides = []
         for k, side in enumerate(self._BL_SIDES):
             if bs[k] != 'fixed_value':
@@ -557,11 +715,77 @@ class siim:
     def set_and_check_parameters(self, user_params):
         defaults = self._default_params()
 
+        removed = sorted(set(user_params) & set(_REMOVED_PARAMS))
+        if removed:
+            raise ValueError("; ".join(f"{k} was removed: {_REMOVED_PARAMS[k]}"
+                                       for k in removed) + ".")
         unexpected = set(user_params) - set(defaults)
         if unexpected:
             raise ValueError(f"Unexpected parameter(s): {sorted(unexpected)}")
 
         params = SimpleNamespace(**{**defaults, **user_params})
+        params.boundary_status = _check_boundary_status(params.boundary_status)
+
+        # Mode D (constants.MODE_D_*): mode C with the channel/sheet reading choosing
+        # valley or sheet rules per cell. Its defaults go into params HERE,
+        # before any knob below is bound, for every key the user left unset
+        # (None counts as unset: the sentinels' own default); explicit values win.
+        self.regime_switch = _constants.normalize_mode(params.mode) == 'D'
+        if self.regime_switch:
+            for key, value in (
+                    ('width_hack_k', _constants.MODE_D_WIDTH_HACK_K),
+                    ('routing_filter_factor', _constants.MODE_D_ROUTING_FILTER_FACTOR),
+                    ('flow_routing', _constants.MODE_D_FLOW_ROUTING),
+                    ('trunk_surface', _constants.MODE_D_TRUNK_SURFACE),
+                    ('channel_bed_bar', _constants.REGIME_BED_BAR)):
+                if user_params.get(key) is None:
+                    setattr(params, key, value)
+        # Under MFD routing (mode D's default) an unset parallel_erode is on
+        # only where the layer's fork/join is cheap.
+        if (user_params.get('parallel_erode') is None
+                and _constants.normalize_flow_routing(params.flow_routing) == 'mfd'):
+            params.parallel_erode = (_threads.threading_layer()
+                                     in _constants.MFD_PARALLEL_ERODE_LAYERS)
+        # Damping (constants.INNER_DAMPINGS). Modes B/C/D default to
+        # constants.MODE_BCD_INNER_DAMPING, but an explicit inner_relax picks
+        # 'omega' (so inner_relax=1, inner_passes=1 is the undamped model).
+        # 'omega' fills each unset dial with the mode's (B/C:
+        # constants.MODE_BC_*; D: MODE_D_INNER_RELAX over one pass); an
+        # adaptive preset carries its floor in inner_relax, which is then not a
+        # dial (an explicit value equal to the floor, a round-trip, is
+        # accepted). Mode A has nothing to damp (the plain defaults).
+        # lazy: the floor in inner_relax keeps every "the commit can differ from
+        # F" gate (inner_relax < 1: the closure-thickness row, the ice_speed
+        # and diffusion warnings, the xsimlab refusal) working unchanged, but
+        # only while every preset's floor is < 1; upgrade path: one `blends`
+        # predicate (damping != 'omega' or inner_relax < 1) at those sites.
+        damped_mode = _constants.normalize_mode(params.mode) in ('B', 'C', 'D')
+        relax_set = user_params.get('inner_relax') is not None
+        damping = params.inner_damping
+        if damping is None:
+            damping = (_constants.MODE_BCD_INNER_DAMPING
+                       if damped_mode and not relax_set else _constants.INNER_DAMPING)
+        if damping not in _constants.INNER_DAMPINGS:
+            raise ValueError(f"inner_damping must be one of "
+                             f"{_constants.INNER_DAMPINGS}, got {damping!r}.")
+        if damping in _constants.INNER_DAMPING_FLOORS:
+            if not damped_mode:
+                raise ValueError(f"inner_damping={damping!r} requires mode "
+                                 f"'B', 'C' or 'D', got mode={params.mode!r}.")
+            floor = _constants.INNER_DAMPING_FLOORS[damping]
+            if relax_set and float(user_params['inner_relax']) != floor:
+                raise ValueError(
+                    f"inner_relax is the 'omega' preset's dial; "
+                    f"inner_damping={damping!r} sets its own floor ({floor:.3g}).")
+            params.inner_relax = floor
+        elif damped_mode:
+            omega_dials = ((_constants.MODE_D_INNER_RELAX, _constants.INNER_PASSES)
+                           if self.regime_switch else
+                           (_constants.MODE_BC_INNER_RELAX, _constants.MODE_BC_INNER_PASSES))
+            for key, value in zip(('inner_relax', 'inner_passes'), omega_dials):
+                if user_params.get(key) is None:
+                    setattr(params, key, value)
+        self.inner_damping = damping
 
         # initial_topography from ndarray, DataFrame, or CSV file path. When
         # loaded from a file/DataFrame, the derived (nx, ny, Lx, Ly) override
@@ -583,12 +807,26 @@ class siim:
         self.grid_ny = params.ny
         self.Lx = params.Lx
         self.Ly = params.Ly
+        # one node divided by zero in dx; three is the least a looped axis can
+        # wrap (the hillslope's cyclic solve) and leaves a fixed axis an
+        # interior node (audit #40)
+        if not (self.grid_nx >= 3 and self.grid_ny >= 3):
+            raise ValueError(f"nx and ny must be >= 3, got nx={self.grid_nx}, ny={self.grid_ny}")
+        _check_range('Lx', self.Lx, 0.0)
+        _check_range('Ly', self.Ly, 0.0)
 
         # time
         self.to = params.to
         self.T = params.T
         self.nt = params.nt
         self.nt_out = params.nt_out
+        # The clock needs one step at least and must run forward (audit #3, #4,
+        # #40): nt = 1 ran zero steps and died in run() on a KeyError, T == to
+        # made every erosion rate 0/0, and T < to integrated on a negative dt.
+        if not self.nt >= 2:
+            raise ValueError(f"nt must be >= 2 (one step at least), got nt={self.nt}")
+        if not (np.isfinite(self.to) and np.isfinite(self.T) and self.T > self.to):
+            raise ValueError(f"T must be finite and later than to, got to={self.to}, T={self.T}")
         # nt_out > nt is a degenerate output cadence: out_idx would carry
         # duplicate master steps, which xsimlab silently left as NaN frames
         # (and the in-house driver would fill with duplicated data) — reject it
@@ -652,8 +890,7 @@ class siim:
         self.flotation_gate = bool(params.flotation_gate)
         # Flotation-ramp width gamma (0 = hard binary gate, bit-for-bit).
         self.flotation_ramp = float(params.flotation_ramp)
-        if self.flotation_ramp < 0.0:
-            raise ValueError("flotation_ramp (gamma) must be >= 0.")
+        _check_range('flotation_ramp (gamma)', self.flotation_ramp, 0.0, inclusive=True)
         # Mode-B parallel-eroder toggle (bit-for-bit; default constants.PARALLEL_ERODE).
         self.parallel_erode = bool(params.parallel_erode)
         self._analytical_bl_note = None
@@ -673,6 +910,7 @@ class siim:
                 "offset by ~bl.")
 
         self.beta = params.beta
+        _check_range('beta', self.beta, 0.0)   # every zELA/zT conversion divides by it (audit #41)
         if params.zELA is None and params.zT is None:
             self.zELA = _constants.ZELA
         elif params.zELA is None and params.zT is not None:
@@ -680,24 +918,54 @@ class siim:
         else:
             self.zELA = params.zELA
 
-        # zELA can be scalar or array of length nt (time-varying)
+        # zELA: scalar, (nt,) series, (ny, nx) field or (nt, ny, nx) field series.
+        # A series goes on the 'tstep' clock (_zELA_series), a static field to
+        # the mass balance as is (_zELA_field). The scalar self.zELA is the
+        # analytical / zT reference: a series' minimum (most glaciated), a
+        # field's spatial mean (the minimum over time of it for a field series;
+        # the zT + P-series path below keeps its time mean).
         self._zELA_series = None
+        self._zELA_field = None
+        grid = (self.grid_ny, self.grid_nx)
         if not np.isscalar(self.zELA):
-            zELA_arr = np.asarray(self.zELA)
-            if zELA_arr.ndim == 1 and len(zELA_arr) == self.nt:
+            zELA_arr = np.asarray(self.zELA, dtype=float)     # the constructor's deep copy, never the caller's array
+            if not np.isfinite(zELA_arr).all():
+                raise ValueError("zELA must be finite everywhere (a field or series with NaN/inf would "
+                                 "carry NaN into the mass balance and the analytical reference)")
+            if zELA_arr.shape == (self.nt,):
                 self._zELA_series = zELA_arr
                 self.zELA = np.min(zELA_arr)  # scalar for analytical solution
+            elif zELA_arr.shape == grid:
+                self._zELA_field = zELA_arr
+                self.zELA = float(zELA_arr.mean())
+            elif zELA_arr.shape == (self.nt, *grid):
+                self._zELA_series = zELA_arr
+                self.zELA = float(zELA_arr.mean(axis=(1, 2)).min())
             else:
                 raise ValueError(
-                    f"zELA array must have length nt={self.nt}, got {len(zELA_arr)}"
-                )
+                    f"zELA must be a scalar, (nt,) = ({self.nt},), (ny, nx) = "
+                    f"{grid}, or (nt, ny, nx) = {(self.nt, *grid)}; got shape "
+                    f"{zELA_arr.shape}")
         # zT given + P-series ⇒ time-varying zELA on the clock: zELA_run(t) =
         # zT − P(t)/β (paper semantics; the scalar self.zELA keeps the time-MEAN
-        # for the analytical reference). Only this zT-input path changes; the
-        # zELA-input path stays bit-for-bit. (audit F2)
-        if (self._zELA_series is None and self._P_series is not None
+        # for the analytical reference), per cell for an (ny, nx) zT. Only this
+        # zT-input path changes; the zELA-input path stays bit-for-bit. (audit F2)
+        # A zT series pairs with the P series step by step too (it used the P's
+        # time mean, a constant zELA; audit #34).
+        if (self._P_series is not None
                 and params.zELA is None and params.zT is not None):
-            self._zELA_series = params.zT - self._P_series / self.beta
+            zT_shape = np.shape(params.zT)
+            if zT_shape not in ((), grid, (self.nt,), (self.nt, *grid)):
+                raise ValueError(f"zT must be a scalar, an (ny, nx) = {grid} field or an (nt,) / "
+                                 f"(nt, ny, nx) series, got shape {zT_shape}")
+            timed = zT_shape[:1] == (self.nt,) and len(zT_shape) in (1, 3)
+            # lazy: a field zT materialises the (nt, ny, nx) series (~200 MB at nt 2501 on 100^2);
+            # upgrade path: keep zT and P apart and form zT - P[k]/beta per step in the driver.
+            P_t = self._P_series.reshape((-1,) + (1,) * (len(zT_shape) - timed))
+            self._zELA_series = params.zT - P_t / self.beta
+            self._zELA_field = None
+            if timed:   # the series rule for the analytical scalar: its most glaciated step
+                self.zELA = float(self._zELA_series.reshape(self.nt, -1).mean(axis=1).min())
         self.zT = self.zELA + self.P / self.beta
 
         # uplift — scalar, (nt,), (ny, nx), or (nt, ny, nx) array.
@@ -749,14 +1017,25 @@ class siim:
         self.sliding_law = params.sliding_law
         self.ce = params.ce
         self.tau_c = params.tau_c
+        # 0 divided by zero at construction and < 0 ran silently (audit #8)
+        _check_range('lambda_p', self.lambda_p, 0.0)
+        _check_range('lambda_c', self.lambda_c, 0.0)
+        _check_range('tau_c', self.tau_c, 0.0)
         self.width_hack_k = float(params.width_hack_k)
         self.width_hack_p = float(params.width_hack_p)
-        if params.flow_routing not in ('single', 'dinf'):
+        self.flow_routing = _constants.normalize_flow_routing(params.flow_routing)
+        # MFD spreading exponent (inert under 'single' / 'dinf'; validated
+        # always, so a typo is loud rather than silently ignored). Mode D runs
+        # on MFD alone, checked first so the refusal never follows the
+        # resolver's warning, and refuses an exponent that resolves to inf
+        # (single flow by another name).
+        if self.regime_switch and self.flow_routing != 'mfd':
             raise ValueError(
-                f"flow_routing must be 'single' or 'dinf', "
-                f"got {params.flow_routing!r}"
-            )
-        self.flow_routing = params.flow_routing
+                "mode='D' requires flow_routing='mfd': the channel/sheet reading grows "
+                "false channels along single-flow and D-inf flux trees. Got "
+                f"flow_routing={params.flow_routing!r}.")
+        self.mfd_exponent = _constants.resolve_mfd_exponent(params.mfd_exponent,
+                                                            finite=self.regime_switch)
         if params.router_backend != 'inhouse_d8':
             raise ValueError(
                 f"router_backend must be 'inhouse_d8' (the retired 'fortran' "
@@ -778,11 +1057,13 @@ class siim:
         # Mode 'C' is the user-facing alias for the mode-B + sub-grid-carve
         # configuration (selected by class: GlacialSPLModeC) — not a new
         # dynamical mode. Resolve it to internal 'B' with carving implied on;
-        # an explicit carve_width=False contradicts the name (be loud).
-        if self.mode == 'C':
+        # an explicit carve_width=False contradicts the name (be loud). Mode
+        # 'D' resolves the same way (its own defaults were written above).
+        if self.mode in ('C', 'D'):
             if user_params.get('carve_width') is False:
                 raise ValueError(
-                    "mode='C' is the mode-B + sub-grid-carve alias; "
+                    f"mode={self.mode!r} carves (mode B + sub-grid carve"
+                    f"{' + the channel/sheet reading' if self.mode == 'D' else ''}); "
                     "carve_width=False contradicts it (use mode='B' for plain "
                     "bed memory without carving).")
             params.carve_width = True
@@ -793,8 +1074,7 @@ class siim:
             self.H_diffusivity = None
         else:
             D_H = float(params.H_diffusivity)
-            if D_H < 0:
-                raise ValueError("H_diffusivity must be >= 0 or None.")
+            _check_range('H_diffusivity', D_H, 0.0, inclusive=True)
             self.H_diffusivity = D_H
         # raw; resolved per-cell/per-step by _make_border_bed_uplift()
         self.border_bed_uplift = params.border_bed_uplift
@@ -817,44 +1097,114 @@ class siim:
         self.widening_factor = _constants.widening_factor_from_rate(self.widening_rate)
         # --- Mode-C standard defaults -------------------------------------------
         # Mode C (mode B + sub-grid carve — the flagship carved mode) resolves its
-        # unset trunk_surface / routing_relax sentinels (None) to the mode-C
-        # standard (constants.mode_c_standard, shared with the fastscape
-        # facade); plain mode B (no carve) and mode A keep them OFF. An EXPLICIT
+        # unset trunk_surface sentinel (None) to the mode-C standard
+        # (constants.mode_c_standard, shared with the fastscape facade); plain
+        # mode B (no carve) and mode A keep it OFF. An EXPLICIT
         # user value (not None) always wins. widening_rate has no sentinel — its
         # constants default (3.0) is the mode-C standard and is a no-op wherever
         # carve is off. Resolved here, after carve_width is finalized (line above).
-        _trunk_std, _relax_std = _constants.mode_c_standard(
-            self.mode == 'B' and self.carve_width)
         if params.trunk_surface is None:
-            params.trunk_surface = _trunk_std
-        if params.routing_relax is None:
-            params.routing_relax = _relax_std
-        # Fabricated trunk-surface routing (mode B/C only). Routes + accumulates
-        # on a fabricated ice surface so trunk flow converges to the centerline
+            params.trunk_surface = _constants.mode_c_standard(
+                self.mode == 'B' and self.carve_width)
+        # Fabricated trunk-surface routing (mode B/C only). Routes on a
+        # fabricated ice surface so trunk flow converges to the centerline
         # (raw flux there = full cross-section).
         self.trunk_surface = bool(params.trunk_surface)
-        self.trunk_dip_k = float(params.trunk_dip_k)
+        self.trunk_dip_k = _resolve_trunk_dip_k(params.trunk_dip_k,
+                                                self.flow_routing)
         if self.trunk_surface and self.mode != 'B':
             raise ValueError("trunk_surface=True requires mode='B' "
                              "(mode A reconstructs the bed; no trunk to converge).")
-        # Routing-surface EMA relaxation (mode B/C anti-flicker; 0 = off). Composes
-        # freely with trunk_surface / carve and both routings.
-        self.routing_relax = float(params.routing_relax)
-        if not (0.0 <= self.routing_relax < 1.0):
-            raise ValueError("routing_relax must be in [0, 1), got "
-                             f"{params.routing_relax!r}.")
-        if self.routing_relax > 0.0 and self.mode != 'B':
-            raise ValueError("routing_relax > 0 requires mode 'B' or 'C' "
-                             "(mode 'A' has no glacial surf2erode provider to relax).")
+        # Within-step damped iteration (mode B/C). Validated AFTER the mode
+        # resolution above; single-sourced in _core.router so the fastscape
+        # facade raises the same errors.
+        self.inner_passes, self.inner_relax = _check_inner_loop_config(
+            params.inner_passes, params.inner_relax, mode=self.mode)
+        if self.inner_relax < 1.0 and self.H_diffusivity:
+            warnings.warn(
+                "inner_relax < 1 damping attenuates the diffusion correction: "
+                "H diffusion runs on the final pass only and the committed "
+                "state blends the diffused closure with the undiffused "
+                f"iterate (inner_damping={self.inner_damping!r}, "
+                f"inner_relax={self.inner_relax:.3g}, "
+                f"H_diffusivity={self.H_diffusivity}).", stacklevel=2)
+        # Routing-surface spatial filter (mode B/C), validated the same way.
+        # Grid spacing (shared with the MFD guards below) is resolved as
+        # _build_driver_config does.
+        dx, dy = self.Lx / (self.grid_nx - 1), self.Ly / (self.grid_ny - 1)
+        if params.channel_bed_bar is not None and not self.regime_switch:
+            raise ValueError("channel_bed_bar is mode D's channel/sheet dial; "
+                             f"it requires mode='D', got mode={params.mode!r}.")
+        self.channel_bed_bar = params.channel_bed_bar   # mode D's default is set above
+        if self.regime_switch:
+            bar = self.channel_bed_bar
+            # a real number, not a bool; the chained comparison is exact for any
+            # int and fails for NaN and inf. The bound is Python's float: numpy 2
+            # raises OverflowError comparing a huge int with np.finfo(float).max
+            if not (isinstance(bar, numbers.Real) and not isinstance(bar, bool)
+                    and 0.0 <= bar <= sys.float_info.max):
+                raise ValueError("channel_bed_bar must be a finite number >= 0 (0 = no bar), "
+                                 f"got {params.channel_bed_bar!r}.")
+            self.channel_bed_bar = float(bar)
+            # square cells, a finite carve widening factor, and rays that do
+            # not wrap onto themselves (constants.REGIME_DX_WARN: the reading
+            # was measured at 1 km - 250 m)
+            bs = params.boundary_status
+            _check_regime_grid(
+                self.grid_ny, self.grid_nx, dx,
+                wrap_y=bs[2] == 'looped', wrap_x=bs[0] == 'looped', dy=dy,
+                widening_factor=self.widening_factor if self.carve_width else None)
+            if dx > _constants.REGIME_DX_WARN:
+                warnings.warn(
+                    f"mode='D' at {dx / 1e3:g} km cells: the channel/sheet reading "
+                    "needs the glacier's width resolved and was measured at "
+                    f"1 km - 250 m; on grids coarser than "
+                    f"{_constants.REGIME_DX_WARN / 1e3:g} km most outlets are sub-grid.",
+                    stacklevel=2)
+        self.routing_filter_factor = _check_routing_filter_config(
+            params.routing_filter_factor, mode=self.mode,
+            trunk_surface=self.trunk_surface, dx=dx, dy=dy,
+            regime_switch=self.regime_switch)
+        # closure_flux (EXPERIMENTAL): 'cell' | 'transect' | 'transect_min'; the
+        # None sentinel resolves per mode (transect_min for B/C, cell for A).
+        if params.closure_flux is None:
+            params.closure_flux = _constants.CLOSURE_FLUX if self.mode == 'B' else _constants.MODE_A_CLOSURE_FLUX
+        self.closure_flux = str(params.closure_flux)
+        if self.closure_flux not in _constants.CLOSURE_FLUXES:
+            raise ValueError("closure_flux must be 'cell', 'transect' or "
+                             f"'transect_min', got {params.closure_flux!r}.")
+        if self.closure_flux != 'cell' and self.mode != 'B':
+            raise ValueError("closure_flux != 'cell' requires mode 'B' or 'C' "
+                             "(the transect closure is a mode-B kernel input).")
+        # gamma effective-slope normalisation. A multi-receiver reduction
+        # returns the gradient PROJECTED on the weighted receiver vector, so any
+        # spreading router needs the 1/gamma correction to feed |grad zs| to the
+        # closure and the eroders. Default (None) = router-derived from
+        # _core.router.SLOPE_NORMALISED_ROUTERS ('dinf' and 'mfd' on, 'single'
+        # off); an explicit value wins, which is how the pre-2026-09-05 D-inf
+        # behaviour stays reachable (slope_normalise=False).
+        if params.slope_normalise is None:
+            self.slope_normalise = self.flow_routing in _SLOPE_NORMALISED_ROUTERS
+        else:
+            self.slope_normalise = bool(params.slope_normalise)
+        # MFD coherence guards. Single-sourced in
+        # _core.router so siim2d, the fastscape facade and the adapter processes
+        # raise the same errors.
+        _check_mfd_config(
+            self.flow_routing, mode=self.mode, closure_flux=self.closure_flux,
+            dx=dx, dy=dy, slope_normalise=self.slope_normalise)
         # Citizen Mode B: the bed is tracked AS topography (topography__elevation
         # = zb), routing on the reconstructed ice surface (GlacialSurfaceToErode),
         # erosion = denudation. Both mode-B paths are citizens now — no carve
         # (GlacialSPLModeB) and carve (GlacialSPLModeC) alike — so bed-as-topography
         # holds whenever mode == 'B'.
         self._citizen_mode_b = (self.mode == 'B')
-        # hc_over_H lives on the model so the output reconstruction (zb<->zs) and
-        # the plotters read the run's value rather than the import-bound constant.
-        self.hc_over_H = float(_constants.HC_OVER_H)
+        # hc_over_H: the run's channel-floor datum (per mode: docs/guides/parameter_reference.md).
+        self.hc_over_H = (float(_constants.HC_OVER_H) if params.hc_over_H is None
+                          else float(params.hc_over_H))
+        if not (np.isfinite(self.hc_over_H) and self.hc_over_H > 0.0):
+            raise ValueError("hc_over_H must be finite and > 0, got "
+                             f"{params.hc_over_H!r}.")
 
         # Physical constants needed for the per-law dispatch
         self.kt = KT
@@ -873,6 +1223,9 @@ class siim:
                 "Both 'nu' and 'ell' were provided; 'ell' takes precedence and "
                 "'nu' is ignored (re-derived from ell by the sliding-law relations).",
                 UserWarning, stacklevel=2)
+        # the exponent the law is derived from; nu and ell share its sign (audit #8)
+        exponent = 'ell' if params.ell is not None else 'nu'
+        _check_range(exponent, getattr(params, exponent), 0.0)
         if self.sliding_law == 'coulomb':
             c = derive_coulomb(self.ce, self.alpha_g, self.tau_c,
                                self.rho_g, self.g,
@@ -897,7 +1250,8 @@ class siim:
 
         # hillslope + run config
         self.D = params.D
-        self.boundary_status = params.boundary_status
+        _check_range('D', self.D, 0.0, inclusive=True)   # < 0 anti-diffused, NaN spread (audit #29, #38)
+        self.boundary_status = params.boundary_status   # checked 4-list (_check_boundary_status)
         self.initial_max_elevation = params.initial_max_elevation
         self.noise_amplitude = params.noise_amplitude
         self.seed = params.seed
@@ -917,17 +1271,34 @@ class siim:
                 "track_sediment must be False, True, 'basin', 'edge' or "
                 f"'both', got {params.track_sediment!r}")
         self.track_sediment = track
+        if not isinstance(params.save_closure_pair, (bool, np.bool_)):
+            raise ValueError("save_closure_pair must be True or False, got "
+                             f"{params.save_closure_pair!r}")
+        self.save_closure_pair = bool(params.save_closure_pair)
         self.sediment_basin = track in ('basin', 'both')
         self.sediment_edge = track in ('edge', 'both')
         self.lithos_density = params.lithos_density
         self.asthen_density = params.asthen_density
         self.e_thickness = params.e_thickness
+        if self.flexure:
+            # rho_a = Te = 0 divided by zero in the plate transfer (audit #29);
+            # Te = 0 alone is Airy isostasy. The plate takes scalar Te and rho_a.
+            _check_range('lithos_density', self.lithos_density, 0.0)
+            _check_range('asthen_density', self.asthen_density, 0.0)
+            _check_range('e_thickness', self.e_thickness, 0.0, inclusive=True)
+            if np.ndim(self.asthen_density) or np.ndim(self.e_thickness):
+                raise ValueError("asthen_density and e_thickness must be scalars "
+                                 "(only lithos_density may be an (ny, nx) field)")
 
         self.coulomb_clamp = params.coulomb_clamp
+        # >= 1 zeroed the ice everywhere; < 0 let phi pass the yield pole (audit #8)
+        _check_range('coulomb_clamp', self.coulomb_clamp, 0.0, hi=1.0)
 
     @property
     def run_id(self):
-        ela = self._zELA_series[-1] if self._zELA_series is not None else self.zELA
+        # the last step's ELA (its spatial mean for a field series)
+        ela = (np.mean(self._zELA_series[-1]) if self._zELA_series is not None
+               else self.zELA)
         return f"Ko{self.Ko:.0e}_ce{self.ce:.0e}_n{self.n:g}_nu{self.nu:g}_ELA{ela:g}"
 
     def _set_analytical_grid(self, L, xo, k_h, d):
@@ -940,15 +1311,16 @@ class siim:
         new_user = {**self._user_params, "xo": xo, "k_h": k_h, "d": d}
         new_params = self._analytical_user_params(new_user)
         new_params["L"] = L  # use the fitted channel length, not Lx
-        self.analytical = analytical_steady_state_solution(new_params)
-        self.x = self.analytical.x
+        self.analytical = self._build_analytical(new_params)
+        self.x = None if self.analytical is None else self.analytical.x
 
     def _make_initial_topo(self):
         """Build initial topography that slopes toward fixed_value boundaries.
 
         Returns a (ny, nx) array with elevation 0 at fixed_value sides and
-        1000 m at the farthest interior point.  If no sides are 'core',
-        the surface slopes from the centre toward all fixed_value edges.
+        ``initial_max_elevation`` at the farthest interior point.  If no
+        sides are 'core', the surface slopes from the centre toward all
+        fixed_value edges.
         """
         ny, nx = self.grid_ny, self.grid_nx
 
@@ -958,20 +1330,13 @@ class siim:
         if self.initial_max_elevation == 0:
             return np.zeros((ny, nx))
 
-        # Normalize a scalar status (fastscape broadcasts a scalar to all four
-        # borders; enumerating a bare 'fixed_value' string iterated characters,
-        # found no fixed side, and produced a flat surface with borders locked
-        # high — audit m24). Now a scalar behaves like the equivalent 4-list.
-        bs = list(np.broadcast_to(self.boundary_status, 4))  # [left, right, bottom, top]
+        bs = self.boundary_status  # [left, right, bottom, top], normalised in __init__
 
         x = np.linspace(0, 1, nx)
         y = np.linspace(0, 1, ny)
         X, Y = np.meshgrid(x, y)
 
-        fixed_sides = [i for i, s in enumerate(bs) if s == 'fixed_value']
-
-        if len(fixed_sides) == 0:
-            return np.ones((ny, nx)) * self.initial_max_elevation
+        fixed_sides = [i for i, s in enumerate(bs) if s == 'fixed_value']   # >= 1 (checked)
 
         distances = []
         for side in fixed_sides:
@@ -1046,7 +1411,7 @@ class siim:
         # mode A -> GlacialSPLModeA; mode B + carve -> GlacialSPLModeC citizen;
         # mode B + no-carve -> GlacialSPLModeB citizen (both add GlacialSurfaceToErode).
         return glacial_processes(
-            mode=self.mode,
+            mode='D' if self.regime_switch else self.mode,   # D is refused by name
             carve=self.carve_width,
             routing=self.flow_routing,
             router_backend=self.router_backend,
@@ -1055,6 +1420,12 @@ class siim:
             sediment=self.sediment_basin or self.sediment_edge,
             trunk_surface=self.trunk_surface,
             numerics_backend=self.numerics_backend,
+            # Forwarded so the adapter path REFUSES the standalone-only sheet
+            # knobs instead of silently dropping them (the xsimlab process graph
+            # has neither a second-routing seam nor a filtered-surface seam).
+            inner_passes=self.inner_passes,
+            inner_relax=self.inner_relax,
+            routing_filter_factor=self.routing_filter_factor,
         )
 
     def _forcing_input_vars(self):
@@ -1101,6 +1472,11 @@ class siim:
                 "per-side bl (a dict) is in-house-driver only: the xsimlab "
                 "adapter's glacial_spl__bl is a single scalar per step. Run "
                 "with driver='inhouse' (the default).")
+        if self._zELA_series is not None and self._zELA_series.ndim == 3:
+            raise NotImplementedError(
+                "an (nt, ny, nx) zELA series is in-house-driver only: the "
+                "xsimlab adapter takes a scalar, an (nt,) series or a static "
+                "(ny, nx) field. Run with driver='inhouse' (the default).")
         import xsimlab as xs
         from fastscape.models import basic_model
         # Drop the stock spl/drainage slots; the renamed glacial_spl / glacial_flow
@@ -1124,7 +1500,7 @@ class siim:
             'glacial_flow__beta': self.beta,
             'glacial_flow__zELA': (
                 ('tstep',), self._zELA_series
-            ) if self._zELA_series is not None else self.zELA,
+            ) if self._zELA_series is not None else self._zELA_static,
             # Law params (raw inputs + constant algebra) now live on GlacialLaw.
             'law__n': self.n,
             'law__nu': self.nu,
@@ -1144,13 +1520,17 @@ class siim:
             # monkeypatch-before-setup override convention), single-sourced here
             # + reused by the output reconstruction and the plotters.
             'law__hc_over_H': self.hc_over_H,
-            # alpha_g is single-sourced on GlacialLaw (law__alpha_g above);
-            # GlacialFlowAccumulator reads it by foreign — no glacial_flow__alpha_g.
+            # alpha_g is single-sourced on GlacialLaw (law__alpha_g above):
+            # there is no glacial_flow__alpha_g.
             'glacial_flow__width_hack_k': self.width_hack_k,
             'glacial_flow__width_hack_p': self.width_hack_p,
             'glacial_spl__border_bed_uplift': self._make_border_bed_uplift(),
             'glacial_spl__carve_width': self.carve_width,
+            'glacial_spl__closure_flux': self.closure_flux,
+            'glacial_spl__slope_normalise': self.slope_normalise,
             'glacial_spl__widening_rate': self.widening_rate,
+            **({'flow__mfd_exponent': self.mfd_exponent}
+               if self.flow_routing == 'mfd' else {}),
             # Base level: scalar, or a length-nt series on the 'tstep' clock
             # (per-step waterline datum, like glacial_flow__zELA above).
             'glacial_spl__bl': (
@@ -1163,10 +1543,6 @@ class siim:
             'glacial_spl__ice_thickness': np.zeros((self.grid_ny, self.grid_nx)),
         }
         input_vars.update(self._forcing_input_vars())
-        if self._citizen_mode_b:
-            # The mode-B/C surf2erode provider (GlacialSurfaceToErode, or its
-            # TrunkSurfaceToErode subclass) owns the routing-surface EMA knob.
-            input_vars['surf2erode__routing_relax'] = self.routing_relax
         if self.trunk_surface:
             # The trunk-surface provider (surf2erode slot) owns the dip knob.
             input_vars['surf2erode__trunk_dip_k'] = self.trunk_dip_k
@@ -1197,7 +1573,10 @@ class siim:
                 name: 'time'
                 for name, _dtype, _dims in _outputs.output_spec(
                     self.mode, self.flexure, self.sediment_basin,
-                    self.sediment_edge)
+                    self.sediment_edge, regime_switch=self.regime_switch,
+                    closure_flux=self.closure_flux,
+                    inner_relax=self.inner_relax,
+                    save_closure_pair=self.save_closure_pair)
             }
 
             ds_in = xs.create_setup(
@@ -1240,12 +1619,16 @@ class siim:
         from ._core.router import InhouseRouter
         router = InhouseRouter([self.grid_ny, self.grid_nx],
                                self.boundary_status, self.flow_routing,
-                               cfg.dx, cfg.dy)
+                               cfg.dx, cfg.dy, self.mfd_exponent)
         with router as route:
             cfg.route = route
             buffers = _driver.run_loop(cfg)
         spec = _outputs.output_spec(self.mode, self.flexure, self.sediment_basin,
-                                    self.sediment_edge)
+                                    self.sediment_edge,
+                                    regime_switch=self.regime_switch,
+                                    closure_flux=self.closure_flux,
+                                    inner_relax=self.inner_relax,
+                                    save_closure_pair=self.save_closure_pair)
         self.ds_out = _outputs.build_dataset(buffers, spec, cfg.t_out, cfg.x,
                                              cfg.y, self.t)
 
@@ -1271,6 +1654,17 @@ class siim:
             return lambda k, dt: block_uplift(rate_arr[k], dt, mask, shape)
         return lambda k, dt: block_uplift(spec, dt, mask, shape)
 
+    def _driver_bbu_fn(self):
+        """A per-step ``bbu_fn(k, dt) -> (ny, nx)`` border-bed uplift for the in-house
+        driver, or None for the static / clock-sliced ``_make_border_bed_uplift``
+        (the base). The escarpment wave overrides it so the border follows the wave."""
+        return None
+
+    @property
+    def _zELA_static(self):
+        """The run's static zELA: the (ny, nx) field when one was given, else the scalar."""
+        return self.zELA if self._zELA_field is None else self._zELA_field
+
     def _build_driver_config(self):
         """Assemble the resolved-parameter bundle the in-house driver reads
         (:func:`siim._core.driver.run_loop`). Every value flows from the
@@ -1280,7 +1674,7 @@ class siim:
         dx = self.Lx / (nx - 1)
         dy = self.Ly / (ny - 1)
         ibc = _ibc_from_border_status(self.boundary_status)
-        bs = list(np.broadcast_to(self.boundary_status, 4))
+        bs = self.boundary_status
         out_idx = np.round(np.linspace(0, self.nt - 1, self.nt_out)).astype(int)
         law_code, gp = build_glacial_params(
             sliding_law=self.sliding_law, Ko=self.Ko, ce=self.ce,
@@ -1291,6 +1685,9 @@ class siim:
             H_diffusivity=self.H_diffusivity)
         # border_bed_uplift: static (scalar/(ny,nx)) or a clock series (nt,ny,nx).
         bbu_spec = self._make_border_bed_uplift()
+        if bbu_spec is None and self._driver_bbu_fn() is None:
+            raise RuntimeError("border_bed_uplift resolved to None without a per-step "
+                               "_driver_bbu_fn: a subclass must override both")
         if isinstance(bbu_spec, tuple):
             bbu_static, bbu_series = None, np.asarray(bbu_spec[1], dtype=float)
         else:
@@ -1310,6 +1707,7 @@ class siim:
             mode=self.mode, carve=self.carve_width,
             trunk_surface=self.trunk_surface, flexure=self.flexure,
             sediment=self.sediment_basin, sediment_edge=self.sediment_edge,
+            save_closure_pair=self.save_closure_pair,
             # law record
             law_code=law_code, gp=gp, hc_over_H=float(gp.hc_over_H),
             alpha_g=float(gp.alpha_g), widening_factor=self.widening_factor,
@@ -1317,7 +1715,16 @@ class siim:
             beta=self.beta, width_hack_k=self.width_hack_k,
             width_hack_p=self.width_hack_p, D=self.D,
             flotation_gate=self.flotation_gate, flotation_ramp=self.flotation_ramp,
-            parallel_erode=self.parallel_erode, routing_relax=self.routing_relax,
+            parallel_erode=self.parallel_erode,
+            inner_passes=self.inner_passes, inner_relax=self.inner_relax,
+            inner_damping=self.inner_damping,
+            routing_filter_factor=self.routing_filter_factor,
+            # mode D's valley <-> sheet devices: s from the channel/sheet reading
+            regime_switch=self.regime_switch,
+            hc_sheet=_constants.HC_SHEET,
+            channel_bed_bar=self.channel_bed_bar,
+            closure_flux=self.closure_flux,
+            slope_normalise=self.slope_normalise,
             trunk_dip_k=self.trunk_dip_k,
             trunk_dip_floor=_constants.TRUNK_DIP_FLOOR,
             # flexure params
@@ -1325,12 +1732,13 @@ class siim:
             e_thickness=self.e_thickness, ice_load=self.ice_load,
             flexure_solve=flexure_solve,
             # forcing series / scalars
-            zELA_series=self._zELA_series, zELA=self.zELA,
+            zELA_series=self._zELA_series,
+            zELA=self._zELA_static,
             runoff_series=self._P_series, P=self.P,
             bl_series=self._bl_series, bl=self.bl, bl_sides=self._bl_sides,
             bbu_static=bbu_static, bbu_series=bbu_series,
             # injected seams
-            uplift_fn=self._driver_uplift_fn(),
+            uplift_fn=self._driver_uplift_fn(), bbu_fn=self._driver_bbu_fn(),
             initial_surface=self._driver_initial_surface(),
             route=None,   # set inside the InhouseRouter context in _run_inhouse
         )
@@ -1344,7 +1752,10 @@ class siim:
 
         - Citizen Mode B / C (GlacialSPLModeB, GlacialSPLModeC): topography__elevation
           IS the bed, so ``zb_out = topography__elevation`` and the ice surface is
-          the reconstruction ``z_out = zb_out + hc_over_H*H_out``. No flicker: zb
+          the reconstruction ``z_out = zb_out + hc_over_H*H_out`` — or, when the
+          run carries mode D's per-cell datum
+          (``hc_cell_out``, ``glacial_spl__hc_cell``), ``zb_out + hc_cell_out*H_out``:
+          the surface the model balanced on. No flicker: zb
           is a clean tracked state; only the derived display surface can jump.
         - Mode A: topography is the ice surface (``z_out``); the bed is the
           kernel-committed ``bedrock_surface``. (Runs saved under the retired
@@ -1354,6 +1765,13 @@ class siim:
         self.H_out = self.ds_out['glacial_spl__ice_thickness'].values  # (time, y, x)
         topo = self.ds_out['topography__elevation'].values             # (time, y, x)
         hc = float(self.hc_over_H)
+        # The per-cell datum (mode D); None = the scalar hc.
+        self.hc_cell_out = (self.ds_out['glacial_spl__hc_cell'].values
+                            if 'glacial_spl__hc_cell' in self.ds_out else None)
+        # Mode D's binary class (True = channel); None outside mode D and for
+        # mode-D runs saved before the class was stored.
+        self.channel_out = (self.ds_out['glacial_spl__channel'].values.astype(bool)
+                            if 'glacial_spl__channel' in self.ds_out else None)
         if 'glacial_spl__bedrock_surface' in self.ds_out:
             # Mode A (or a legacy surface-replace run): topography is the surface,
             # bed is stored. Prefer the kernel-committed bedrock_surface —
@@ -1363,9 +1781,11 @@ class siim:
             self.z_out = topo
             self.zb_out = self.ds_out['glacial_spl__bedrock_surface'].values
         elif self._citizen_mode_b:
-            # Citizen Mode B / C: topography IS the bed; reconstruct the ice surface.
+            # Citizen Mode B / C: topography IS the bed; reconstruct the ice
+            # surface on the datum the model balanced on (per cell in mode D).
             self.zb_out = topo
-            self.z_out = self.zb_out + hc * self.H_out
+            hc_field = hc if self.hc_cell_out is None else self.hc_cell_out
+            self.z_out = self.zb_out + hc_field * self.H_out
         else:
             # Fallback (runs saved before the bed was stored): derive the bed from
             # the surface under the CURRENT convention.
@@ -1378,10 +1798,21 @@ class siim:
         if self._zELA_series is not None:
             out_idx = np.round(np.linspace(0, self.nt - 1, len(self.output_times))).astype(int)
             self._zELA_output = self._zELA_series[out_idx]
+            if self._zELA_output.ndim == 3:        # a field series: its spatial mean
+                self._zELA_output = self._zELA_output.mean(axis=(1, 2))
         else:
             self._zELA_output = np.full(len(self.output_times), self.zELA)
 
         self.Qg_out = self.ds_out['glacial_flow__ice_flux'].values         # (time, y, x)
+        # The closure's own (flux, thickness), stored only where it differs
+        # from (Qg_out, H_out): a transect closure_flux / inner_relax < 1.
+        # None otherwise (and on runs saved before the rows existed).
+        self.closure_Qg_out = (self.ds_out['glacial_spl__closure_ice_flux'].values
+                               if 'glacial_spl__closure_ice_flux' in self.ds_out
+                               else None)
+        self.closure_H_out = (self.ds_out['glacial_spl__closure_ice_thickness'].values
+                              if 'glacial_spl__closure_ice_thickness' in self.ds_out
+                              else None)
         self.Qf_out = self.ds_out['glacial_flow__water_flux'].values       # (time, y, x)
         self.basin_out = self.ds_out['glacial_flow__basin_ids'].values     # (time, y, x)
         self.stack_out = self.ds_out['glacial_flow__stack_2d'].values          # (time, y, x)
@@ -1475,7 +1906,9 @@ class siim:
         if not path.is_file():
             candidate = Path(output_path(str(path), 'saved_models'))
             if not candidate.is_file() and not str(candidate).endswith('.pkl'):
-                candidate = candidate.with_suffix('.pkl')
+                # append, as save() does: with_suffix would turn 'sweep_nu1.5'
+                # into 'sweep_nu1.pkl', another run
+                candidate = candidate.with_name(candidate.name + '.pkl')
             path = candidate
         try:
             with open(path, 'rb') as f:
@@ -1486,7 +1919,24 @@ class siim:
                 f"Could not load SIIM saved model {path}: the pickle is invalid "
                 "or incompatible with this Python environment.") from exc
         _validate_saved_state(state, cls)
-        model = cls(state['_user_params'])
+        if state['siim_version'] != _SIIM_VERSION:
+            warnings.warn(
+                f"{path} was saved by siim {state['siim_version']} and is "
+                f"loaded by siim {_SIIM_VERSION}: its parameters are stored as "
+                "passed, so defaults such as the router-derived trunk_dip_k / "
+                "slope_normalise are re-resolved from this version's constants.",
+                RuntimeWarning, stacklevel=2)
+        params = dict(state['_user_params'])
+        # a falsy value was the knob's off setting: dropping it changes nothing
+        dropped = [k for k in _REMOVED_PARAMS if params.pop(k, None)]
+        if dropped:
+            warnings.warn(
+                f"{path} was run with {', '.join(dropped)}, which this version "
+                "removed: its stored outputs load unchanged, but the "
+                "reconstructed model (and any re-run) takes this version's "
+                "defaults in its place (modes B/C/D: inner_damping="
+                f"{_constants.MODE_BCD_INNER_DAMPING!r}).", RuntimeWarning, stacklevel=2)
+        model = cls(params)
         model.ds_out = state['ds_out']
         model._unpack_outputs()
         print(f"Loaded from {path}")
@@ -1532,6 +1982,40 @@ class siim:
             lengths[nan_mask] = 0.0
         return lengths.reshape(nt, ny, nx)
 
+    def ice_speed(self, i=-1):
+        """Ice surface speed and cross-section mean speed (m/yr) at output i.
+
+        Recomputed by :func:`siim._core.solvers.ice_speeds` from the flux and
+        thickness the kernel's closure solved at output i: ``closure_Qg_out``
+        / ``closure_H_out`` where the run stores them (``save_closure_pair=True``
+        under a transect ``closure_flux``, the mode B/C/D default / ``inner_relax
+        < 1``), ``Qg_out`` / ``H_out`` otherwise. No speed is stored.
+        Returns ``(us, U)``, each shaped ``(grid_ny, grid_nx)``, zero where
+        the closure carried no ice (under ``inner_relax < 1`` a blended
+        ``H_out`` can still be positive there) and at outlet cells (whose H
+        is copied from their donor, not solved). Under 'eff-exp' ``us = U``
+        (no sliding split). Approximate, with a warning, in two cases: ``H_diffusivity`` smooths
+        the kernel's H after the closure solve, and a run without the
+        closure rows (``save_closure_pair=False``, the default) lacks the pair its
+        settings need.
+
+        Every icy cell is a channel of width ``W = alpha_g*H``, so thick
+        interior ice that covers its cell as a sheet (``W > dx``) reads slow:
+        the same flux through the cell width would move about ``W/dx`` times
+        faster.
+        Under 'coulomb', thin ice near the yield stress ``tau_c`` can show
+        very large speeds at a few cells.
+        """
+        if self.H_diffusivity:
+            warnings.warn("H_diffusivity smoothed H after the closure solve; "
+                          "ice_speed is approximate for this run", stacklevel=2)
+        _outputs.warn_if_closure_pair_missing(self)
+        H, Q = _outputs.closure_pair(self, i)
+        return ice_speeds(H, Q, self.sliding_law,
+                          self.alpha_g, self.Ac, self.lambda_p,
+                          self.lambda_c, self.tau_c,
+                          receivers=self.receivers_out[i])
+
     def extract_channel(self, i=-1, basin_rank=0):
         """Extract the main channel from a basin at output time step i,
         then follow those same nodes through all output time steps.
@@ -1552,10 +2036,7 @@ class siim:
             z, zb, H, Qg, Qf, area, erosion_rate — (nt_out, n_nodes) arrays
             k_h, d, xo, L — Hack's law fit from time step i
         """
-        rec    = self.receivers_out[i].flatten()
-        # NaN receivers (boundary nodes) map to SELF, not node 0 — nan_to_num
-        # would make every such node a phantom donor of the grid corner.
-        rec = np.where(np.isnan(rec), np.arange(rec.size), rec).astype(int)
+        rec    = _sanitized_receivers(self.receivers_out[i])
         area   = self.area_out[i].flatten()
         basins = self.basin_out[i].flatten()
 
@@ -1572,12 +2053,7 @@ class siim:
         outlet = basin_nodes[np.argmax(area[basin_nodes])]
 
         # 3. Build donor lookup (one pass over rec), then walk upstream
-        nn = rec.size
-        donor_list = [[] for _ in range(nn)]
-        for j in range(nn):
-            r = rec[j]
-            if r != j:
-                donor_list[r].append(j)
+        donor_list = _donor_lists(rec)
 
         path = [outlet]
         node = outlet
@@ -1669,31 +2145,29 @@ class siim:
         Works correctly with flow_routing='single' and 'dinf' (SFR-equivalent
         donor topology in both cases — D-inf's primary-receiver collapse is
         meaningful because facet-weighted routing picks a clear dominant
-        direction).
+        direction). Under ``'mfd'`` it is a PRIMARY-PATH diagnostic: the walk
+        follows the largest-weight receiver only, which at p = 1 carries well
+        under half of the cell's flux, so the orders/ratios describe the
+        dominant network, not the full MFD graph (see
+        ``docs/guides/outputs_and_io.md``).
         """
         ny, nx = self.grid_ny, self.grid_nx
-        rec = self.receivers_out[i].flatten()
-        # NaN receivers map to self (see extract_channel)
-        rec = np.where(np.isnan(rec), np.arange(rec.size), rec).astype(int)
+        rec = _sanitized_receivers(self.receivers_out[i])
         stack = np.nan_to_num(self.stack_out[i].flatten(), nan=0).astype(int)
         area = self.area_out[i].flatten()
         nn = rec.size
-
-        # Build donor lookup
-        donor_list = [[] for _ in range(nn)]
-        for j in range(nn):
-            r = rec[j]
-            if r != j:
-                donor_list[r].append(j)
+        donor_list = _donor_lists(rec)
 
         # Walk upstream → downstream. Stack convention differs by router:
-        #   SFR   stores stack outlet-first → walk stack[::-1] (head→outlet)
-        #   D-inf stores stack donor-first  → walk stack       (head→outlet)
-        # Without this dispatch, D-inf walks outlet→head and every donor is
-        # unvisited at lookup time, so every channel cell collapses to
+        #   SFR         stores stack outlet-first → walk stack[::-1] (head→outlet)
+        #   D-inf / MFD store stack donor-first   → walk stack       (head→outlet)
+        # Without this dispatch, a donor-first router walks outlet→head and every
+        # donor is unvisited at lookup time, so every channel cell collapses to
         # order=1, max_order=1, A has length 1, sigma becomes an empty array,
-        # and downstream np.mean(sigma) returns NaN.
-        walk_order = stack if self.flow_routing == 'dinf' else stack[::-1]
+        # and downstream np.mean(sigma) returns NaN. Router identity — not
+        # arity — selects here, so EVERY donor-first router must be listed.
+        walk_order = (stack if self.flow_routing in _DONOR_FIRST_ROUTERS
+                      else stack[::-1])
         order = np.zeros(nn, dtype=int)
         for j in walk_order:
             if area[j] < channel_threshold:

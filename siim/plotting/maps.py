@@ -12,17 +12,20 @@ contract.
 
 import numpy as np
 
-from ._render import _slider_view, _add_colorbar, _node_extent
+from ._colormaps import bed_cmap
+from ._render import _slider_view, _add_colorbar, _node_extent, _ice_ramp
 from ._style import time_label
 from ._animation import movie_path, save_animation
 
-# field name -> (model attribute holding the (time, y, x) array, cmap, label)
+# field name -> (model attribute holding the (time, y, x) array, default
+# colormap factory, label). Bedrock takes siim's bed colormap (as landscape's),
+# ice the glacier ramp of every depth-coded ice map (landscape's veil, flux).
 # 'ice' is H_out: the WIDTH-MEAN thickness the physics consumes, NOT the local
 # column depth landscape() paints (hc_over_H * H at the thalweg, deeper on
 # carved flanks) — the labels say which.
 FIELD_REGISTRY = {
-    'bedrock': ('zb_out', 'gist_earth', 'Bedrock elevation (m)'),
-    'ice':     ('H_out',  'Blues',      'Mean ice thickness H̄ (m)'),
+    'bedrock': ('zb_out', bed_cmap,  'Bedrock elevation (m)'),
+    'ice':     ('H_out',  _ice_ramp, r'Mean ice thickness $\bar{H}$ (m)'),
     # future, free to add: 'erosion': ('erosion_rate_out', 'magma', 'Erosion rate (m/yr)')
 }
 
@@ -66,9 +69,9 @@ class MapMixin:
                 if field in _MASKED_FIELDS else arr)
 
     @staticmethod
-    def _field_cmap(field, cmap):
+    def _field_cmap(field, cmap, default):
         import matplotlib.pyplot as plt
-        cmap_obj = plt.get_cmap(cmap)
+        cmap_obj = default() if cmap is None else plt.get_cmap(cmap)
         if field in _MASKED_FIELDS:
             cmap_obj = cmap_obj.with_extremes(bad=BARE_GROUND_COLOR)
         return cmap_obj
@@ -89,20 +92,19 @@ class MapMixin:
             _, ax = plt.subplots(figsize=self._field_figsize(fig_width), layout='constrained')
         im = ax.imshow(self._mask_field(arr[0], field), origin='lower',
                        extent=self._field_extent(), interpolation='nearest',
-                       cmap=self._field_cmap(field, cmap or default_cmap),
+                       cmap=self._field_cmap(field, cmap, default_cmap),
                        vmin=vmin, vmax=vmax, aspect='equal')
         ax.set_xlim(0, self.model.Lx / 1e3)
         ax.set_ylim(0, self.model.Ly / 1e3)
         ax.set_xlabel('x (km)')
         ax.set_ylabel('y (km)')
-        ax.tick_params(labelsize=9)
         _add_colorbar(im, ax, label=label)
         return arr, im
 
     def _update_map(self, im, arr, field, idx):
         im.set_data(self._mask_field(arr[idx], field))
         title = im.axes.set_title(time_label(self.model.output_times[idx]),
-                                  loc='right', fontsize=10)
+                                  loc='right')
         return im, title
 
     def map(self, field='bedrock', i=-1, field_min=None, field_max=None,
@@ -110,7 +112,9 @@ class MapMixin:
         """Stored node-valued raster at snapshot i; returns the Axes.
 
         Ice is width-mean thickness, with ice-free ground masked. Color limits
-        cover all outputs unless field_min/field_max are supplied.
+        span the data range over all outputs unless field_min/field_max are
+        supplied, whereas ``landscape`` fixes its bed scale's floor at
+        ``z_min`` (default -500 m) so its colours compare across runs.
         """
         field = field.lower()
         arr, im = self._setup_map(field, field_min, field_max, cmap, ax, fig_width)

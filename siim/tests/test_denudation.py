@@ -129,8 +129,7 @@ def test_sediment_carve_adds_to_yield():
     proxy read 0.99."""
     # Isolate the carve: pin the mode-C standard flags off so the carve-on /
     # carve-off twins differ ONLY in carve_width.
-    base = _glac(mode='B', track_sediment=True, trunk_surface=False,
-                 routing_relax=0.0)
+    base = _glac(mode='B', track_sediment=True, trunk_surface=False)
     on = siim2d({**base, 'carve_width': True, 'widening_rate': 0.0})
     on.run()
     off = siim2d({**base, 'carve_width': False})
@@ -269,7 +268,7 @@ def test_flexure_slot_is_glacial_flexure():
     adapter's flexure slot (the Map-4 class-identity assert; conda)."""
     from siim.fastscape import GlacialFlexure
     on = siim2d({**_glac(U=2e-3), 'flexure': True, 'e_thickness': 20e3,
-                 'ice_load': False})
+                 'ice_load': False, 'inner_passes': 1, 'inner_relax': 1.0})   # the adapter's one pass
     assert on._process_overrides()['flexure'] is GlacialFlexure
 
 

@@ -3,7 +3,7 @@
 #     the primary supported interpreter;
 #   test-artifact — build and inspect the distributions, then smoke-test the
 #     installed wheel on the newest supported interpreter;
-#   test-macos — a small flexure run covering SIIM's macOS Numba workaround;
+#   test-macos — a small flexure run on SIIM's default Numba threading layer;
 #   test-adapter — the optional Fastscape/xsimlab contract in its pinned conda
 #     environment. The adapter stays a single Python 3.12 job because its
 #     compiled backend is not available from PyPI.
@@ -30,25 +30,65 @@ concurrency:
 jobs:
   test-standalone:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest]
         python-version: ["3.12"]
+        # Both numba threading layers siim can run: TBB (its first choice,
+        # through the optional `tbb` extra) and workqueue (what a plain pip
+        # install falls back to). Results are bit-for-bit on either.
+        layer: [tbb, workqueue]
+    name: Standalone (${{ matrix.os }}, Python ${{ matrix.python-version }}, ${{ matrix.layer }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # numpy picks SIMD code paths by the runner's CPU, as numba does (the
+    # workflow-level pin above): on an AVX-512 runner its float64 ufuncs use
+    # other kernels than on an AVX2 one and round differently in the last bit,
+    # which the autogenic dynamics amplify. Seen 2026-11-13: one commit failed
+    # the seven flexure-on references on one pair of runners and passed on the
+    # next. Cap numpy at the AVX2 level (X86_V3) every runner has. The names
+    # are numpy 2.5's dispatch groups (baseline X86_V2; dispatch X86_V3,
+    # X86_V4, AVX512_ICL, AVX512_SPR): a numpy that renames them warns at
+    # import, and the CPU step below shows what is in use.
+    env:
+      NPY_DISABLE_CPU_FEATURES: "X86_V4 AVX512_ICL AVX512_SPR"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install siim and its declared test dependencies
-        run: pip install -e '.[test]'
+        run: pip install -e '.[test${{ matrix.layer == 'tbb' && ',tbb' || '' }}]'
       # cache=True misses cross-module njit edits: stale caches give false
       # green/red on the bitwise battery gate.
       - name: Clear numba cache
         run: find siim -name '*.nb[ci]' -delete
+      # numba finds pip's libtbb only on the loader's path (docs: install.md);
+      # setup-python already puts this Python's lib directory on
+      # LD_LIBRARY_PATH. Without it, or without the extra, numba falls back to
+      # workqueue silently: fail here instead, in either arm.
+      - name: Runner CPU and numpy SIMD (the reference battery is float-exact)
+        run: |
+          grep -m1 "model name" /proc/cpuinfo
+          python - <<'PY'
+          import numpy as np
+          from numpy._core import _multiarray_umath as m
+          print("numpy", np.__version__, "| baseline", m.__cpu_baseline__,
+                "| dispatch in use", [k for k in m.__cpu_dispatch__ if m.__cpu_features__.get(k)])
+          PY
+      - name: Check the layer numba picks
+        run: |
+          python - <<'PY'
+          import siim, numba
+          numba.get_num_threads()          # launches the pool, which picks the layer
+          layer = numba.threading_layer()
+          assert layer == "${{ matrix.layer }}", layer
+          print("numba threading layer:", layer)
+          PY
       - name: Standalone suite (everything but the adapter slice)
         run: python -m pytest siim/tests -q -m 'not adapter'
       - name: Docs build (warnings are errors)
+        if: matrix.layer == 'tbb'      # once is enough
         run: |
           pip install -r docs/requirements.txt
           python -m sphinx -W -E -b html docs docs/_build/html
@@ -184,7 +224,7 @@ jobs:
       - name: Exercise the default Numba threading layer and flexure
         working-directory: ${{ runner.temp }}
         run: |
-          unset NUMBA_THREADING_LAYER
+          unset NUMBA_THREADING_LAYER NUMBA_THREADING_LAYER_PRIORITY
           python - <<'PY'
           from pathlib import Path
           import os
@@ -193,7 +233,9 @@ jobs:
 
           assert "NUMBA_THREADING_LAYER" not in os.environ
           import siim
-          assert os.environ["NUMBA_THREADING_LAYER"] == "workqueue"
+          # gate: the layer default is TBB-first, else workqueue (ED-168), not a workqueue pin
+          assert os.environ["NUMBA_THREADING_LAYER_PRIORITY"] == "tbb workqueue omp"
+          assert "NUMBA_THREADING_LAYER" not in os.environ
 
           checkout = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
           imported = Path(siim.__file__).resolve()
@@ -210,7 +252,10 @@ jobs:
           model.run()
           assert np.isfinite(model.z_out).all()
           assert np.isfinite(model.rebound_out).all()
-          print(f"macOS workqueue smoke passed from {imported}")
+          import numba
+          layer = numba.threading_layer()
+          assert layer in ("tbb", "workqueue"), layer   # never OpenMP
+          print(f"macOS {layer} smoke passed from {imported}")
           PY
 
   test-adapter:

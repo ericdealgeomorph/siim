@@ -20,6 +20,47 @@ from .solvers import (
 # =============================================================================
 
 @numba.njit(cache=True)
+def _linear_implicit(zo, zr, G):
+    """n = nu = 1 implicit step against one receiver: the closed form of
+    ``_solver_fluvial`` at n = 1, with its guard. A receiver at or above the
+    cell does not erode it (the closed form raised a pit toward a higher
+    receiver; audit #7)."""
+    if zo <= zr:
+        return zo
+    return (zo + G * zr) / (1.0 + G)
+
+
+@numba.njit(cache=True)
+def _linear_dinf_below(zo_i, z_cut, n_rec, receivers_i, weights_i, lengths_i,
+                       z, C, Q, ex, dt):
+    """The n = nu = 1 multi-receiver root when the all-receivers closed form
+    ``z_cut`` lies below one of the receivers. A receiver above the cell does not
+    erode it (the ``max(0, .)`` of the nonlinear solvers; audit #7), and counting
+    it only raises the closed form, so re-solving without the receivers at or
+    above the last value walks down to the exact root."""
+    zi = z_cut
+    for _ in range(n_rec):
+        K_sum = 0.0
+        Kz_sum = 0.0
+        zr_max = -np.inf
+        for k in range(n_rec):
+            L = lengths_i[k]
+            zr = z[receivers_i[k]]
+            if L <= 0.0 or zr >= z_cut:
+                continue
+            wG = weights_i[k] * ((dt / L) * C * Q ** ex)
+            K_sum += wG
+            Kz_sum += wG * zr
+            if wG > 0.0 and zr > zr_max:
+                zr_max = zr
+        zi = (zo_i + Kz_sum) / (1.0 + K_sum)
+        if zr_max <= zi:
+            return zi
+        z_cut = zi
+    return zi
+
+
+@numba.njit(cache=True)
 def _linear_erode_2d(z, zo, Qf, Qg, Kf, Kg, m, mu, stack, rec):
     """Linear (n=nu=1) implicit erosion on a directed graph."""
     for i in stack:
@@ -27,10 +68,10 @@ def _linear_erode_2d(z, zo, Qf, Qg, Kf, Kg, m, mu, stack, rec):
         if r != i:
             if Qg[i] > 0.0:   # under ice (align w/ the other 6 eroders; m13)
                 Gi = Kg[i] * Qg[i] ** mu
-                z[i] = (zo[i] + Gi * z[r]) / (1.0 + Gi)
+                z[i] = _linear_implicit(zo[i], z[r], Gi)
             else:
                 Fi = Kf[i] * Qf[i] ** m
-                z[i] = (zo[i] + Fi * z[r]) / (1.0 + Fi)
+                z[i] = _linear_implicit(zo[i], z[r], Fi)
 
 
 @numba.njit(cache=True)
@@ -73,8 +114,9 @@ def _power_erode_2d(z, zo, Qf, Qg, H, Kf, Kg_prefactor, m, n, t, lambda_p, stack
 # Same form as the SFR versions but with the implicit equation summed over
 # the cell's receivers:
 #     F(z) = z - zo + Σ_k w_k · (dt/L_k^ν) · Co · Q^μ · max(0, z - z_rk)^ν
-# Each term is monotonic non-decreasing in z (for z > z_rk), so F is monotonic
-# and Newton converges from above.
+# Each term is non-decreasing in z, so F is strictly increasing with its root
+# in [min_k z_rk, zo]. _solver_nonlinear_dinf brackets its Newton there:
+# plain Newton 2-cycles for exponents < 1.
 #
 # Iteration order: D-inf's stack is donor-first, so to march receivers-first
 # (so each cell's receivers have already been updated when we hit it) we
@@ -90,7 +132,8 @@ def _linear_erode_2d_dinf(z, zo, Qf, Qg, dt, Ko, Co, m, mu,
 
         z (1 + K) = zo + Σ_k w_k · Gi_k · z_rk
 
-    where K = Σ_k w_k · Gi_k. Closed-form, no Newton needed.
+    where K = Σ_k w_k · Gi_k, closed form while every receiver lies below
+    the result; otherwise :func:`_linear_dinf_below` drops the ones above it.
     """
     for idx in range(stack.shape[0] - 1, -1, -1):
         i = stack[idx]
@@ -102,6 +145,7 @@ def _linear_erode_2d_dinf(z, zo, Qf, Qg, dt, Ko, Co, m, mu,
         is_glacial = Qg[i] > 0.0
         K_sum = 0.0
         Kz_sum = 0.0
+        zr_max = -np.inf
         for k in range(n_rec):
             r = receivers[i, k]
             L = lengths[i, k]
@@ -114,8 +158,18 @@ def _linear_erode_2d_dinf(z, zo, Qf, Qg, dt, Ko, Co, m, mu,
             wG = weights[i, k] * Gi
             K_sum += wG
             Kz_sum += wG * z[r]
+            if wG > 0.0 and z[r] > zr_max:
+                zr_max = z[r]
         if K_sum > 0.0:
-            z[i] = (zo[i] + Kz_sum) / (1.0 + K_sum)
+            zi = (zo[i] + Kz_sum) / (1.0 + K_sum)
+            if zr_max > zi:   # a receiver above the root (audit #7)
+                if is_glacial:
+                    zi = _linear_dinf_below(zo[i], zi, n_rec, receivers[i], weights[i],
+                                            lengths[i], z, Co, Qg[i], mu, dt)
+                else:
+                    zi = _linear_dinf_below(zo[i], zi, n_rec, receivers[i], weights[i],
+                                            lengths[i], z, Ko, Qf[i], m, dt)
+            z[i] = zi
 
 
 @numba.njit(cache=True)
@@ -178,12 +232,6 @@ def _power_erode_2d_dinf(z, zo, Qf, Qg, H, dt, Ko, ce, m, n, t, lambda_p,
 # differs (walks fastscape's directed graph via stack/receivers instead of 1D
 # indices). See ``docs/guides/concepts.md`` for the governing-model overview.
 # =============================================================================
-
-
-
-
-
-
 
 @numba.njit(cache=True)
 def _coulomb_erode_2d(z, zo, Qf, Qg, Kf, A_const_nodal, m, n, ell, t,
@@ -557,6 +605,157 @@ def _erode_modeb_dinf(law_code, z, zo, water_flux, ice_flux, H,
                                   lambda_c, tau_c, coulomb_clamp, rho_g_g, dt,
                                   stack, nb_receivers, receivers, weights, lengths)
 
+
+# =============================================================================
+# Mode-B EFFECTIVE-RECEIVER erosion step — the ``slope_normalise`` path.
+#
+# Under the gamma effective-slope normalisation (constants.MFD_GAMMA_FLOOR) the
+# multi-receiver eroders above are not the right discretisation, because scaling
+# the link lengths by gamma is exactly ``S / gamma`` only where a kernel reads
+# ``lengths`` at exponent 1. The nonlinear residual sums
+# ``sum_k w_k (dz_k/L_k)^p``, so scaled lengths give ``gamma^-p sum_k w_k S_k^p``
+# where a normalised slope would give ``(gamma^-1 sum_k w_k S_k)^p`` -- Jensen
+# separates them at p != 1 (+3 % on a cardinal plane at p = 2).
+#
+# So when the flag is on, erosion collapses the receiver fan to the SAME single
+# effective receiver the thickness closure uses (skeleton._dinf_modeB_recv): the
+# length-weighted mean receiver surface
+# ``Z_bar = (sum_k w_k z_rk / L_k) / (sum_k w_k / L_k)`` at distance
+# ``L_bar = 1 / (sum_k w_k / L_k)`` -- read off the GAMMA-SCALED lengths, so
+# ``L_bar_eff = gamma*L_bar`` while ``Z_bar`` is unchanged (both accumulators
+# scale by 1/gamma). The residual is then the single-receiver form
+#
+#     z - zo + (dt / L_bar_eff**p) * A * (z - Z_bar)**p
+#
+# i.e. the SFR per-node arithmetic verbatim, so thickness and erosion see the
+# same effective slope and -- on a cardinal plane, where gamma*L_bar == dx and
+# Z_bar is the +x neighbour's surface at any p -- the whole mode-B step reduces
+# to D8's (docs/dev/mfd_router_plan.md section 2.4; the S3 a7 parity gate).
+#
+# Z_bar is built from the receivers' ALREADY-UPDATED elevations, exactly as the
+# D-inf eroders and the joint walk do: the walk is receivers-first (the reversed
+# donor-first stack), or level-scheduled, where a node's receivers all live in
+# strictly lower, already-finalized levels.
+# =============================================================================
+
+@numba.njit(cache=True)
+def _eff_recv_erode(z, i, n_rec, receivers, weights, lengths):
+    """``(Z_bar, L_bar, ok)`` for cell ``i`` -- the erosion twin of
+    :func:`siim._core.skeleton._dinf_modeB_recv`, reading the working elevations
+    ``z`` (which ARE the reduced surface in the mode-B erosion view) instead of
+    ``zb + hc*H``. Same accumulators, same skip rules, so closure and eroder
+    agree cell for cell on the effective receiver."""
+    A = 0.0
+    B = 0.0
+    for k in range(n_rec):
+        r = receivers[i, k]
+        L = lengths[i, k]
+        w = weights[i, k]
+        if L <= 0.0 or w <= 0.0 or r == i:
+            continue
+        A += w / L
+        B += w * z[r] / L
+    if A <= 0.0:
+        return 0.0, 0.0, False
+    L_bar = 1.0 / A
+    return B * L_bar, L_bar, True
+
+
+@numba.njit(cache=True)
+def _erode_node_eff(law_code, i, z, zo, water_flux, ice_flux, H, zr, L,
+                    Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p,
+                    lambda_c, tau_c, coulomb_clamp, rho_g_g, dt):
+    """One node's implicit erosion against a SINGLE effective receiver at surface
+    ``zr``, distance ``L``: the per-node arithmetic of the SFR eroders
+    (:func:`_erode_modeb_sfr` and the loops it calls) expression for expression,
+    including the two distinct ``ell_half`` rounding paths the SFR power eroder
+    uses. Returns the new ``z[i]``."""
+    if L <= 0.0:
+        return z[i]
+    if law_code == LAW_EFFEXP:
+        if ice_flux[i] > 0.0:
+            Gi = dt / L ** nu * Co * ice_flux[i] ** mu
+            if n == 1.0 and nu == 1.0:
+                return _linear_implicit(zo[i], zr, Gi)
+            return _solver_glacial(zo[i], zr, Gi, nu)
+        Fi = dt / L ** n * Ko * water_flux[i] ** m
+        if n == 1.0 and nu == 1.0:
+            return _linear_implicit(zo[i], zr, Fi)
+        return _solver_fluvial(zo[i], zr, Fi, n)
+    elif law_code == LAW_POWER:
+        ell = 3.0 * nu / 5.0
+        t = 3.0 * ell / 2.0
+        if ice_flux[i] > 0.0:
+            base = ce * (cg * lambda_p ** 2 / alpha_g ** 2) ** (ell / 2.0)
+            rheology_factor = 1.0 + (H[i] / lambda_p) ** 2
+            Gi = (dt / L ** t * base) * (ice_flux[i] / rheology_factor) ** (t / 3.0)
+            return _solver_glacial_power(zo[i], zr, Gi, t)
+        Fi = dt / L ** n * Ko * water_flux[i] ** m
+        return _solver_fluvial(zo[i], zr, Fi, n)
+    else:
+        ell = nu / 2.0
+        t = 6.0 * ell / 5.0
+        if ice_flux[i] > 0.0:
+            base_A = ce * (cg ** 0.4 / alpha_g) ** ell
+            A_pre = (dt / L ** t * base_A) * ice_flux[i] ** (3.0 * ell / 5.0)
+            return _solver_glacial_coulomb(
+                zo[i], zr, ice_flux[i], A_pre, ell, t,
+                cg, rho_g_g, tau_c, lambda_c, L, coulomb_clamp)
+        Fi = dt / L ** n * Ko * water_flux[i] ** m
+        return _solver_fluvial(zo[i], zr, Fi, n)
+
+
+@numba.njit(cache=True)
+def _erode_modeb_eff(law_code, z, zo, water_flux, ice_flux, H,
+                     Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p,
+                     lambda_c, tau_c, coulomb_clamp, rho_g_g, dt,
+                     stack, nb_receivers, receivers, weights, lengths):
+    """Effective-receiver mode-B erosion step (the ``slope_normalise`` twin of
+    :func:`_erode_modeb_dinf`). Receivers-first walk = the reversed donor-first
+    stack, so every receiver is already updated when its donor is visited."""
+    for idx in range(stack.shape[0] - 1, -1, -1):
+        i = stack[idx]
+        n_rec = nb_receivers[i]
+        if n_rec == 0:
+            continue
+        if n_rec == 1 and receivers[i, 0] == i:
+            continue
+        zr, L, ok = _eff_recv_erode(z, i, n_rec, receivers, weights, lengths)
+        if not ok:
+            continue
+        z[i] = _erode_node_eff(law_code, i, z, zo, water_flux, ice_flux, H,
+                               zr, L, Ko, Co, ce, n, nu, m, mu, cg, alpha_g,
+                               lambda_p, lambda_c, tau_c, coulomb_clamp,
+                               rho_g_g, dt)
+
+
+@numba.njit(cache=True, parallel=True)
+def _erode_modeb_eff_levels(law_code, z, zo, water_flux, ice_flux, H,
+                            Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p,
+                            lambda_c, tau_c, coulomb_clamp, rho_g_g, dt,
+                            nb_receivers, receivers, weights, lengths,
+                            order, offsets, nlev):
+    """Level-parallel twin of :func:`_erode_modeb_eff` -- the same per-node call,
+    so bit-for-bit with the serial walk at any thread count (disjoint writes; a
+    node's receivers all sit in strictly lower, already-finalized levels)."""
+    for lev in range(nlev):
+        for k in numba.prange(offsets[lev], offsets[lev + 1]):
+            i = order[k]
+            n_rec = nb_receivers[i]
+            if n_rec == 0:
+                continue
+            if n_rec == 1 and receivers[i, 0] == i:
+                continue
+            zr, L, ok = _eff_recv_erode(z, i, n_rec, receivers, weights,
+                                        lengths)
+            if not ok:
+                continue
+            z[i] = _erode_node_eff(law_code, i, z, zo, water_flux, ice_flux, H,
+                                   zr, L, Ko, Co, ce, n, nu, m, mu, cg,
+                                   alpha_g, lambda_p, lambda_c, tau_c,
+                                   coulomb_clamp, rho_g_g, dt)
+
+
 # =============================================================================
 # Level-scheduled parallel mode-B erosion (the ``parallel_erode`` toggle).
 #
@@ -606,13 +805,13 @@ def _erode_modeb_sfr_levels(law_code, z, zo, water_flux, ice_flux, H_flat,
                 if ice_flux[i] > 0.0:
                     Gi = Kg_i * ice_flux[i] ** mu
                     if linear:
-                        z[i] = (zo[i] + Gi * z[r]) / (1.0 + Gi)
+                        z[i] = _linear_implicit(zo[i], z[r], Gi)
                     else:
                         z[i] = _solver_glacial(zo[i], z[r], Gi, nu)
                 else:
                     Fi = Kf_i * water_flux[i] ** m
                     if linear:
-                        z[i] = (zo[i] + Fi * z[r]) / (1.0 + Fi)
+                        z[i] = _linear_implicit(zo[i], z[r], Fi)
                     else:
                         z[i] = _solver_fluvial(zo[i], z[r], Fi, n)
             elif law_code == LAW_POWER:
@@ -676,6 +875,7 @@ def _erode_modeb_dinf_levels(law_code, z, zo, water_flux, ice_flux, H,
                     is_glacial = ice_flux[i] > 0.0
                     K_sum = 0.0
                     Kz_sum = 0.0
+                    zr_max = -np.inf
                     for kk in range(n_rec):
                         r = receivers[i, kk]
                         L = lengths[i, kk]
@@ -688,8 +888,20 @@ def _erode_modeb_dinf_levels(law_code, z, zo, water_flux, ice_flux, H,
                         wG = weights[i, kk] * Gi
                         K_sum += wG
                         Kz_sum += wG * z[r]
+                        if wG > 0.0 and z[r] > zr_max:
+                            zr_max = z[r]
                     if K_sum > 0.0:
-                        z[i] = (zo[i] + Kz_sum) / (1.0 + K_sum)
+                        zi = (zo[i] + Kz_sum) / (1.0 + K_sum)
+                        if zr_max > zi:   # a receiver above the root (audit #7)
+                            if is_glacial:
+                                zi = _linear_dinf_below(
+                                    zo[i], zi, n_rec, receivers[i], weights[i],
+                                    lengths[i], z, Co, ice_flux[i], mu, dt)
+                            else:
+                                zi = _linear_dinf_below(
+                                    zo[i], zi, n_rec, receivers[i], weights[i],
+                                    lengths[i], z, Ko, water_flux[i], m, dt)
+                        z[i] = zi
                 else:
                     if ice_flux[i] > 0.0:
                         p = nu

@@ -97,26 +97,30 @@ def glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat, surface_ou
                                Ko, Co, n, nu, m, mu, cg, alpha_g, lambda_p,
                                dt, stack, nb_receivers, receivers, weights,
                                lengths, D_H, ny, nx, dx_cell, dy_cell,
-                               border_bed_uplift, hc, wrap_y, wrap_x):
+                               border_bed_uplift, hc, wrap_y, wrap_x,
+                               slope_normalise=False):
     p = _gp_effexp(Ko, Co, n, nu, m, mu, cg, alpha_g, lambda_p, hc, D_H)
     _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux,
                                 H_flat, surface_out,
                                 LAW_EFFEXP, p, dt, stack, nb_receivers, receivers,
                                 weights, lengths, ny, nx, dx_cell, dy_cell,
-                                border_bed_uplift, wrap_y, wrap_x, _BL0)
+                                border_bed_uplift, wrap_y, wrap_x, _BL0,
+                                slope_normalise=slope_normalise)
 
 
 def glac_fast_solve_power_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
                                      surface_out, Ko, ce, n, nu, m, cg, alpha_g,
                                      lambda_p, dt, stack, nb_receivers, receivers,
                                      weights, lengths, D_H, ny, nx, dx_cell,
-                                     dy_cell, border_bed_uplift, hc, wrap_y, wrap_x):
+                                     dy_cell, border_bed_uplift, hc, wrap_y,
+                                     wrap_x, slope_normalise=False):
     p = _gp_power(Ko, ce, n, nu, m, cg, alpha_g, lambda_p, hc, D_H)
     _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux,
                                 H_flat, surface_out,
                                 LAW_POWER, p, dt, stack, nb_receivers, receivers,
                                 weights, lengths, ny, nx, dx_cell, dy_cell,
-                                border_bed_uplift, wrap_y, wrap_x, _BL0)
+                                border_bed_uplift, wrap_y, wrap_x, _BL0,
+                                slope_normalise=slope_normalise)
 
 
 def glac_fast_solve_coulomb_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
@@ -124,11 +128,13 @@ def glac_fast_solve_coulomb_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
                                        lambda_c, tau_c, coulomb_clamp, rho_g_g,
                                        dt, stack, nb_receivers, receivers, weights,
                                        lengths, D_H, ny, nx, dx_cell, dy_cell,
-                                       border_bed_uplift, hc, wrap_y, wrap_x):
+                                       border_bed_uplift, hc, wrap_y, wrap_x,
+                                       slope_normalise=False):
     p = _gp_coulomb(Ko, ce, n, nu, m, cg, alpha_g, lambda_c, tau_c,
                     coulomb_clamp, rho_g_g, hc, D_H)
     _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux,
                                 H_flat, surface_out,
                                 LAW_COULOMB, p, dt, stack, nb_receivers, receivers,
                                 weights, lengths, ny, nx, dx_cell, dy_cell,
-                                border_bed_uplift, wrap_y, wrap_x, _BL0)
+                                border_bed_uplift, wrap_y, wrap_x, _BL0,
+                                slope_normalise=slope_normalise)

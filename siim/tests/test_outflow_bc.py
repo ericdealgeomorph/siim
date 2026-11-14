@@ -289,6 +289,46 @@ def test_outflow_border_parity_sfr_dinf_1d(law):
         assert zb_s[b] < zb0.ravel()[b] + 1e-12      # border eroded (budget live)
 
 
+@pytest.mark.pin
+@pytest.mark.parametrize('router', ['sfr', 'dinf'])
+def test_icy_border_without_an_icy_donor_drops_its_ice(router):
+    """A glacier that retreated off the border leaves the border cell icy
+    (positive ice flux from its own surface) with no icy donor: the
+    zero-gradient copy then reads ice-free ground, H = 0, as the 1D twin does.
+    The 2D kernels skipped the copy, and the border kept last step's 300 m,
+    whose surface fed its own mass balance (audit #14)."""
+    from .test_dinf_routing import _route_full, _edges_interior
+    ny, nx, dx = 7, 20, 100.0
+    nn = ny * nx
+    _, ii = np.meshgrid(np.arange(ny), np.arange(nx), indexing='ij')
+    zb0 = 5.0 + 0.01 * dx * ii.astype(float)          # drains -x to col 0
+    b = (ny // 2) * nx                               # a col-0 border cell
+    ice = np.zeros(nn)
+    ice[b] = 1e4                                     # icy border, ice-free interior
+    code, p = _params('eff-exp')
+    zb, H, surf = zb0.ravel().copy(), np.zeros(nn), np.empty(nn)
+    H[b] = 300.0                                     # last step's thickness
+    if router == 'sfr':
+        rec = np.arange(nn, dtype=np.int64)
+        lengths = np.zeros(nn)
+        for j in range(1, ny - 1):
+            for i in range(1, nx - 1):
+                rec[j * nx + i] = j * nx + (i - 1)
+                lengths[j * nx + i] = dx
+        stack = np.argsort(ii.ravel(), kind='stable').astype(np.int64)
+        _glac_fast_solve_modeB_sfr(zb, ice, np.zeros(nn), H, surf, code, p, 500.0,
+                                   lengths, stack, rec, ny, nx, dx, dx, np.zeros(nn),
+                                   0.0, True)
+    else:
+        _, receivers, weights, lengths, nb_rec, stack = _route_full(
+            zb0, dx, dx, _edges_interior(ny, nx))
+        _glac_fast_solve_modeB_dinf(zb, ice, np.zeros(nn), H, surf, code, p, 500.0,
+                                    stack, nb_rec, receivers, weights, lengths,
+                                    ny, nx, dx, dx, np.zeros(nn), False, False,
+                                    0.0, True)
+    assert H[b] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # The implicit budget at the kernel level (SFR; the D-inf twin is pinned
 # bed-bit-close by the parity test): the committed border bed is EXACTLY the

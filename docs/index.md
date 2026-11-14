@@ -9,8 +9,8 @@ Three front ends share one set of physics and constants (`siim.constants`):
 
 - **1D profile model** (`siim.siim1d`) — a single glacial–fluvial long
   profile; fast and standalone.
-- **2D landscape model** (`siim.siim2d`) — a raster model (single-flow or
-  D-infinity routing, sub-grid glacier-width carving), with a rifted-margin
+- **2D landscape model** (`siim.siim2d`) — a raster model (single-flow,
+  multiple-flow or D-infinity routing, sub-grid glacier-width carving), with a rifted-margin
   escarpment variant in `siim.escarpment`. Its default *mode-C standard*
   combines bed memory, width carving, and trunk-surface routing. Since 0.9.1
   it runs standalone on a plain pip install (in-house time loop, routing,

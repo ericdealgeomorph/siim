@@ -1,12 +1,14 @@
 """Time-series builders for time-varying model forcing.
 
-Each function builds the run's time vector internally from ``T`` (run time,
-years) and ``nt`` (number of steps) and returns ``(t, series)``: the time
+Each function builds the run's time vector internally from the models' clock,
+``linspace(to, T, nt)`` (``T`` the final time in years, ``to`` the initial time,
+default 0, ``nt`` the number of steps), and returns ``(t, series)``: the time
 vector (handy for plotting) and the length-``nt`` forcing array that drops
 straight into a model parameter dict, e.g.::
 
     from siim.forcing import ela_sawtooth
-    t, zELA = ela_sawtooth(params['T'], params['nt'], ela_high=2400, ela_low=1400)
+    t, zELA = ela_sawtooth(params['T'], params['nt'], ela_high=2400, ela_low=1400,
+                           to=params.get('to', 0.0))
     params['zELA'] = zELA
 
 Both ``siim.siim1d`` and ``siim.siim2d`` accept a scalar or a length-``nt``
@@ -17,10 +19,10 @@ import numpy as np
 
 
 def ela_sawtooth(T, nt, ela_high=1500, ela_low=300, period=100e3,
-                 buildup_frac=0.88):
+                 buildup_frac=0.88, to=0.0):
     """Asymmetric sawtooth ELA(t): slow glacial buildup, fast termination.
 
-    Builds ``t = linspace(0, T, nt)`` internally. Linear ramp down from
+    Builds ``t = linspace(to, T, nt)`` internally. Linear ramp down from
     ``ela_high`` to ``ela_low`` over ``buildup_frac`` of each ``period`` (the
     slow drop into a glacial), then linear ramp back up over the remaining
     ``1 - buildup_frac`` (the fast termination).
@@ -28,9 +30,12 @@ def ela_sawtooth(T, nt, ela_high=1500, ela_low=300, period=100e3,
     Parameters
     ----------
     T : float
-        Total run time in years (the time vector spans 0 to T).
+        Final model time in years, as the models read it (the time vector
+        spans ``to`` to ``T``).
     nt : int
         Number of time steps (length of the returned array).
+    to : float, optional
+        Initial model time in years (default 0), the models' ``to``.
     ela_high, ela_low : float
         ELA (m) at the start of buildup and at termination onset.
     period : float
@@ -43,8 +48,8 @@ def ela_sawtooth(T, nt, ela_high=1500, ela_low=300, period=100e3,
     (t, ela) : tuple of ndarray
         The time vector and the ELA(t) series, each length ``nt``.
     """
-    t = np.linspace(0, T, nt)
-    phase = (t % period) / period
+    t = np.linspace(to, T, nt)
+    phase = ((t - to) % period) / period      # a cycle starts with the run
     ela = np.where(
         phase < buildup_frac,
         ela_high - (ela_high - ela_low) * phase / buildup_frac,    # slow drop
@@ -53,19 +58,22 @@ def ela_sawtooth(T, nt, ela_high=1500, ela_low=300, period=100e3,
     return t, ela
 
 
-def uplift_step(T, nt, U_init, U_final, step_frac=0.5):
+def uplift_step(T, nt, U_init, U_final, step_frac=0.5, to=0.0):
     """Step change in uplift rate partway through the run.
 
-    Builds ``t = linspace(0, T, nt)`` internally and returns ``U_init`` before
-    the step and ``U_final`` at and after it. The step falls at ``step_frac * T``
-    (so ``step_frac`` is a fraction of the run time).
+    Builds ``t = linspace(to, T, nt)`` internally and returns ``U_init`` before
+    the step and ``U_final`` at and after it. The step falls at
+    ``to + step_frac * (T - to)``, a fraction ``step_frac`` of the run.
 
     Parameters
     ----------
     T : float
-        Total run time in years (the time vector spans 0 to T).
+        Final model time in years, as the models read it (the time vector
+        spans ``to`` to ``T``).
     nt : int
         Number of time steps (length of the returned array).
+    to : float, optional
+        Initial model time in years (default 0), the models' ``to``.
     U_init, U_final : float
         Uplift rate (m/yr) before and after the step.
     step_frac : float
@@ -76,16 +84,16 @@ def uplift_step(T, nt, U_init, U_final, step_frac=0.5):
     (t, U) : tuple of ndarray
         The time vector and the uplift-rate series, each length ``nt``.
     """
-    t = np.linspace(0, T, nt)
-    U = np.where(t < step_frac * T, U_init, U_final)
+    t = np.linspace(to, T, nt)
+    U = np.where(t < to + step_frac * (T - to), U_init, U_final)
     return t, U
 
 
-def interp_forcing(T, nt, times, values, left=None, right=None):
+def interp_forcing(T, nt, times, values, left=None, right=None, to=0.0):
     """Piecewise-linear forcing series from coarse ``(times, values)`` nodes.
 
-    Interpolates ``values`` (defined at ``times``, in run-time years from 0)
-    onto ``t = linspace(0, T, nt)``. A generic table-to-series builder, reusable
+    Interpolates ``values`` (defined at ``times``, in model-time years)
+    onto ``t = linspace(to, T, nt)``. A generic table-to-series builder, reusable
     for any scalar forcing — ``P``, ``zELA``, or ``U``::
 
         from siim.forcing import interp_forcing
@@ -94,15 +102,18 @@ def interp_forcing(T, nt, times, values, left=None, right=None):
                               times=[0, 1.5e6, 3e6], values=[2.0, 1.2, 0.65])
         params['P'] = P
 
-    ``times`` are model-time years (0 → ``T``); map geological time (e.g. Ma)
+    ``times`` are model-time years (``to`` → ``T``); map geological time (e.g. Ma)
     onto that axis before calling, the same way you would for ``zELA``.
 
     Parameters
     ----------
     T : float
-        Total run time in years (the time vector spans 0 to T).
+        Final model time in years, as the models read it (the time vector
+        spans ``to`` to ``T``).
     nt : int
         Number of time steps (length of the returned array).
+    to : float, optional
+        Initial model time in years (default 0), the models' ``to``.
     times, values : array_like
         Node positions (run-time years) and the forcing value at each node.
         ``times`` must be increasing (``np.interp`` requirement).
@@ -115,5 +126,5 @@ def interp_forcing(T, nt, times, values, left=None, right=None):
     (t, series) : tuple of ndarray
         The time vector and the interpolated forcing series, each length ``nt``.
     """
-    t = np.linspace(0, T, nt)
+    t = np.linspace(to, T, nt)
     return t, np.interp(t, times, values, left=left, right=right)

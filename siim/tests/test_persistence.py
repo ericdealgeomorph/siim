@@ -109,6 +109,19 @@ def test_save_load_round_trip_subfolder_name(tmp_path, monkeypatch):
     assert siim2d.load("batch/run003.pkl")._user_params == {}
 
 
+def test_load_appends_the_suffix_to_a_dotted_name(tmp_path, monkeypatch):
+    """A name with a dot loads the run saved under it, not its prefix's
+    (audit #33: with_suffix turned 'sweep_nu1.5' into 'sweep_nu1.pkl')."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(siim2d, "_unpack_outputs", lambda self: None)
+    for nu in (1.0, 1.5):
+        model = _model_for_save()
+        model._user_params = {"nu": nu}
+        model.save(f"sweep_nu{nu:g}")
+    assert siim2d.load("sweep_nu1.5")._user_params == {"nu": 1.5}
+    assert siim2d.load("sweep_nu1")._user_params == {"nu": 1.0}
+
+
 def test_failed_save_preserves_existing_file_and_cleans_temp(tmp_path, monkeypatch):
     path = tmp_path / "state.pkl"
     original = b"existing saved model"
@@ -179,3 +192,17 @@ def test_load_reports_invalid_pickle(tmp_path):
 
     with pytest.raises(ValueError, match="pickle is invalid or incompatible"):
         siim2d.load(path)
+
+
+def test_load_drops_removed_routing_relax_with_a_warning(tmp_path, monkeypatch):
+    """A model saved with routing_relax (removed 2026-11-04) still loads: the
+    key is dropped with a warning and the stored outputs are kept as saved."""
+    monkeypatch.setattr(siim2d, "_unpack_outputs", lambda self: None)
+    payload = _valid_payload()
+    payload["_user_params"] = {"routing_relax": 0.5, "progress_bar": False}
+    path = tmp_path / "old.pkl"
+    _dump(path, payload)
+    with pytest.warns(RuntimeWarning, match="routing_relax"):
+        loaded = siim2d.load(path)
+    assert loaded._user_params == {"progress_bar": False}
+    assert loaded.ds_out.identical(payload["ds_out"])

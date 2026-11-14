@@ -20,8 +20,9 @@ import numpy as np
 
 from ._render import _slider_view
 from ._profiles import (ProfileMethods, PROFILE_FIELDS, profile_data, data_limits,
-                        normalize_fields, resolve_limits, uplift_at_outputs, draw_panel)
-from ._style import COLORS, style_axes, time_label
+                        normalize_fields, resolve_limits, uplift_at_outputs, draw_panel,
+                        panel_shape)
+from ._style import style_axes, time_label
 
 _FIELDS = tuple(name for name in PROFILE_FIELDS
                 if name not in ('shear_stress', 'sliding_velocity'))
@@ -54,14 +55,11 @@ class ProfileMixin(ProfileMethods):
             uplift=uplift_at_outputs(m, ch.nodes), context=f'Basin {basin_rank}',
         )
 
-    @staticmethod
-    def _compute_field_ylims(ch, fields, smooth_n=None):
-        """Stable finite extrema; smooth_n is accepted for old internal callers."""
-        return data_limits(ch, fields)
-
     def _analytical_overlay(self, bistable):
         import warnings
         m = self.model
+        if m.analytical is None:                  # ce or Ko = 0: no steady state
+            return None
         surface, bed = m.analytical._analytical_profiles()
         if surface is None or bed is None:
             return None
@@ -78,37 +76,38 @@ class ProfileMixin(ProfileMethods):
         )
 
     # --- standalone overlay + cross-section viewer ------------------------
-    def analytical(self, ax=None, bistable=True):
-        """Plot the analytical SS reference profile (distance axis). Assumes a
-        prior ``profile``/channel extraction set the analytical grid."""
-        import matplotlib.pyplot as plt
-        m = self.model
+    def analytical(self, ax=None, bistable=True, basin_rank=0, ref=-1):
+        """Plot the analytical SS reference profile alone, drawn as
+        ``profile`` draws it (the same renderer, figure and distance axis),
+        fitted to the channel ``profile`` draws: basin ``basin_rank`` at
+        output ``ref`` (refitted when another extraction, e.g.
+        ``largest_basins``, has moved the reference to its own basin). The
+        bistable fluvial alternative is dotted when ``bistable=True``. Returns
+        the Axes, or None when there is no reference."""
+        self._get_channel(ref, basin_rank)
         an = self._analytical_overlay(bistable)
         if an is None:
             print('No analytical solution available.')
-            return
-        if ax is None:
-            _, ax = plt.subplots(1, 1, figsize=(8, 3.04), layout='constrained')
-        ax.plot(an.x, an.surface, '--', color=COLORS['ice'], lw=1.1, label='Analytical ice surface')
-        ax.plot(an.x, an.bed, '--', color=COLORS['bed'], lw=1, label='Analytical bedrock')
-        if an.surface_alt is not None:
-            ax.plot(an.x, an.surface_alt, '--', color='gray', alpha=0.5, lw=1,
-                    label='Analytical fluvial alt')
-        ax.set_xlim(0, 1.05 * m.L / 1e3)
-        ax.set_xlabel('Distance (km)')
-        ax.set_ylabel('Elevation (m)')
-        style_axes(ax)
-        return ax
+            return None
+        return self._draw_analytical(ax, an)
 
     def view_xsection(self, fields='elevation', figsize=None, y_km=None,
-                      z_min=None, z_max=None, H_max=None, fig_width=8, aspect=0.38):
+                      z_min=None, z_max=None, H_max=None, fig_width=None, aspect=None):
         """Interactive x-direction cross-section viewer: two sliders (time,
         y-row). The cross-section is the raster row at the chosen y — no
         flow graph / analytical. ``fields`` ⊂ {elevation, ice_thickness,
         erosion_rate}. Uses ipympl for a smooth live canvas (managed locally,
-        so your other plots stay on the default backend)."""
+        so your other plots stay on the default backend). ``fig_width`` and
+        ``aspect`` size it as ``profile``; ``figsize`` is deprecated (removal
+        in 1.0)."""
+        if figsize is not None:
+            import warnings
+            warnings.warn('view_xsection(figsize=) is deprecated and will be '
+                          'removed in 1.0; use fig_width and aspect, as profile() does',
+                          DeprecationWarning, stacklevel=2)
         m = self.model
         fields = normalize_fields(fields, ('elevation', 'ice_thickness', 'erosion_rate'))
+        fig_width, aspect = panel_shape(len(fields), fig_width, aspect)
         nt, ny, nx = m.z_out.shape
         x = np.linspace(0, m.Lx / 1e3, nx)
         iy0 = ny // 2 if y_km is None else int(
@@ -135,13 +134,13 @@ class ProfileMixin(ProfileMethods):
                 )
                 for ax, field in zip(axes, fields):
                     ax.clear()
-                    draw_panel(ax, field, row, idx)
+                    draw_panel(ax, field, row, idx, floor=limits[field][0])
                     ax.set_ylim(*limits[field])
                     style_axes(ax, legend=False)
                 axes[-1].set_xlabel('x (km)')
                 axes[0].set_title(
                     f'{time_label(m.output_times[idx])} · y = {iy * m.Ly / (ny - 1) / 1e3:g} km',
-                    loc='right', fontsize=10)
+                    loc='right')
             return draw
 
         return _slider_view(make_draw, [(nt, 'Snapshot', 0), (ny, 'y row', iy0)],

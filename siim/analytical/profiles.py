@@ -32,6 +32,7 @@ import numpy as np
 import scipy.special as _sp
 from scipy.optimize import brentq
 
+from .._palette import COLORS
 from ..constants import (ALPHA_G, AC, BETA, HC_OVER_H, KH, KT, LAMBDA_C,
                          RHO_ICE_G, TAU_C)
 from .core import (AARResult, Solution, _arccosh_safe, closure_slope,
@@ -91,6 +92,16 @@ def _finalize_solutions(obj):
         obj.Lt = float('nan')
         obj.zt = float('nan')
         obj.zo = float('nan')
+
+
+def _over_zela(h, zELA):
+    """``h / zELA``: the dimensionless NH = H/zELA from the thickness scale.
+    zELA = 0 (an ELA at base level) is physical: NH is then infinite for a
+    glacier, and NaN for no thickness (0/0), rather than a ZeroDivisionError
+    (audit #57)."""
+    if zELA == 0.0:
+        return math.inf if h > 0.0 else math.nan
+    return h / zELA
 
 
 def _profile(self, n_points: int = 3000, *, solution: Optional[Solution] = None):
@@ -167,8 +178,8 @@ def _thickness(self, x, *, solution: Optional[Solution] = None):
     if sol is None or sol.regime == 'fluvial':
         return H
     Lt = sol.Lt
-    NH_val = self.NH(Lt)
-    if not math.isfinite(NH_val):
+    H_scale = self._H_scale(Lt)     # zELA * NH, without NH's 1/zELA (audit #57)
+    if not math.isfinite(H_scale):
         return H
     if sol.regime == 'mixed':
         mask = (x > self.xo) & (x <= Lt)
@@ -176,15 +187,15 @@ def _thickness(self, x, *, solution: Optional[Solution] = None):
         mask = (x > self.xo) & (x <= self.L)
     ratio = np.clip(x[mask] / Lt, 0.0, 1.0)
     shape = (1.0 - ratio ** self.k) * ratio ** self.d
-    H[mask] = self.zELA * NH_val * np.power(np.maximum(shape, 0.0), self.gamma)
+    H[mask] = H_scale * np.power(np.maximum(shape, 0.0), self.gamma)
     return H
 
 
 def _plot(self, ax=None, *, solution: Optional[Solution] = None,
           n_points: int = 3000, show_ela: bool = True,
           show_thickness: bool = True, show_bedrock: bool = True,
-          topo_color='k', ice_color='#b0d6e2', ice_alpha: float = 0.55,
-          bedrock_color='#888888', bedrock_fade='auto',
+          topo_color='k', ice_color=COLORS['ice_fill'], ice_alpha: float = 0.55,
+          bedrock_color=COLORS['bed'], bedrock_fade='auto',
           bedrock_alpha: float = 0.6,
           label: Optional[str] = None):
     """Plot the steady-state surface and (optionally) the ice column.
@@ -192,13 +203,14 @@ def _plot(self, ax=None, *, solution: Optional[Solution] = None,
     Parameters
     ----------
     ax : matplotlib.axes.Axes, optional
-        Axis to draw into; a new 8x3-inch figure is created when None.
+        Axis to draw into; a new 6x2.25-inch figure is created when None.
     solution : Solution, optional
         Steady state to draw. Defaults to ``primary``.
     n_points : int, optional
         Sample count for the surface profile. Default 3000.
     show_ela : bool, optional
-        Draw the ELA as a dashed horizontal red line. Default True.
+        Draw the ELA as a dashed horizontal line in siim's ELA colour,
+        ``COLORS['ela']``. Default True.
     show_thickness : bool, optional
         Fill the ice column (bed to surface) and draw the sub-ice bed
         line. Default True.
@@ -208,11 +220,13 @@ def _plot(self, ax=None, *, solution: Optional[Solution] = None,
         Line color for the topographic surface and sub-ice bed.
         Default ``'k'``.
     ice_color : color, optional
-        Fill color of the ice column. Default ``'#b0d6e2'``.
+        Fill color of the ice column. Default: the model plotters' ice-fill
+        colour, so the two families of plots match.
     ice_alpha : float, optional
         Opacity of the ice fill. Default 0.55.
     bedrock_color : color, optional
-        Fill color of the bedrock. Default ``'#888888'``.
+        Fill color of the bedrock. Default ``COLORS['bed']``, the model
+        plotters' bed colour.
     bedrock_fade : float | 'auto' | None
         Vertical e-folding scale [m] for the bedrock alpha fade below the
         bedrock surface. ``'auto'`` picks 0.25 * relief. ``None`` falls back
@@ -236,7 +250,7 @@ def _plot(self, ax=None, *, solution: Optional[Solution] = None,
     import matplotlib.pyplot as plt  # lazy: keep the module headless-importable
 
     if ax is None:
-        _, ax = plt.subplots(figsize=(8, 3))
+        _, ax = plt.subplots(figsize=(6, 2.25), layout='constrained')
 
     sol = solution if solution is not None else self.primary
     x, z = self.profile(n_points=n_points, solution=sol)
@@ -262,7 +276,7 @@ def _plot(self, ax=None, *, solution: Optional[Solution] = None,
                  show_thickness=show_thickness and has_glacier, label=label)
 
     if show_ela:
-        ax.axhline(self.zELA, color='r', lw=0.8, ls='--', zorder=-1)
+        ax.axhline(self.zELA, color=COLORS['ela'], lw=0.8, ls='--', zorder=-1)
 
     ax.set_xlabel('Distance from divide (km)')
     ax.set_ylabel('Elevation (m)')
@@ -313,19 +327,23 @@ def _draw_bedrock(ax, x, zb, z, *, color, fade, alpha_max):
 
 
 def draw_profile(ax, x, surface, bed, *, ice_x_range=None,
-                 topo_color='k', ice_color='#b0d6e2', ice_alpha=0.55,
-                 bedrock_color='#888888', bedrock_fade='auto',
+                 topo_color='k', ice_color=COLORS['ice_fill'], ice_alpha=0.55,
+                 bedrock_color=COLORS['bed'], bedrock_fade='auto',
                  bedrock_alpha=0.6, show_bedrock=True, show_thickness=True,
                  label=None):
     """Render a steady-state profile in the paper's canonical visual language:
     a depth-faded bedrock fill below ``bed``, the ice column shaded between
     ``bed`` and ``surface``, the topographic surface line, and the sub-ice bed
     line. The single source of truth behind both ``GeneralProfile.plot`` and
-    ``analytical_steady_state_solution.plot``.
+    ``analytical_steady_state_solution.plot`` (and the elevation panel of
+    its ``plot_profile``); the fills default to the model plotters' ice and
+    bed colours, and this depth-faded bed is the one place a bed is not a
+    flat translucent fill.
 
     ``x``, ``surface``, ``bed`` are in metres (``x`` strictly increasing;
     plotted in km). ``bed`` is the channel-floor datum (``surface -
-    HC_OVER_H*H`` under ice, ``surface`` where ice-free). ``ice_x_range`` =
+    hc_over_H*H`` under ice, ``surface`` where ice-free; the caller's datum,
+    ``HC_OVER_H`` for ``GeneralProfile.plot``). ``ice_x_range`` =
     ``(x_lo, x_hi)`` in metres bounds the sub-ice bed line — H -> 0 at the
     glacier endpoints, so a geometric extent draws cleaner than an ``H > 0``
     mask; ``None`` draws it wherever ``surface > bed``. ``show_thickness`` is
@@ -367,6 +385,19 @@ def _repr(self):
 # ---------------------------------------------------------------------------
 # General solution (arbitrary exponents)
 # ---------------------------------------------------------------------------
+
+def _default_xo(obj):
+    """The default hillslope cutoff ``xo = L/1000`` follows ``L`` across a
+    mutate-then-``solve()`` (audit #59); an ``xo`` the user set, at
+    construction or by assignment since, is kept."""
+    if obj.xo != obj._xo_seen:
+        obj._xo_arg = obj.xo
+    if obj._xo_arg is None:
+        obj.xo = obj.L / 1000.0
+    if not 0 < obj.xo < obj.L:
+        raise ValueError(f'xo ({obj.xo}) must be in (0, L={obj.L})')
+    obj._xo_seen = obj.xo
+
 
 class GeneralProfile:
     """General steady-state coupled glacial-fluvial profile (steepness-in).
@@ -453,6 +484,7 @@ class GeneralProfile:
         if missing:
             raise TypeError(f'missing required parameter(s): {missing}')
 
+        self._xo_arg = xo
         if xo is None:
             xo = L / 1000.0
         if not 0 < xo < L:
@@ -465,6 +497,7 @@ class GeneralProfile:
         self.zELA = float(zELA)
         self.L = float(L)
         self.xo = float(xo)
+        self._xo_seen = self.xo
         self.d = float(d)
         self.sigma = float(sigma)
         self.phi = float(phi)
@@ -488,6 +521,7 @@ class GeneralProfile:
         call it again after mutating a parameter attribute (e.g. ``self.zELA``)
         to refresh the object (construct-then-mutate-then-``solve()``;
         idempotent; audit m27)."""
+        _default_xo(self)
         self.gamma = self.phi if self._gamma_arg is None else float(self._gamma_arg)
         self.dtheta = self.d * self.theta
         # d*phi = 1 (the marginal-Coulomb singularity) is handled exactly by
@@ -698,13 +732,17 @@ class GeneralProfile:
         -------
         float
             The H/zELA scale; NaN when there is no glacier (Lt non-finite
-            or Lt <= xo).
+            or Lt <= xo), inf at zELA = 0.
         """
+        return _over_zela(self._H_scale(Lt), self.zELA)
+
+    def _H_scale(self, Lt: Optional[float] = None) -> float:
+        """zELA * NH, the thickness scale [m] (finite at zELA = 0)."""
         if Lt is None:
             Lt = self.Lt
         if not math.isfinite(Lt) or Lt <= self.xo:
             return float('nan')
-        return (self.kH / self.zELA) * Lt ** self.Lambda
+        return self.kH * Lt ** self.Lambda
 
     # ------------------------------------------------------------------
     # Accumulation-area ratio
@@ -730,7 +768,8 @@ class GeneralProfile:
                     u_ELA^k = 1 - I^{-1}_{1-lam}(1-phi, (1-dphi)/k) is the same in
                     the xo -> 0 limit (and only when (1-dphi)/k > 0); the head
                     offset is not always negligible, so the root-find is preferred
-                    and also covers the nudged marginal case.
+                    and also covers the marginal case d*phi = 1 (b = 0), exact
+                    through ``_G``.
         """
         if surface == 'powerlaw':
             return self.lam
@@ -982,6 +1021,7 @@ class MarginalCoulombProfile:
         if missing:
             raise TypeError(f'missing required parameter(s): {missing}')
 
+        self._xo_arg = xo
         if xo is None:
             xo = L / 1000.0
         if not 0 < xo < L:
@@ -1001,6 +1041,7 @@ class MarginalCoulombProfile:
         self.L = float(L)
         self.sigma = float(sigma)
         self.xo = float(xo)
+        self._xo_seen = self.xo
         self.k = float(k)
         self.Ac = float(Ac)
         self.alpha_g = float(alpha_g)
@@ -1016,6 +1057,7 @@ class MarginalCoulombProfile:
         attributes. Called by ``__init__``; call it again after mutating a
         parameter attribute (e.g. ``self.zELA``) to refresh the object
         (construct-then-mutate-then-``solve()``; idempotent; audit m27)."""
+        _default_xo(self)
         _validate_common(self)
         _require(self.beta > 0, f'beta must be > 0, got {self.beta}')
         _require(self.tau_c > 0, f'tau_c must be > 0, got {self.tau_c}')
@@ -1172,8 +1214,12 @@ class MarginalCoulombProfile:
         -------
         float
             The H/zELA scale; NaN when there is no glacier (or when
-            lam = 0, i.e. no ice flux).
+            lam = 0, i.e. no ice flux), inf at zELA = 0.
         """
+        return _over_zela(self._H_scale(Lt), self.zELA)
+
+    def _H_scale(self, Lt: Optional[float] = None) -> float:
+        """zELA * NH, the thickness scale [m] (finite at zELA = 0)."""
         if Lt is None:
             Lt = self.Lt
         if not math.isfinite(Lt) or Lt <= self.xo:
@@ -1187,7 +1233,7 @@ class MarginalCoulombProfile:
         denom = ((self.cs / lam_tau) ** 3
                  + self.lam_c * cg * lam_tau ** 2
                    / (self.kh * self.beta * self.lam * Go))
-        return (Lt / self.zELA) * denom ** (-1.0 / 3.0)
+        return Lt * denom ** (-1.0 / 3.0)
 
     # ------------------------------------------------------------------
     # Shared presentation methods (module-level implementations above)

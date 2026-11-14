@@ -6,7 +6,10 @@ strictly lower levels) and run each level under ``prange``: writes are
 disjoint and the per-node arithmetic replicates the serial eroders
 expression-for-expression, so the toggle must be BIT-FOR-BIT with the serial
 walk at any thread count. That exact equality is the whole contract — pin it
-over a multi-step glaciating run for both routings and both nonlinear laws.
+over a multi-step glaciating run for every level kernel (SFR; D-inf through the
+effective-receiver eroder, the ``slope_normalise`` default; D-inf through the
+per-receiver eroder, ``slope_normalise=False``) and every law (power, Coulomb,
+eff-exp at nu = 2, and its n = nu = 1 linear branch).
 """
 import numpy as np
 import pytest
@@ -34,12 +37,18 @@ def _cfg(**ov):
     return base
 
 
-@pytest.mark.parametrize("routing", ['single', 'dinf'])
-@pytest.mark.parametrize("law", ['power', 'coulomb'])
+@pytest.mark.parametrize("routing", ['single', 'dinf', 'dinf-raw'])
+@pytest.mark.parametrize("law", ['power', 'coulomb', 'eff-exp', 'linear'])
 def test_parallel_erode_bit_for_bit(routing, law):
     cfg = _cfg(flow_routing=routing)
+    if routing == 'dinf-raw':   # _erode_modeb_dinf_levels (the eff eroder otherwise; audit #9)
+        cfg.update(flow_routing='dinf', slope_normalise=False)
+    if law == 'eff-exp':        # the eff-exp nonlinear branch, nu = 2 (audit #9)
+        cfg.update(sliding_law='eff-exp')
     if law == 'coulomb':
         cfg.update(sliding_law='coulomb', tau_c=1.2e5, k=0.65)
+    if law == 'linear':     # n = nu = 1: the closed-form eroders and their guard (audit #7)
+        cfg.update(sliding_law='eff-exp', nu=1)
     # Both arms explicit: parallel_erode defaults ON (constants.PARALLEL_ERODE),
     # so the serial reference must be pinned, not left to the default.
     ref = siim2d(dict(cfg, parallel_erode=False)); ref.run()

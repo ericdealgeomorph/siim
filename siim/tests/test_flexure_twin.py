@@ -338,3 +338,62 @@ def test_flexure_three_way_beats_fortran():
     # the in-house is the accurate one: closer to the analytic truth by >=20x
     assert in_vs_k < ft_vs_k / 20.0, \
         f"in-house should beat fortran vs Kelvin: {in_vs_k:.3e} vs {ft_vs_k:.3e}"
+
+
+@pytest.mark.pin
+def test_footprint_ice_column_counts_each_section_once():
+    """The flexure ice load spreads each channel's cross-section alpha_g*H**2 over
+    its footprint (ED-184): an isolated wide valley keeps its section (the
+    per-cell section piled it on one cell, a full-cell cap kept 19 % of it), a
+    sub-cell valley keeps alpha_g*H**2/L on its own cell, and a broad cap loads
+    1.5*H*(1 - L^2/(12 R^2)) a cell where the per-cell section counted the
+    overlapping widths alpha_g*H/L times."""
+    from siim._core.step import footprint_ice_column
+    L, ag = 2e4 / 30, 12.0
+    H = np.zeros((31, 31))
+    H[15, :] = 300.0                                 # a straight valley, looped along it
+    col = footprint_ice_column(H, ag, L, L, wrap_y=False, wrap_x=True)
+    np.testing.assert_allclose(col.sum(axis=0) * L, ag * 300.0 ** 2, rtol=1e-12)
+    assert np.count_nonzero(col[:, 0]) > 1           # spread across the valley
+    H[15, :] = 30.0                                  # W = 360 m < L
+    col = footprint_ice_column(H, ag, L, L, wrap_x=True)
+    np.testing.assert_allclose(col[15], ag * 30.0 ** 2 / L, rtol=1e-12)
+    assert np.count_nonzero(col[14]) == 0
+    R = 0.5 * ag * 500.0
+    col = footprint_ice_column(np.full((31, 31), 500.0), ag, L, L)
+    np.testing.assert_allclose(col, 1.5 * 500.0 * (1 - L ** 2 / (12 * R ** 2)), rtol=1e-12)
+
+
+@pytest.mark.pin
+def test_flexure_is_periodic_along_a_looped_axis():
+    """A looped axis is an infinitely long source, so the plate is periodic
+    along it (ED-181): moving the seam moves the deflection with it (the
+    held-flat solve changed it by a quarter to a third of its maximum), a
+    uniform load on a doubly looped grid is Airy-compensated, and a Fourier mode
+    deflects by q / (rho_a g + D k^4) exactly."""
+    ny, nx, dx = 31, 41, 500.0
+    rhos, rhoa, Te = 2800.0, 3200.0, 20e3
+
+    def w_of(diff, ibc, **kw):
+        n_y, n_x = diff.shape
+        post, eq = diff.ravel().copy(), np.zeros(n_x * n_y)
+        flexure(post, eq, n_x, n_y, dx * (n_x - 1), dx * (n_y - 1), rhos, rhoa, Te, ibc, **kw)
+        return (post - diff.ravel()).reshape(n_y, n_x)
+
+    q = np.random.default_rng(0).normal(0.0, 50.0, (ny, nx))
+    w = w_of(q, 101, wrap_y=True)                      # x fixed, y looped
+    for k in (3, 11):
+        np.testing.assert_allclose(np.roll(w_of(np.roll(q, k, 0), 101, wrap_y=True), -k, 0),
+                                   w, rtol=0, atol=1e-12)
+    # the x-looped path is the y-looped one transposed (ibc 1010: y fixed, x looped)
+    np.testing.assert_allclose(w_of(q.T, 1010, wrap_x=True).T, w, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(w_of(np.full((ny, nx), 2.0), 0, wrap_y=True, wrap_x=True),
+                               -2.0 * rhos / rhoa, rtol=1e-12)
+    D = _YOUNG * Te ** 3 / (12 * (1 - _POISSON ** 2))
+    for axis, n, m in ((1, nx, 3), (0, ny, 2)):     # the half (x) and full (y) spectra
+        k = 2 * np.pi * m / (n * dx)
+        mode = np.cos(k * dx * np.arange(n))
+        diff = np.broadcast_to(mode if axis else mode[:, None], (ny, nx)).copy()
+        np.testing.assert_allclose(w_of(diff, 0, wrap_y=True, wrap_x=True),
+                                   -diff * rhos * _G / (rhoa * _G + D * k ** 4),
+                                   rtol=0, atol=1e-15)

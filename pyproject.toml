@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "siim-lem"
-version = "0.9.10"
+version = "0.10.0"
 description = "Sliding Ice Incision Model (siim): coupled glacial-fluvial landscape evolution."
 readme = "README.md"
 authors = [
@@ -58,6 +58,15 @@ dependencies = [
 # PyPI wheel — the validated adapter env is conda:
 #   conda env create -f environment.yml
 fastscape = ["fastscape", "xarray-simlab"]
+# OPTIONAL speed: numba's TBB threading layer, which siim picks over workqueue
+# whenever numba can load it (bit-for-bit; docs/getting_started/install.md).
+# PyPI's tbb ships wheels for x86_64 Linux, Windows and Intel Macs only (none
+# for Apple silicon or ARM Linux), so the marker skips it there and
+# `pip install siim-lem[tbb]` still succeeds; conda-forge's tbb covers every
+# platform (environment.yml). numba needs TBB 2021.6 or later. In a Linux venv
+# numba finds pip's libtbb only with "$VIRTUAL_ENV/lib" on LD_LIBRARY_PATH (tested
+# 2026-11-12, numba 0.68); without it siim runs on workqueue.
+tbb = ["tbb>=2021.6; platform_machine == 'x86_64' or platform_machine == 'AMD64'"]
 test = [
     "pytest",
     # High-precision oracle used by the analytical profile tests.

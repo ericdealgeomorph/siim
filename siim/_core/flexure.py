@@ -10,7 +10,8 @@ Thin elastic plate on an inviscid asthenosphere,
     \qquad D = \frac{E\,T_e^3}{12\,(1-\nu^2)},
 
 solved spectrally on the **native (ny, nx) grid** (no quarter-grid resample) in a
-**type-2 sine basis (DST-II)** on the padded box: transfer
+**type-2 sine basis (DST-II)** on the padded box along each non-looped axis
+(a looped axis is periodic, below): transfer
 :math:`\hat w = \hat q / (\rho_a g + D|k|^4)` with :math:`|k|^2 = k_x^2 + k_y^2`,
 :math:`k_x = \pi j/(N_x\,d_x)` and :math:`k_y = \pi i/(N_y\,d_y)` for
 modes :math:`i, j = 1 \ldots N`, evaluated with ``scipy.fft`` dstn/idstn
@@ -42,6 +43,11 @@ needs no regime switch
   uniform uplift of the WHOLE box (+3.5 m per 100 kyr wave step on a
   2500 x 250 km domain, an untouched far plateau rising 290 -> 1460 m).
 
+A looped axis (``wrap_y`` / ``wrap_x``) is an infinitely long source, so the
+plate is periodic along it: real-FFT modes there (the mean mode is Airy), the
+sine basis on the other axis, no padding along the loop (Eric's ruling, ED-181;
+``flexure-looped-edges`` in the parameter reference).
+
 Key differences from the fortran (both by design):
 
 * **native grid.** The fortran resamples the domain onto the central quarter of
@@ -55,10 +61,10 @@ Key differences from the fortran (both by design):
   the in-house diverges from fortran BY DESIGN and instead tracks the
   closed-form point-load solution.
 
-Same call signature as the fortran seam
-``flexure(elev_post, elev_eq, nx, ny, xl, yl, rhos, rhoa, Te, ibc)`` -- mutates
-``elev_post`` in place (adds the deflection ``w``) -- so it drops into the S1
-injection seam (:func:`siim._core.step.glacial_flexure_step`) unchanged.
+Called as ``flexure(elev_post, elev_eq, nx, ny, xl, yl, rhos, rhoa, Te, ibc,
+wrap_y=False, wrap_x=False)`` -- the fortran seam's signature plus the two wrap
+flags -- it mutates ``elev_post`` in place (adds the deflection ``w``);
+:func:`siim._core.step.glacial_flexure_step` injects it.
 
 numpy/scipy only -- no fastscape/xsimlab imports (framework-free core).
 """
@@ -73,15 +79,18 @@ _POISSON = 0.25        # Poisson ratio
 _G = 9.81              # gravity [m s^-2] -- fortran's flexure g (NOT constants.GRAVITY)
 
 
-def _pad_load(load, free_top, free_bottom, free_left, free_right):
+def _pad_load(load, free_top, free_bottom, free_left, free_right, wrap_y=False,
+              wrap_x=False):
     """Embed ``load`` (ny, nx) in a >=2x, fast-FFT-length grid: mirror-reflect
     the load across each FREE (no-reflection at fixed) edge -- a symmetric
     extension that gives the zero-gradient (free) plate edge the fortran ``addw``
     reflection imposes -- and zero-pad the fixed edges (clamped far field) plus
     the anti-wraparound buffer. Returns ``(padded, off_y, off_x)`` where the
-    native block sits at ``padded[off_y:off_y+ny, off_x:off_x+nx]``.
+    native block sits at ``padded[off_y:off_y+ny, off_x:off_x+nx]``. A looped
+    axis (``wrap_y`` / ``wrap_x``) is left at its native length with offset 0:
+    the plate is periodic there, so it is neither padded nor clamped.
 
-    WARNING -- since the sine basis the pad RATIO is physics, not just a
+    WARNING -- on a non-looped axis the pad RATIO is physics, not just a
     numerical buffer: the padded box's outer edge is where the sine basis clamps
     ``w = 0``, so it sets how far from the load the plate is held flat, which IS
     the small-domain rigidity support. Measured on the 31x31 / 20 km all-free
@@ -92,8 +101,10 @@ def _pad_load(load, free_top, free_bottom, free_left, free_right):
     a = load
     off_y = 0
     off_x = 0
-    for axis, (n, free_lo, free_hi) in enumerate(
-            ((ny, free_top, free_bottom), (nx, free_left, free_right))):
+    for axis, (n, free_lo, free_hi, wrap) in enumerate(
+            ((ny, free_top, free_bottom, wrap_y), (nx, free_left, free_right, wrap_x))):
+        if wrap:                    # a looped axis is periodic: no pad, no clamp
+            continue
         big = fft.next_fast_len(2 * n)
         pad = big - n
         lo = pad // 2
@@ -120,19 +131,27 @@ def _pad_load(load, free_top, free_bottom, free_left, free_right):
 
 
 @lru_cache(maxsize=2)
-def _transfer(Ny, Nx, dy, dx, D, rhoa):
+def _transfer(Ny, Nx, dy, dx, D, rhoa, wrap_y=False, wrap_x=False):
     """``rho_a g + D |k|^4`` on the padded (Ny, Nx) box: DST-II mode j has
-    wavenumber ``pi*j/(N*d)``, j = 1..N (module docstring). Cached because it is
-    about a quarter of a solve and identical every step of a run; read-only so a
-    cached array can never be corrupted in place."""
-    ky = (np.pi * np.arange(1, Ny + 1) / (Ny * dy))[:, None]
-    kx = (np.pi * np.arange(1, Nx + 1) / (Nx * dx))[None, :]
+    wavenumber ``pi*j/(N*d)``, j = 1..N (module docstring); a looped axis carries
+    the real-FFT wavenumbers ``2*pi*m/(N*d)`` instead (period N*d, the seam one
+    spacing long; m = 0 the mean, Airy-compensated), the last looped axis as the
+    rfft's half spectrum (scipy's rfftn convention). Cached because it is about a
+    quarter of a solve and identical every step of a run; read-only so a cached
+    array can never be corrupted in place."""
+    def k(n, d, wrapped, half):
+        if not wrapped:
+            return np.pi * np.arange(1, n + 1) / (n * d)
+        return 2.0 * np.pi * (np.fft.rfftfreq(n, d) if half else np.fft.fftfreq(n, d))
+    ky = k(Ny, dy, wrap_y, half=wrap_y and not wrap_x)[:, None]
+    kx = k(Nx, dx, wrap_x, half=wrap_x)[None, :]
     t = rhoa * _G + D * (kx ** 2 + ky ** 2) ** 2
     t.setflags(write=False)
     return t
 
 
-def flexure(elev_post, elev_eq, nx, ny, xl, yl, rhos, rhoa, Te, ibc):
+def flexure(elev_post, elev_eq, nx, ny, xl, yl, rhos, rhoa, Te, ibc,
+            wrap_y=False, wrap_x=False):
     """Flexural deflection of the elastic plate under the load implied by
     ``elev_post - elev_eq`` (the per-step loading increment the caller stacked
     into ``elev_post``); the deflection ``w`` is ADDED to ``elev_post`` in place
@@ -142,7 +161,11 @@ def flexure(elev_post, elev_eq, nx, ny, xl, yl, rhos, rhoa, Te, ibc):
     ``elev_post`` / ``elev_eq`` / ``rhos`` are flat length-``nx*ny`` arrays (row-
     major, x fastest, as fastscape passes them); ``rhoa`` asthenospheric density;
     ``Te`` effective elastic thickness; ``ibc`` the fastscapelib boundary code.
-    ``dx = xl/(nx-1)``, ``dy = yl/(ny-1)``."""
+    ``dx = xl/(nx-1)``, ``dy = yl/(ny-1)``. ``wrap_y`` / ``wrap_x`` mark looped
+    axes: the plate is periodic along them (a looped axis is an infinitely long
+    source, so the load repeats along it), a Fourier basis there and the sine
+    basis on the others; with neither looped the solve is the sine-basis one,
+    bit-for-bit (ED-181)."""
     dx = xl / (nx - 1)
     dy = yl / (ny - 1)
     D = _YOUNG * Te ** 3 / (12.0 * (1.0 - _POISSON ** 2))
@@ -167,10 +190,20 @@ def flexure(elev_post, elev_eq, nx, ny, xl, yl, rhos, rhoa, Te, ibc):
     free_left = cbc[3] == '0'
     free_right = cbc[1] == '0'
 
-    lp, oy, ox = _pad_load(load, free_top, free_bottom, free_left, free_right)
+    lp, oy, ox = _pad_load(load, free_top, free_bottom, free_left, free_right,
+                           wrap_y, wrap_x)
     Ny, Nx = lp.shape
     # scalar Te / rhoa only (the cache key); per-cell lithos density stays in rhos2
-    w_hat = fft.dstn(lp, type=2, workers=-1) / _transfer(Ny, Nx, dy, dx, float(D), float(rhoa))
-    w = fft.idstn(w_hat, type=2, workers=-1)[oy:oy + ny, ox:ox + nx]
+    if not (wrap_y or wrap_x):
+        w_hat = fft.dstn(lp, type=2, workers=-1) / _transfer(Ny, Nx, dy, dx, float(D), float(rhoa))
+        w = fft.idstn(w_hat, type=2, workers=-1)[oy:oy + ny, ox:ox + nx]
+    else:
+        sine = [ax for ax, w_ in ((0, wrap_y), (1, wrap_x)) if not w_]
+        loop = [ax for ax, w_ in ((0, wrap_y), (1, wrap_x)) if w_]
+        a = fft.dstn(lp, type=2, axes=sine, workers=-1) if sine else lp
+        a = fft.rfftn(a, axes=loop, workers=-1)
+        a = a / _transfer(Ny, Nx, dy, dx, float(D), float(rhoa), bool(wrap_y), bool(wrap_x))
+        a = fft.irfftn(a, s=[lp.shape[ax] for ax in loop], axes=loop, workers=-1)
+        w = (fft.idstn(a, type=2, axes=sine, workers=-1) if sine else a)[oy:oy + ny, ox:ox + nx]
 
     elev_post += w.ravel()

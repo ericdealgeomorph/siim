@@ -9,7 +9,8 @@ mismatch is a real ordering/state bug (never tolerance it; plan S3 escalation
 rule).
 
 Compared: ``z_out, zb_out, H_out`` (+ ``rebound_out`` where flexure,
-``sediment_*`` where tracked) plus the deterministic float fields
+``sediment_*`` where tracked, ``closure_Qg_out`` under a transect
+``closure_flux``) plus the deterministic float fields
 ``Qg/Qf/area/erosion_rate/denudation`` — a strictly stronger gate at zero
 risk. EXCLUDED: ``basin_out`` (nondeterministic fortran labels, Map 4 §4) and
 ``receivers/stack`` (the xsimlab store's integer NaN-decode artifact, the S0
@@ -51,6 +52,9 @@ def _assert_pair(params, cls=siim2d):
     the ``adapter`` marker."""
     pytest.importorskip('xsimlab')
     pytest.importorskip('fastscape')
+    # the model the adapter runs: one fresh pass (siim2d's B/C default iterates);
+    # the opt-in closure rows on, so the twin compares closure_Qg_out
+    params = {'inner_passes': 1, 'inner_relax': 1.0, 'save_closure_pair': True, **params}
     a = cls(params); a.run(driver='xsimlab')
     b = cls(params); b.run(driver='inhouse')
     fields = list(_FIELDS)
@@ -61,6 +65,10 @@ def _assert_pair(params, cls=siim2d):
         fields += ['sediment_flux_out', 'eroded_volume_out']
     if track in ('edge', 'both'):
         fields += ['sediment_edge_flux_out', 'sediment_edge_cumulative_out']
+    # the closure-flux row (a transect closure_flux): both drivers write it
+    assert (a.closure_Qg_out is None) == (b.closure_Qg_out is None)
+    if b.closure_Qg_out is not None:
+        fields.append('closure_Qg_out')
     for name in fields:
         xa, xb = getattr(a, name), getattr(b, name)
         assert xa.shape == xb.shape, f"{name}: shape {xa.shape} vs {xb.shape}"
@@ -82,7 +90,7 @@ def _assert_pair(params, cls=siim2d):
 @pytest.mark.parametrize('mode', ['A', 'B', 'C'])
 def test_driver_matrix(mode, routing, flexure):
     """{A,B,C} x {SFR,dinf} x {flexure off/on}: bit-for-bit at every frame.
-    Mode C = B + carve + the mode-C standard (trunk_surface, routing_relax)."""
+    Mode C = B + carve + the mode-C standard (trunk_surface)."""
     _assert_pair(dict(_BASE, mode=mode, flow_routing=routing,
                       flexure=flexure, ice_load=flexure))
 

@@ -222,7 +222,7 @@ def test_incomplete_beta_negative_b_quadrature():
     from scipy.integrate import quad
     for a, b in [(0.5, -0.7), (1.2, -2.4), (0.5, -1.0), (0.5, -2.0)]:
         for x in (0.2, 0.6, 0.9):
-            want, _ = quad(lambda t: t ** (a - 1) * (1 - t) ** (b - 1),
+            want, _ = quad(lambda t, a=a, b=b: t ** (a - 1) * (1 - t) ** (b - 1),
                            0, x, limit=400)
             np.testing.assert_allclose(incomplete_beta(x, a, b), want,
                                        rtol=1e-8)
@@ -287,6 +287,25 @@ def test_incomplete_beta_compl_divergent_tail():
     # eps = 1 -> B(0; .) = 0 on all branches
     for b in (2.5, 0.0, -0.7, -2.0):
         assert incomplete_beta_compl(1.0, 0.5, b) == 0.0
+
+
+def test_incomplete_beta_is_inf_at_one_for_nonpositive_b():
+    """B(1; a, b <= 0) diverges for every a > 0, as the docstring says. At a >= 1
+    and b <= -1 the recurrence returned inf - inf = NaN there (audit #63)."""
+    for a, b in [(1.5, -1.0), (2.5, -2.0), (1.0, -1.0), (3.0, -2.5), (0.5, -1.0), (1.5, 0.0)]:
+        assert incomplete_beta(1.0, a, b) == np.inf
+    got = incomplete_beta(np.array([0.9, 1.0]), 1.0, -1.0)   # B(0.9; 1, -1) = 1/0.1 - 1
+    assert got[0] == pytest.approx(9.0) and got[1] == np.inf
+
+
+def test_incomplete_beta_compl_is_inf_at_zero_for_nonpositive_b():
+    """The complement form diverges the same way at eps = 0 (x = 1); it
+    returned the same inf - inf = NaN at a >= 1, b <= -1."""
+    from siim.analytical import incomplete_beta_compl
+    for a, b in [(1.5, -1.0), (3.0, -2.5), (0.5, -1.0), (1.5, 0.0)]:
+        assert incomplete_beta_compl(0.0, a, b) == np.inf
+    got = incomplete_beta_compl(np.array([0.1, 0.0]), 1.0, -1.0)   # B(0.9; 1, -1) = 9
+    assert got[0] == pytest.approx(9.0) and got[1] == np.inf
 
 
 def test_incomplete_beta_guards():
@@ -428,11 +447,14 @@ def test_aar_truncated_at_base_level():
     r2 = g2.aar('powerlaw')
     assert np.isfinite(r2.aar)
 
-    # sigma = 0 -> lam = 0: crossing collapses to the divide, aar = 0
-    g3 = GeneralProfile(ks=100, cs=150, zELA=650, L=1e5, sigma=0.0)
-    if g3.regime in ('mixed', 'glacial'):
-        r3 = g3.aar('powerlaw')
-        assert r3.aar == 0.0 and np.isinf(r3.Aa_over_Ac)
+    # sigma = 0 -> lam = 0: crossing collapses to the divide, aar = 0. At
+    # sigma = 0 this set is glacial only for zELA ~1040-1240 m; at 650 the
+    # closure has no root (regime None) and the branch never ran (audit #64)
+    g3 = GeneralProfile(ks=100, cs=150, zELA=1150, L=1e5, sigma=0.0)
+    assert g3.regime == 'glacial'
+    r3 = g3.aar('powerlaw')
+    # gate: was behind `if g3.regime in (...)`, which never held (audit #64)
+    assert r3.aar == 0.0 and np.isinf(r3.Aa_over_Ac)
 
 
 def test_eta_bar_consistency_check():
@@ -532,6 +554,61 @@ def test_zela_zero_queryable():
     m = MarginalCoulombProfile(ks=100.0, cs=150.0, zELA=0.0, L=1e5)
     assert 'MarginalCoulombProfile' in repr(m)
     np.testing.assert_allclose(g.Lt, m.Lt, rtol=1e-9)
+
+
+def test_zela_zero_has_a_finite_thickness():
+    """At zELA = 0 the thickness is finite (NH = H/zELA is infinite): the
+    profiles and the steady-state front end build it instead of raising
+    ZeroDivisionError (audit #57)."""
+    from siim.analytical.steady_state import SteadyStateProfile
+    x = np.linspace(0.0, 1e5, 201)
+    for cls in (GeneralProfile, MarginalCoulombProfile):
+        p = cls(ks=100.0, cs=150.0, zELA=0.0, L=1e5)
+        H = p.thickness(x)
+        assert np.isfinite(H).all() and H.max() > 0.0
+        assert np.isinf(p.NH())
+    ss = SteadyStateProfile({'zELA': 0.0})
+    assert np.isfinite(ss.analytical_ice_thickness(np.linspace(0.0, 1.0, 11))).all()
+
+
+@pytest.mark.pin
+@pytest.mark.parametrize('a', [0.5, 0.25, 0.9])
+@pytest.mark.parametrize('eps', [1e-6, 1e-3, 0.1, 0.4])
+def test_incomplete_beta_is_continuous_through_b_zero(a, eps):
+    """b = (1 - d*phi)/k one rounding step off 0 (a phi from np.arange) gives
+    the b = 0 value to rounding, not an O(1) error: the reflection and the
+    recurrence each subtracted two ~1/b terms (audit #56)."""
+    from siim.analytical.core import incomplete_beta_compl
+    b0 = incomplete_beta_compl(eps, a, 0.0)
+    for b in (4.4e-16, -4.4e-16, 1.1e-16, -1e-13):
+        assert abs(incomplete_beta_compl(eps, a, b) - b0) <= 1e-12 * abs(b0)
+
+
+def test_incomplete_beta_small_b_matches_mpmath():
+    """Against 50-digit quadrature on both sides of the small-b switch."""
+    mp = pytest.importorskip('mpmath')
+    from siim.analytical.core import _b_small, incomplete_beta_compl
+    with mp.workdps(50):
+        for a in (0.5, 0.05, 1.7):
+            s = _b_small(a)
+            # near 0, both sides of the switch, and the recurrence's hand-off
+            # into the small-b form (b = -1 -+ delta)
+            for b in (1e-10, -1e-10, 0.98 * s, -0.98 * s, 1.02 * s, -1.02 * s,
+                      -1.0 + 1e-14, -1.0 - 1e-14):
+                for eps in (1e-6, 0.1, 0.3, 0.4):
+                    want = float(mp.betainc(a, b, 0, 1 - mp.mpf(eps)))
+                    got = incomplete_beta_compl(eps, a, b)
+                    assert abs(got - want) <= 1e-11 * abs(want), (a, b, eps, got, want)
+
+
+def test_profile_is_continuous_in_phi_through_d_phi_one():
+    """GeneralProfile at phi one ULP either side of 1/d returns the marginal
+    profile (Lt was 99715 m against 32548 m before the fix)."""
+    ref = GeneralProfile(ks=100.0, cs=150.0, zELA=650.0, L=1e5, phi=0.5)
+    for phi in (np.arange(0.3, 0.71, 0.01)[20], 0.49999999999999994):
+        assert phi != 0.5
+        g = GeneralProfile(ks=100.0, cs=150.0, zELA=650.0, L=1e5, phi=phi)
+        np.testing.assert_allclose(g.Lt, ref.Lt, rtol=1e-9)
 
 
 def test_front_end_inherits_kernel():
@@ -711,3 +788,146 @@ def test_ce_ell_collapse_at_fixed_sliding_speed(law):
         assert alt.zo == pytest.approx(ref.zo, rel=1e-10)
         assert alt.Lt == pytest.approx(ref.Lt, rel=1e-10)
         np.testing.assert_allclose(alt.surface, ref.surface, rtol=1e-10)
+
+
+def test_solve_rederives_after_any_input_changes():
+    """solve() re-ran only the root solve, so a mutated input mixed with stale
+    derived values (K, Co, lam, the grid); a GeneralProfile's default xo stayed
+    at the old L/1000 (audit #59). Each case now matches a fresh build."""
+    from siim.analytical import GeneralProfile, MarginalCoulombProfile, SteadyStateProfile
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        for change in ({'Ko': 4e-6}, {'k': 3.0}, {'nu': 1.5}, {'L': 8e4}):
+            s = SteadyStateProfile({'zELA': 1500.0})
+            for name, value in change.items():
+                setattr(s, name, value)
+            s.solve()
+            fresh = SteadyStateProfile({'zELA': 1500.0, **change})
+            assert s.glacier_flag == fresh.glacier_flag, change
+            np.testing.assert_allclose(s.x, fresh.x)
+            if fresh.surface is not None:
+                np.testing.assert_allclose(s.surface, fresh.surface, rtol=1e-12)
+        s = SteadyStateProfile({'zELA': 1500.0})
+        zT = s.zT - 300.0
+        s.zT = zT
+        s.solve()
+        assert s.zELA == SteadyStateProfile({'zT': zT}).zELA == zT - s.P / s.beta
+    for cls in (GeneralProfile, MarginalCoulombProfile):
+        g = cls(ks=100, cs=150, zELA=650, L=1e5)
+        g.L = 2e5
+        g.solve()
+        fresh = cls(ks=100, cs=150, zELA=650, L=2e5)
+        assert g.xo == fresh.xo == 200.0
+        assert g.regime == fresh.regime
+        np.testing.assert_allclose(g.Lt, fresh.Lt, rtol=1e-12)
+    g = GeneralProfile(ks=100, cs=150, zELA=650, L=1e5, xo=300.0)
+    g.L = 2e5
+    g.solve()
+    assert g.xo == 300.0                     # an xo given is kept
+    g.L = 200.0
+    with pytest.raises(ValueError, match="xo"):
+        g.solve()                            # a kept xo past the new L is refused
+    s = SteadyStateProfile({'dx': 50.0})
+    s.nx = 201
+    s.solve()
+    assert s.x.size == 201 == SteadyStateProfile({'nx': 201}).x.size
+    s.zELA, s.zT = 1200.0, 2500.0
+    with pytest.raises(ValueError, match="not both"):
+        s.solve()
+    s = SteadyStateProfile({'zELA': 1500.0})
+    s.U = np.full(5, 1e-3)
+    with pytest.raises(TypeError, match="U must be a scalar"):
+        s.solve()
+
+
+@pytest.mark.parametrize("params, msg", [
+    ({'right_bc': 'fixed_value'}, "right_bc must be one of"),
+    ({'sliding_law': 'columb'}, "sliding_law must be one of"),
+    ({'sigma': 0.0}, "sigma must be finite and > 0"),
+])
+def test_steady_state_profile_refuses_bad_inputs(params, msg):
+    """A typo'd boundary condition crashed later on a missing attribute, an
+    unknown sliding law ran the power law, sigma = 0 divided by zero (audit #58)."""
+    from siim.analytical import SteadyStateProfile
+    with pytest.raises(ValueError, match=msg):
+        SteadyStateProfile(params)
+
+
+@pytest.mark.parametrize('bcs', [
+    {}, {'left_bc': 'reflecting', 'right_bc': 'base_level'}])
+def test_steady_state_plot_profile_matches_plot(bcs):
+    """plot_profile drew x as stored, so with base level on the right its
+    glacier sat at 26-50 km while plot() draws it from the divide at 0; and
+    its fixed 2*zELA top clipped the profile (1260 m against 1200 m at
+    zELA = 600; audit C6)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from siim.analytical import SteadyStateProfile
+    a = SteadyStateProfile({'zELA': 600.0, **bcs})
+    assert a.surface.max() > 2 * a.zELA, "test setup: the old top clips"
+    ax = a.plot(show_bedrock=False, label='topo')
+    topo = next(ln for ln in ax.lines if ln.get_label() == 'topo')
+    _, (panel,) = a.plot_profile('elevation')
+    # gate: plot_profile's elevation panel is now plot() itself, its line 'Surface'
+    surface = next(ln for ln in panel.lines if ln.get_label() == 'Surface')
+    # the same surface over the same x, whatever the order it is drawn in
+    drawn = []
+    for line in (topo, surface):
+        x, z = np.asarray(line.get_xdata()), np.asarray(line.get_ydata())
+        drawn.append((x[np.argsort(x)], z[np.argsort(x)]))
+    np.testing.assert_allclose(drawn[1][0], drawn[0][0])
+    np.testing.assert_allclose(drawn[1][1], drawn[0][1])
+    assert panel.get_ylim()[1] >= a.surface.max()
+    plt.close('all')
+
+
+def test_steady_state_plot_two_sided_bed_line_under_the_ice():
+    """With base level at both ends, plot() took the Lt range from the left
+    end, not the divide, so the sub-ice bed line lay at 0.3-9.45 km under an
+    ice column at 15.6-34.4 km, on an axis called distance from the divide
+    (audit #61, C7)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from siim.analytical import SteadyStateProfile
+    a = SteadyStateProfile({'left_bc': 'base_level', 'right_bc': 'base_level',
+                            'zELA': 1500.0, 'nx': 1001})
+    ax = a.plot(show_bedrock=False, label='topo')
+    ice_km = ax.collections[0].get_paths()[0].vertices[:, 0]
+    bed_km = next(ln for ln in ax.lines if ln.get_label() != 'topo').get_xdata()
+    assert ice_km.min() < a.L / 2e3 < ice_km.max()
+    assert ice_km.min() <= bed_km.min() and bed_km.max() <= ice_km.max()
+    assert bed_km.max() - bed_km.min() > 0.9 * (ice_km.max() - ice_km.min())
+    assert ax.get_xlabel() == 'x (km)'
+    plt.close(ax.figure)
+
+
+def test_analytical_plots_share_the_model_plotters_colours():
+    """The analytical ELA was red (plot) and goldenrod (plot_profile), its ice
+    a paler blue and its bed a neutral grey: they read the model plotters'
+    siim._palette.COLORS now (2026-11-05), still without importing
+    matplotlib at package import (test_light_import)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_hex
+    from siim._palette import COLORS
+    from siim.analytical import SteadyStateProfile
+    from siim.plotting._style import COLORS as PLOT_COLORS
+    assert PLOT_COLORS is COLORS                      # one table, re-exported
+    a = SteadyStateProfile({'zELA': 600.0})
+    for ax in (a.plot(show_bedrock=False),
+               GeneralProfile(ks=100.0, cs=150.0, zELA=300.0, L=1e5).plot(show_bedrock=False)):
+        ela = [ln for ln in ax.lines if len(set(ln.get_ydata())) == 1]
+        assert [to_hex(ln.get_color()) for ln in ela] == [COLORS['ela']]
+        assert to_hex(ax.collections[0].get_facecolor()[0]) == COLORS['ice_fill']
+        assert ax.figure.get_figwidth() == 6
+    fig, axes = a.plot_profile(['elevation', 'ice_thickness', 'water_flux'])
+    assert fig.get_figwidth() == 12
+    assert axes[1].get_ylabel() == 'Ice column depth (m)'     # surface - bed = hc*H
+    assert to_hex(axes[1].lines[0].get_color()) == COLORS['ice']
+    assert to_hex(axes[2].lines[0].get_color()) == COLORS['water_flux']
+    assert axes[-1].get_xlabel() == 'Distance from divide (km)'
+    plt.close('all')

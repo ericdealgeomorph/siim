@@ -163,6 +163,19 @@ def test_m24_scalar_boundary_status_initial_topo():
     assert ts.max() > 100.0                           # interior still high
 
 
+def test_scalar_boundary_status_runs_as_the_four_list():
+    """A scalar boundary_status is the 4-list everywhere, not only in the
+    initial topography: the uplift mask and the driver's initial surface used
+    to iterate the string's characters (audit #32)."""
+    runs = []
+    for bs in ('fixed_value', ['fixed_value'] * 4):
+        m = siim2d(_s2d(boundary_status=bs))
+        m.run()
+        runs.append(m)
+    assert runs[0].boundary_status == ['fixed_value'] * 4
+    assert np.array_equal(runs[0].zb_out, runs[1].zb_out)
+
+
 # --- m54: single-sourced xo default ------------------------------------------
 
 def test_m54_xo_single_sourced():
@@ -171,3 +184,104 @@ def test_m54_xo_single_sourced():
     p = _s1d(); p.pop('xo')                            # use the default, not the fixture's
     assert siim1d(p).xo == _C.XO
     assert SS({'zELA': 1000.0}).xo == _C.XO
+
+
+@pytest.mark.parametrize('bs, match', [
+    (['fixed'] * 4, 'sides must be one of'),                       # typo for fixed_value
+    (['fixed_value', None, 'looped', 'looped'], 'sides must be one of'),
+    (['looped', 'fixed_value', 'looped', 'looped'], "'looped' pairs"),
+    (['fixed_value', 'fixed_value', 'looped', 'fixed_value'], "'looped' pairs"),
+    ('core', "at least one 'fixed_value'"),
+    (['looped'] * 4, "at least one 'fixed_value'"),
+    (['fixed_value'] * 3, 'one value or four'),
+])
+def test_boundary_status_is_validated(bs, match):
+    """A typo, an unpaired 'looped' side or a domain with no outlet used to run
+    silently (nothing drained, or a half-periodic seam; audit #1, #15, #16)."""
+    with pytest.raises(ValueError, match=match):
+        siim2d(_s2d(boundary_status=bs))
+
+
+def test_boundary_status_accepts_the_supported_sets():
+    """Each supported form becomes the [left, right, bottom, top] list of str,
+    in order (the wrap flags and the per-side bl read it by position)."""
+    for bs, want in (('fixed_value', ['fixed_value'] * 4),
+                     (['fixed_value', 'core', 'looped', 'looped'],
+                      ['fixed_value', 'core', 'looped', 'looped']),
+                     (('looped', 'looped', 'fixed_value', 'core'),
+                      ['looped', 'looped', 'fixed_value', 'core'])):
+        assert siim2d(_s2d(boundary_status=bs)).boundary_status == want
+
+
+def test_a_mutated_input_array_does_not_change_the_run():
+    """The model keeps its own copy of every input: U, P, bl and
+    initial_topography aliased the caller's array, so mutating it after
+    construction changed the run while m.U and the analytical stayed (audit #35)."""
+    U = np.full((21, 21), 1e-3)
+    ref = siim2d(_s2d(U=U.copy()))
+    m = siim2d(_s2d(U=U))
+    U[:] = 5e-3
+    ref.run(); m.run()
+    np.testing.assert_array_equal(m.zb_out, ref.zb_out)
+
+
+def test_a_zt_series_pairs_with_the_p_series():
+    """zELA(t) = zT(t) - P(t)/beta when both are series; the zT series used the
+    time-mean P and gave a constant zELA (audit #34)."""
+    nt = 21
+    P = np.linspace(3.0, 1.0, nt)
+    m = siim2d(_s2d(zELA=None, zT=np.full(nt, 1800.0), P=P))
+    np.testing.assert_allclose(m._zELA_series, 1800.0 - P / 1e-2)
+    assert m.zELA == pytest.approx(1500.0)            # the series' most glaciated step
+
+
+def test_forcing_builders_follow_the_model_clock():
+    """The builders built linspace(0, T, nt) while the models run linspace(to,
+    T, nt), so a forcing for a run with to != 0 was stretched (audit #27); with
+    to they land on the model's steps, and a cycle starts with the run."""
+    from siim.forcing import ela_sawtooth, interp_forcing, uplift_step
+    to, T, nt = 1e6, 3e6, 201
+    model_t = np.linspace(to, T, nt)
+    t, ela = ela_sawtooth(T, nt, period=1e5, to=to)
+    np.testing.assert_array_equal(t, model_t)
+    np.testing.assert_array_equal(ela, ela_sawtooth(T - to, nt, period=1e5)[1])
+    t, U = uplift_step(T, nt, 1e-3, 2e-3, step_frac=0.5, to=to)
+    assert U[t < 2e6].max() == 1e-3 and U[t >= 2e6].min() == 2e-3
+    t, P = interp_forcing(T, nt, [to, T], [2.0, 1.0], to=to)
+    np.testing.assert_allclose(P[[0, -1]], [2.0, 1.0])
+
+
+def test_the_escarpment_wave_starts_at_x_escarpment_whatever_to():
+    """The wave sat at x_escarpment + t*v on the absolute clock, so a run
+    starting at to != 0 began with the wave already moved; it is measured from
+    the run's start now, and the run is the to = 0 run shifted (audit #27)."""
+    from siim.escarpment import siim_escarpment
+    cfg = _s2d(uplift_type='wave', delta_h=800, wave_velocity=0.1,
+               wave_width=1e4, x_escarpment=1e4, mode='A')
+    a = siim_escarpment(dict(cfg, to=0.0, T=2e4)); a.run()
+    b = siim_escarpment(dict(cfg, to=1e6, T=1e6 + 2e4)); b.run()
+    assert a.U == b.U
+    np.testing.assert_allclose(b.z_out, a.z_out, rtol=0, atol=1e-6)
+
+
+def test_the_border_bed_follows_the_escarpment_wave():
+    """Under the wave with no border_bed_uplift, a border bed rises at the wave's
+    local rate each step; it rose at the run-average U meant for the analytical
+    reference, about 8x the wave's peak at the escarpment defaults (audit #25).
+    An explicit border_bed_uplift still wins."""
+    from siim._core.step import wave_rate
+    from siim.escarpment import siim_escarpment
+    cfg = _s2d(uplift_type='wave', delta_h=800, wave_velocity=0.1, wave_width=2e3,
+               x_escarpment=0.0, mode='C')
+    m = siim_escarpment(cfg)
+    # gate: the wave's border default is None (the adapter's border_bed_uplift None
+    # takes the published rate, ED-178 #44), no longer a static 0 beside a flag
+    assert m._make_border_bed_uplift() is None
+    fn = m._driver_bbu_fn()
+    x, y = np.linspace(0, m.Lx, m.grid_nx), np.linspace(0, m.Ly, m.grid_ny)
+    for k in (0, 10):
+        np.testing.assert_array_equal(fn(k, m.dt), wave_rate(
+            x, y, m.dt, m.t[k] - m.t[0], 800, 2e3, 0.1, 0.0, 1.0, 0.0))
+    assert fn(0, m.dt)[:, 0].max() > 10 * fn(0, m.dt)[:, -1].max()   # the wave starts at the left edge
+    explicit = siim_escarpment(dict(cfg, border_bed_uplift=1e-4))
+    assert explicit._driver_bbu_fn() is None and explicit._make_border_bed_uplift() == 1e-4
