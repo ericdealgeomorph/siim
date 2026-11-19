@@ -12,6 +12,7 @@ from types import SimpleNamespace
 # gate: persistence records the producing version from the package's single source.
 from . import __version__ as _SIIM_VERSION
 from . import constants as _constants
+from ._core.toe import thin_ice_phi as _thin_ice_phi
 from .constants import check_range as _check_range
 from .constants import (GRAVITY, KT, RHO_ICE, derive_coulomb,
                         derive_power)
@@ -270,9 +271,14 @@ class siim:
         # Stash a copy so _set_analytical_grid can rebuild the analytical with
         # channel-fitted geometry overrides (called by extract_channel). A deep
         # copy, and the run reads it, so a caller mutating an input array later
-        # cannot change the run (audit #35).
+        # cannot change the run (audit #35). A restart ``state`` stays out of the
+        # stash (save() does not persist it): _check_state copies it once.
+        state = user_params.get('state')
+        user_params = {k: v for k, v in user_params.items() if k != 'state'}
         user_params = self._user_params = _constants.unwrap_0d(copy.deepcopy(user_params))
-        self.set_and_check_parameters(user_params)
+        self.set_and_check_parameters(user_params if state is None
+                                      else dict(user_params, state=state))
+        self._end_state = None          # what restart_state() returns, set by an in-house run
 
         # Standalone analytical (siim.analytical.analytical_steady_state_solution).
         # Constructed from a curated subset of user_params; see _analytical_user_params.
@@ -429,6 +435,16 @@ class siim:
             # constants.WIDTH_HACK_K / WIDTH_HACK_P.
             "width_hack_k": _constants.WIDTH_HACK_K,
             "width_hack_p": _constants.WIDTH_HACK_P,
+            # EXPERIMENTAL, standalone driver only (default off): siim1d's toe
+            # slope correction per routing edge (constants.TOE_SLOPE_CORRECTION_2D).
+            "toe_slope_correction_2d": _constants.TOE_SLOPE_CORRECTION_2D,
+            # EXPERIMENTAL, standalone driver only (default off / 1.0): the
+            # below-ELA ablation footprint width from the ice, alpha_g*H, in
+            # place of the Hack width (constants.FOOTPRINT_FROM_H), and a factor
+            # on the footprint width alone, either form
+            # (constants.FOOTPRINT_WIDTH_FACTOR).
+            "footprint_from_H": _constants.FOOTPRINT_FROM_H,
+            "footprint_width_factor": _constants.FOOTPRINT_WIDTH_FACTOR,
 
             # Flow routing: 'single' (D8 single-flow, default), 'infinite'
             # (Tarboton 1997 D-infinity) or 'multiple' (multiple-flow-direction);
@@ -628,6 +644,10 @@ class siim:
             "initial_topography": None,
             "noise_amplitude": _constants.NOISE_AMPLITUDE,
             "seed": None,
+            # Start with ice: an (ny, nx) H, or a restart_state() dict (the
+            # contract is restart_state's docstring).
+            "initial_ice_thickness": None,
+            "state": None,
             # run options
             "progress_bar": True,
             # coulomb-law params (k_h/d/sigma/xo geometry lives only in the
@@ -733,7 +753,6 @@ class siim:
         self.regime_switch = _constants.normalize_mode(params.mode) == 'D'
         if self.regime_switch:
             for key, value in (
-                    ('width_hack_k', _constants.MODE_D_WIDTH_HACK_K),
                     ('routing_filter_factor', _constants.MODE_D_ROUTING_FILTER_FACTOR),
                     ('flow_routing', _constants.MODE_D_FLOW_ROUTING),
                     ('trunk_surface', _constants.MODE_D_TRUNK_SURFACE),
@@ -1023,6 +1042,20 @@ class siim:
         _check_range('tau_c', self.tau_c, 0.0)
         self.width_hack_k = float(params.width_hack_k)
         self.width_hack_p = float(params.width_hack_p)
+        if not isinstance(params.toe_slope_correction_2d, (bool, np.bool_)):
+            raise ValueError("toe_slope_correction_2d must be True or False, got "
+                             f"{params.toe_slope_correction_2d!r}")
+        self.toe_slope_correction_2d = bool(params.toe_slope_correction_2d)
+        if not isinstance(params.footprint_from_H, (bool, np.bool_)):
+            raise ValueError("footprint_from_H must be True or False, got "
+                             f"{params.footprint_from_H!r}")
+        self.footprint_from_H = bool(params.footprint_from_H)
+        if (isinstance(params.footprint_width_factor, (bool, np.bool_))
+                or np.ndim(params.footprint_width_factor) != 0):
+            raise ValueError("footprint_width_factor must be a scalar, got "
+                             f"{params.footprint_width_factor!r}")
+        _check_range('footprint_width_factor', params.footprint_width_factor, 0.0)
+        self.footprint_width_factor = float(params.footprint_width_factor)
         self.flow_routing = _constants.normalize_flow_routing(params.flow_routing)
         # MFD spreading exponent (inert under 'single' / 'dinf'; validated
         # always, so a typo is loud rather than silently ignored). Mode D runs
@@ -1247,6 +1280,14 @@ class siim:
                     UserWarning, stacklevel=2)
             self.mu = params.mu
             self.phi = self.mu / self.nu
+        if self.toe_slope_correction_2d:
+            # the toe factor needs phi_t < 1 (phi_t = 1 divides 0/0; above 1
+            # the bare-edge factor turns negative and the mode-B walk drops H)
+            if _thin_ice_phi(self.sliding_law, self.mu / self.nu) >= 1.0:
+                raise ValueError(
+                    "toe_slope_correction_2d needs the law's thin-ice exponent "
+                    "phi_t < 1; the effective-exponent law gives phi_t = mu/nu "
+                    f"= {self.mu / self.nu:g}.")
 
         # hillslope + run config
         self.D = params.D
@@ -1293,6 +1334,85 @@ class siim:
         self.coulomb_clamp = params.coulomb_clamp
         # >= 1 zeroed the ice everywhere; < 0 let phi pass the yield pole (audit #8)
         _check_range('coulomb_clamp', self.coulomb_clamp, 0.0, hi=1.0)
+
+        # The start state (restart_state documents it), resolved once here, when
+        # the mode and the grid are: None (cold), {'ice_thickness': H} or a
+        # checked restart state; the driver reads it as is.
+        self._mode_label = ('D' if self.regime_switch else
+                            'C' if self.mode == 'B' and self.carve_width else self.mode)
+        self._grid_label = (int(self.grid_ny), int(self.grid_nx),
+                            float(self.Ly), float(self.Lx))
+        self._start_state = None
+        if params.initial_ice_thickness is not None:
+            if params.state is not None:
+                raise ValueError("initial_ice_thickness and state both set the start ice: "
+                                 "pass one (a state carries its ice thickness).")
+            if self.mode == 'A':
+                raise ValueError(
+                    "initial_ice_thickness needs mode 'B', 'C' or 'D': mode A tracks the ice "
+                    "surface and rebuilds H from it every step, so start it from the surface "
+                    "itself, initial_topography = zb + hc_over_H*H.")
+            if params.noise_amplitude != 0:
+                raise ValueError(
+                    "initial_ice_thickness lies on the initial bed, to which siim2d adds "
+                    f"noise_amplitude={params.noise_amplitude!r} of random relief: pass "
+                    "noise_amplitude=0 so the ice sits on the bed it was made for.")
+            H0 = self._start_array('initial_ice_thickness', params.initial_ice_thickness)
+            _check_range('initial_ice_thickness', H0, 0.0, inclusive=True)
+            self._start_state = {'ice_thickness': H0}
+        elif params.state is not None:
+            self._start_state = self._check_state(params.state)
+
+    def _start_array(self, name, value, dtype=np.float64):
+        """``value`` as an (ny, nx) array of ``dtype``, or a ValueError naming it."""
+        arr = np.asarray(value)
+        if arr.shape != (self.grid_ny, self.grid_nx):
+            raise ValueError(f"{name} must be shape (ny, nx) = ({self.grid_ny}, "
+                             f"{self.grid_nx}); got {arr.shape}")
+        if np.dtype(dtype) == bool and arr.dtype != bool:
+            raise ValueError(f"{name} must be a boolean array, got dtype {arr.dtype}")
+        return np.array(arr, dtype=dtype)
+
+    def _check_state(self, state):
+        """The validated copy of a ``state`` dict (:meth:`restart_state`): the
+        mode, grid and boundary_status it was made on must be this run's, its
+        groups whole (``_core.driver.check_restart_groups``), and every array
+        (ny, nx) of its dtype and, where numeric, finite and within the bounds
+        ``_core.driver.RESTART_GROUPS`` gives it."""
+        if not isinstance(state, dict):
+            raise ValueError(f"state must be a dict from restart_state(), got "
+                             f"{type(state).__name__}")
+        state = _constants.unwrap_0d(dict(state))      # e.g. read back from np.savez
+        fields = {k: spec for _in_use, group in _driver.RESTART_GROUPS.values()
+                  for k, spec in group.items()}
+        labels = ('mode', 'grid', 'boundary_status')
+        unknown = sorted(set(state) - {*labels, 'time', *fields})
+        missing = sorted({*labels, 'topography', 'ice_thickness'} - set(state))
+        if unknown or missing:
+            raise ValueError(f"state is not a restart_state() dict: unknown key(s) "
+                             f"{unknown}, missing key(s) {missing}")
+        if state['mode'] != self._mode_label:
+            raise ValueError(f"state was made by a mode {state['mode']} run and cannot "
+                             f"start a mode {self._mode_label} run (mode C is mode B "
+                             "with carve_width=True)")
+        grid = tuple(np.ravel(state['grid']).tolist())
+        if grid != self._grid_label:
+            raise ValueError(f"state was made on the grid (ny, nx, Ly, Lx) = "
+                             f"{grid}, this run's is {self._grid_label}")
+        bs = _check_boundary_status(np.ravel(state['boundary_status']).tolist())
+        if bs != self.boundary_status:
+            raise ValueError(f"state was made with boundary_status={bs}, this run has "
+                             f"{self.boundary_status}")
+        _driver.check_restart_groups(state)
+        checked = {k: state[k] for k in (*labels, 'time') if k in state}
+        for k, (_cold, dtype, lo, hi) in fields.items():
+            if k in state:
+                name = f"state[{k!r}]"
+                checked[k] = self._start_array(name, state[k], dtype)
+                if dtype is not np.bool_:
+                    _check_range(name, checked[k], lo, inclusive=True, hi=hi,
+                                 hi_inclusive=True)
+        return checked
 
     @property
     def run_id(self):
@@ -1453,6 +1573,7 @@ class siim:
         # of re-plotting the previous run's channel.
         self._profile_channel = None
         self._profile_channel_key = None
+        self._end_state = None                     # set by the in-house driver alone
         driver = driver if driver is not None else _constants.DRIVER_DEFAULT
         if driver == 'inhouse':
             self._run_inhouse(hooks)
@@ -1477,6 +1598,22 @@ class siim:
                 "an (nt, ny, nx) zELA series is in-house-driver only: the "
                 "xsimlab adapter takes a scalar, an (nt,) series or a static "
                 "(ny, nx) field. Run with driver='inhouse' (the default).")
+        if self._start_state is not None:
+            raise NotImplementedError(
+                "initial_ice_thickness and state are in-house-driver only: the "
+                "xsimlab adapter starts from zero ice and carries no restart "
+                "state. Run with driver='inhouse' (the default).")
+        if self.toe_slope_correction_2d:
+            raise NotImplementedError(
+                "toe_slope_correction_2d is an EXPERIMENTAL in-house-driver "
+                "option: the xsimlab adapter does not implement it. Run with "
+                "driver='inhouse' (the default).")
+        if (self.footprint_from_H
+                or self.footprint_width_factor != _constants.FOOTPRINT_WIDTH_FACTOR):
+            raise NotImplementedError(
+                "footprint_from_H and footprint_width_factor are EXPERIMENTAL "
+                "in-house-driver options: the xsimlab adapter does not "
+                "implement them. Run with driver='inhouse' (the default).")
         import xsimlab as xs
         from fastscape.models import basic_model
         # Drop the stock spl/drainage slots; the renamed glacial_spl / glacial_flow
@@ -1622,7 +1759,10 @@ class siim:
                                cfg.dx, cfg.dy, self.mfd_exponent)
         with router as route:
             cfg.route = route
-            buffers = _driver.run_loop(cfg)
+            buffers, end_state = _driver.run_loop(cfg)
+        self._end_state = dict(mode=self._mode_label, grid=self._grid_label,
+                               boundary_status=list(self.boundary_status),
+                               time=float(self.t[-1]), **end_state)
         spec = _outputs.output_spec(self.mode, self.flexure, self.sediment_basin,
                                     self.sediment_edge,
                                     regime_switch=self.regime_switch,
@@ -1714,6 +1854,9 @@ class siim:
             # physics knobs
             beta=self.beta, width_hack_k=self.width_hack_k,
             width_hack_p=self.width_hack_p, D=self.D,
+            toe_slope_correction_2d=self.toe_slope_correction_2d,
+            footprint_from_H=self.footprint_from_H,
+            footprint_width_factor=self.footprint_width_factor,
             flotation_gate=self.flotation_gate, flotation_ramp=self.flotation_ramp,
             parallel_erode=self.parallel_erode,
             inner_passes=self.inner_passes, inner_relax=self.inner_relax,
@@ -1740,6 +1883,9 @@ class siim:
             # injected seams
             uplift_fn=self._driver_uplift_fn(), bbu_fn=self._driver_bbu_fn(),
             initial_surface=self._driver_initial_surface(),
+            # the start (set_and_check_parameters): a state's topography, when it
+            # has one, replaces the initial surface whole (no relief, no noise)
+            initial_state=self._start_state,
             route=None,   # set inside the InhouseRouter context in _run_inhouse
         )
 
@@ -1845,6 +1991,86 @@ class siim:
             # (time, y, x): per-step flexural deflection applied to the column
             # (negative = subsidence under load, positive = isostatic rebound).
             self.rebound_out = self.ds_out['flexure__rebound'].values
+
+    def restart_state(self):
+        """The state this run ended on, to start another run from it.
+
+        This docstring is the contract of the ``state`` and
+        ``initial_ice_thickness`` parameters.
+
+        Returns a dict of copies: the ``topography`` (the bed in modes B, C
+        and D; the ice surface in mode A) and the ``ice_thickness`` ``H`` (the
+        width-mean depth) after the last step, the plate's previous ice column
+        under ``flexure=True``, the adaptive damping's per-cell weight and
+        previous move (``inner_damping`` an adaptive preset, the B/C/D
+        default), mode D's relaxed channel/sheet state and the icy mask it was
+        read on, plus the ``mode``, the ``grid`` (ny, nx, Ly, Lx), the
+        ``boundary_status`` and the ``time`` it ended at. Pass it back as the
+        ``state`` parameter::
+
+            s = m1.restart_state()
+            m2 = siim2d(cfg | dict(state=s, to=s['time'], T=s['time'] + 1e6, nt=1001))
+
+        **Exact.** That restart reproduces the run continued without a break,
+        bit for bit, in modes A, B, C and D: every frame of the restarted run
+        equals the continuous run's frame at the same step, provided the two
+        clocks take the same step sizes (``linspace`` gives the same ``dt``
+        sequence when ``dt`` is exactly representable, e.g. whole years) and
+        the forcing is the same. The state is everything the in-house loop
+        carries from one step to the next; the solvers start each step from
+        ``H`` itself and keep no other warm start, and the run draws no random
+        numbers after its initial relief. Not covered: the escarpment
+        variant's ``uplift_type='wave'``, whose wave starts from
+        ``x_escarpment`` at the start of every run, so a restarted wave run
+        sets the wave back unless ``x_escarpment`` is advanced by hand.
+
+        **What starts afresh.** The clock is the restarted run's own: it runs
+        from its ``to`` (default 0), which the state does not set; pass
+        ``to=state['time']`` to continue the original clock. Forcing is read
+        on that clock too (a length-``nt`` series from its first step). The
+        sediment running totals count from the restart. Under ``state`` the
+        topography is the state's, whole: ``initial_topography``,
+        ``noise_amplitude``, ``seed`` and any generated or plateau surface are
+        not used. Parameters may change at a restart (a forced response from a
+        spin-up), but not the mode (mode C is mode B with
+        ``carve_width=True``), the grid or ``boundary_status``, which raise. A
+        run that uses a device the state lacks starts that device cold:
+        turning ``flexure`` on loads the plate with the whole ice column on
+        the first step; an adaptive run from a state made under
+        ``inner_damping='omega'`` starts its weights at 1. State the run does
+        not use is ignored.
+
+        **Checked.** Every array must be (ny, nx), numeric ones finite: ``H``
+        and the plate's column at least 0, mode D's s in [0, 1], the adaptive
+        weight in [the lowest preset floor, 1], the icy mask boolean; each
+        device's arrays come whole or not at all, and keys must be known.
+
+        **initial_ice_thickness**, the simple start: an (ny, nx) ``H`` (m,
+        finite, at least 0) on the ``initial_topography`` bed, in modes B, C
+        and D. It requires ``noise_amplitude=0`` (the ice must sit on the bed
+        it was made on) and cannot be combined with ``state``; everything else
+        starts cold, as above. Where the run carries nothing else (no adaptive
+        damping: ``inner_damping='omega'`` at any ``inner_relax`` and
+        ``inner_passes``; no plate; not mode D), the end bed and ``H`` are the
+        whole state and this restart is exact too. Otherwise it is
+        approximate: on the 100 x 50 km benchmark case (mode C, multiple flow)
+        the ice volume stayed within 0.01 % of the continued run's for 400 kyr
+        and within 0.3 to 0.6 % at 1 Myr; on small cycling grids it moved by a
+        few per cent over the next frames, after which the runs part as any
+        perturbed runs do there. Mode A refuses it: its state is the ice
+        surface, from which it rebuilds ``H`` every step, so start it from
+        ``initial_topography = zb + hc_over_H*H``.
+
+        Both parameters need the in-house driver. The state is held in memory
+        only: :meth:`save` writes neither it nor the ``state`` a run started
+        from, so a loaded model re-runs from a cold start. Store it yourself,
+        e.g. ``np.savez(path, **s)`` and ``dict(np.load(path))``, to restart in
+        another session.
+        """
+        if self._end_state is None:
+            raise RuntimeError("No restart state: call run() first (the in-house "
+                               "driver keeps it; the xsimlab driver and load() do not).")
+        return copy.deepcopy(self._end_state)
 
     def save(self, filename=None):
         """Atomically pickle the current model state (user_params + ds_out) to

@@ -90,26 +90,57 @@ def test_sill_opens_1d():
 # sits within the standoff delta*U/E of the flotation draft bl - hc*H.
 # ---------------------------------------------------------------------------
 
+class _BorderRecorded(siim1d):
+    """Records, every step, the left border's bed before and after its border
+    budget, its ice thickness, whether the budget ran on ice (Qg > 0) and the
+    uplift it applied."""
+    border: list
+
+    def initialize_simulation(self):
+        super().initialize_simulation()
+        self.border = []
+
+    def _erode_border_bed_1d(self):
+        zb0 = self.zb[0]
+        super()._erode_border_bed_1d()
+        U_b = (self.U_matrix[0, self._forcing_idx] if self.border_bed_uplift is None
+               else self.border_bed_uplift)
+        self.border.append((zb0, self.zb[0], self.H[0], float(self.Qg[0] > 0.0), U_b * self.dt))
+
+
 def test_border_dt_flatness_and_draft_1d():
-    """Fixed T, dt swept 100 -> 50 000 yr (coulomb vigorous, cap=False): the
-    border envelope stays draft-bounded and FLAT-TO-SHRINKING in dt (measured
-    -449 / -148 / -72 m; probe: -320 / -121 / -51 on its dx=50 twin), and at
-    the deepest icy excursion the bed sits AT or just above the flotation
-    draft bl - hc*H (standoff < 100 m, never below draft - 1 m)."""
+    """Fixed T, dt swept 100 -> 50 000 yr (coulomb vigorous, cap=False), read
+    at every step: the border bed never digs past where the ice could float,
+    and its envelope is FLAT-TO-SHRINKING in dt (measured at every step
+    -455 / -148 / -74 m, and -453 / -153 / -72 m with
+    toe_slope_correction=False; probe: -320 / -121 / -51 on its dx=50 twin).
+
+    The draft bound, as the physics allows it: an icy step's budget never
+    takes the bed below the draft bl - hc*H of that step's ice, and a bed that
+    is already below it (dug under thicker ice that has since thinned) only
+    rises, at the uplift rate. So at every icy step the new bed sits at or
+    above min(old bed + U*dt, bl - hc*H), less 1 m. Unrolled, the bed sits
+    above the draft of every earlier step's ice, each raised by the uplift
+    since: the window over which thicker ice still bounds the bed is its
+    uplift recovery time, not a fixed count of steps. As the border's ice
+    thins, the bed sits up to 36 m below the thinner ice's draft here, on and
+    off. Over the icy steps the bed also stays within 100 m above its draft
+    (the standoff) and never rises above bl."""
+    # gate: reads every step against the bound the budget imposes; the old 51-frame reading passed by sampling
     env = {}
     for dtv in (100, 5000, 50000):
-        m = siim1d(_pi_cfg(law='coulomb', k=0.65, zELA=300.0, T=1e6, dt=dtv))
+        m = _BorderRecorded(_pi_cfg(law='coulomb', k=0.65, zELA=300.0, T=1e6, dt=dtv))
         m.run()
-        b, H = m.zb_out[0], m.H_out[0]
+        zb0, b, H, icy, Udt = np.array(m.border).T
+        icy = icy > 0.0
         env[dtv] = float(b.min())
         assert b.max() <= 1e-12                  # never above bl
-        # draft check at the deepest ICY frame
-        icy = H > 0.0
-        if icy.any():
-            k = int(np.argmin(np.where(icy, b, np.inf)))
-            draft = -HC * H[k]
-            assert b[k] >= draft - 1.0, (dtv, b[k], draft)
-            assert b[k] - draft < 100.0, (dtv, b[k], draft)
+        assert icy.any()
+        draft = -HC * H[icy]
+        floor = np.minimum(zb0[icy] + Udt[icy], draft)
+        k = int(np.argmin(b[icy] - floor))
+        assert np.all(b[icy] >= floor - 1.0), (dtv, b[icy][k], floor[k])
+        assert np.all(b[icy] - draft < 100.0), (dtv, float(np.max(b[icy] - draft)))
     # flat-to-shrinking: coarser dt never digs deeper than 2x the finest
     assert env[5000] >= 2.0 * env[100], env      # (both negative)
     assert env[50000] >= 2.0 * env[100], env

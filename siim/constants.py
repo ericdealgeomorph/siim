@@ -36,7 +36,8 @@ AC = 2.5e-24      # Glen's flow-law coefficient A [Pa^-3 s^-1] (canonical ~2.4e-
                   # at 0 C; 2.5e-24 preserves the package's historical cg, which
                   # previously absorbed the deformation factor 2 into Ac=5e-24)
 CE = 1e-5         # glacial erosion coefficient
-WIDTH_HACK_K = 0.5  # glacier-width Hack coefficient (W = width_hack_k * A^width_hack_p)
+WIDTH_HACK_K = 0.2  # glacier-width Hack coefficient (W = width_hack_k * A^width_hack_p), every
+                    # 2D mode (0.5 before 2026-11-19; decisions/2026-11-19-ablation-width-coefficient.md)
 WIDTH_HACK_P = 0.5  # glacier-width Hack exponent
 KO = 1e-6         # fluvial erodibility [m^(1-3m) yr^(m-1)]
 N_FLUVIAL = 1     # fluvial slope exponent (E_f ~ S^n)
@@ -90,6 +91,61 @@ FLOTATION_RAMP = 0.1
 # produces (which would starve erosion and re-dam the border — the sill /
 # reflected-slope failure family). Baked in, not user-facing.
 S_FLOOR_BC = 1e-3
+# 1D toe slope correction (siim1d, modes A and B; on by default since
+# 2026-11-18): makes the upwind step exact for the singular toe surface, so the
+# terminus is no longer pinned to its cell. False is the uncorrected toe step,
+# bit for bit. See siim1d.siim._toe_cells.
+TOE_SLOPE_CORRECTION = True
+# The least zeta (the terminus's distance beyond the last icy node, in cells)
+# the last-node factor (1 - phi_t)/zeta takes: the terminus is placed no
+# nearer the node than this, so the factor stays finite (a tiny positive flux
+# residual would otherwise give ~1e200 and an inf/NaN erosion). An overflow
+# guard only: below the floor erosion again vanishes with the flux, so any
+# floor re-pins the terminus inside it (0.05 held mode-B termini at the floor
+# on 40-100 % of steps; runs visit zeta down to ~6e-5). 2026-11-18.
+TOE_ZETA_MIN = 1e-6
+# The least number of icy nodes a block (the glacier draining to a terminus)
+# must hold for its last icy node to take the (1 - phi_t)/zeta term: that term
+# is exact only on a toe the grid resolves, and on a 1-4-cell glacier it
+# over-corrects (power mode B on the paper suite's 250 m 1D strip, 4-8 Myr:
+# the divide ice-free in 16 % of the 10 kyr frames, the cycle's trough at
+# 1453 m, 1508 m with this guard). Shorter blocks keep the uncorrected step at
+# the last node; the interior c(q) is kept (dropping it too lowers that trough
+# a further 10 m). The block is counted on the terminus's own side of the
+# divide, so a cap centred on it is judged flank by flank. A hard switch: a
+# linear ramp over 1-5 nodes lowered the trough to 1480 m, and the switch
+# shows no flicker. 2026-11-18.
+TOE_MIN_CELLS = 5
+# EXPERIMENTAL 2D toe slope correction (siim2d, standalone driver, every mode;
+# off by default): siim1d's correction per routing edge. Each edge's glacial
+# slope is multiplied by c(q) = (1 - phi_t)(1 - q)/(1 - q^(1 - phi_t)),
+# q = Q_r/Q*, Q* = min(Q_i, I_r) (I_r the receiver's icy inflow; Q* = Q_i on
+# single-flow routing), where 0 < q < 1; an edge to a bare receiver takes
+# (1 - phi_t)/zeta from the sub-grid terminus (zeta = 1/(1 - Q_r/Q*), floored
+# at TOE_ZETA_MIN) only where at least TOE_MIN_CELLS icy cells route through
+# the node, and the uncorrected step where that slope is no steeper than the
+# bare receiver's (siim._core.step.toe_slope_factor). Off: no 2D run changes.
+# Off by default because the 2D studies of 2026-11-18/19 (before that last
+# rule) found no gain: on the
+# paper suite's D8 strip the uncorrected mode-B cycle trough already sits within
+# 3 m of the 1D limit (1534 m) from 250 to 31 m cells and the correction moves
+# it 0.3-5 m, and on c9's mode-B D8 landscape at 1 km it raises the divide's
+# swing from 89 m to 147 m (a replicate: 91 m) instead of damping it.
+TOE_SLOPE_CORRECTION_2D = False
+# EXPERIMENTAL ablation footprint from the ice (siim2d, standalone driver;
+# off by default): below the ELA the footprint width is alpha_g*H, the
+# valley width on the lagged pass thickness, in place of the Hack width
+# WIDTH_HACK_K*A^WIDTH_HACK_P. It closes the H -> width -> ablation loop the
+# Hack width cuts (model paper sec:ablation: a resonant toe oscillation).
+# Off: no run changes.
+FOOTPRINT_FROM_H = False
+# EXPERIMENTAL footprint width factor f (siim2d, standalone driver): multiplies
+# the below-ELA footprint width, either form (f*WIDTH_HACK_K*A^WIDTH_HACK_P or
+# f*alpha_g*H), and nothing else: alpha_g in the cross-section, the closures
+# and the carve is untouched. 1.0 = the unscaled footprint. Against MinSIA on
+# c6's frozen 1 km beds (2026-11-19) the H form fits best near f = 3.2 in
+# mode C; mode B with D8 does not calibrate on the massif.
+FOOTPRINT_WIDTH_FACTOR = 1.0
 # Level-scheduled parallel mode-B erosion: the
 # eroder dependency is a DAG depth, so topological levels run in order with
 # prange inside each — BIT-FOR-BIT identical to the serial walk at any thread
@@ -174,24 +230,29 @@ def unwrap_0d(params):
             for k, v in params.items()}
 
 
-def check_range(name, value, lo, *, inclusive=False, hi=None):
+def check_range(name, value, lo, *, inclusive=False, hi=None, hi_inclusive=False):
     """Raise ValueError unless ``value`` (a scalar or a field) is finite
-    everywhere, above ``lo`` (or at it, if ``inclusive``) and, when ``hi`` is
-    given, below ``hi``. NaN fails every comparison, so a bare ``x < 0`` guard
+    everywhere, above ``lo`` (or at it, if ``inclusive``; ``None`` = no lower
+    bound) and, when ``hi`` is given, below ``hi`` (or at it, if
+    ``hi_inclusive``). NaN fails every comparison, so a bare ``x < 0`` guard
     let it through (audit #38)."""
     import numpy as np                      # constants itself stays numpy-free at import
-    rule = f"{'>=' if inclusive else '>'} {lo:g}" + ("" if hi is None else f" and < {hi:g}")
+    bounds = ([] if lo is None else [f"{'>=' if inclusive else '>'} {lo:g}"]) + (
+        [] if hi is None else [f"{'<=' if hi_inclusive else '<'} {hi:g}"])
+    rule = " and ".join(["finite"] + bounds)
     try:
         a = np.asarray(value, dtype=float)
     except OverflowError:                   # an int beyond float range is not finite: the same refusal
-        raise ValueError(f"{name} must be finite and {rule}; got an int too large for a float") from None
-    ok = np.isfinite(a) & ((a >= lo) if inclusive else (a > lo))
+        raise ValueError(f"{name} must be {rule}; got an int too large for a float") from None
+    ok = np.isfinite(a)
+    if lo is not None:
+        ok &= (a >= lo) if inclusive else (a > lo)
     if hi is not None:
-        ok &= a < hi
+        ok &= (a <= hi) if hi_inclusive else (a < hi)
     if not ok.all():
         got = (f"got {value!r}" if a.ndim == 0
                else f"got {np.count_nonzero(~ok)} of {a.size} cells outside that")
-        raise ValueError(f"{name} must be finite and {rule}; {got}")
+        raise ValueError(f"{name} must be {rule}; {got}")
 
 
 # --- Per-sliding-law parameter dispatch -------------------------------------
@@ -279,19 +340,19 @@ def mode_c_standard(is_mode_c):
 # or sheet rules per cell; decisions/2026-11-02-mode-d.md, 2026-11-03-mode-d-defaults.md
 # and 2026-11-13-channel-sheet-discharge-reading.md (private). siim2d writes these into every mode-D parameter the user did not
 # set; an explicit value wins. The damping is MODE_BCD_INNER_DAMPING (below),
-# with MODE_D_INNER_RELAX the 'omega' preset's dial (whole-domain omega 1/3); the Hack footprint coefficient is half the WIDTH_HACK_K default; the fabricated trunk V is off
+# with MODE_D_INNER_RELAX the 'omega' preset's dial (whole-domain omega 1/3); the Hack footprint coefficient is WIDTH_HACK_K, as in every mode; the fabricated trunk V is off
 # (on, it roughly triples the planview flicker on sheet-dominated beds); the
 # routing filter acts on sheet cells only (its thickness fades with s); MFD
 # routing, the only routing mode D accepts. Everything else resolves as in mode C. Measured against the shallow-
 # ice reference (MinSIA) at 1 km with the volumes counted over the sub-grid width
 # of the channel cells (assessment/suites/minsia.py), massif / notebook / flagship,
-# under the channel/sheet reading of 2026-11-13 and the adaptive damping:
+# under the channel/sheet reading of 2026-11-13 and the adaptive damping, at the
+# old width_hack_k = 0.25 (not re-measured at 0.2):
 # +6.1 / -4.3 / +5.7 % at the bed bar's 1.5 default (2026-11-14; raw -11.8 / -18.1 /
 # -3.9 %), +7.0 / -10.5 / +2.6 % at 2. (Under the retired rim-and-flank reading,
 # 2026-11-05: +16.9 / -6.6 / -0.8 %.)
 MODE_D_INNER_RELAX = 1.0 / 3.0
 MODE_D_TRUNK_SURFACE = False
-MODE_D_WIDTH_HACK_K = 0.25
 MODE_D_ROUTING_FILTER_FACTOR = 2.0
 MODE_D_FLOW_ROUTING = 'mfd'
 _MODE_TO_CODE = {       # keyed in lower case: normalize_mode ignores case

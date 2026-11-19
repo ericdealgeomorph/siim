@@ -42,7 +42,7 @@ own constructor signatures in {doc}`../api/analytical`.
 | `T` | `3e6` | `3e6` | Final model time (yr); the clock is `linspace(to, T, nt)`. |
 | `nt` | `3000` | `2501` | Number of master time points, including both endpoints. |
 | `nt_out` | `101` | `101` | Requested saved frames. 1D also accepts `None` for every step. In 2D it must satisfy `1 <= nt_out <= nt`. |
-| `mode` | `'bedrock+ice_thickness'` | `'C'` | State convention. `'A'`/`'ice_surface'` tracks the surface; `'B'`/`'bedrock+ice_thickness'` tracks bed and ice thickness. 2D `'C'` resolves to B plus width carving. 2D `'D'` is C with the valley ↔ sheet reading choosing, per cell and per step, the valley or the sheet treatment of the five valley devices (see {doc}`configuring_a_run`); it sets its own defaults for `inner_damping` (`'adaptive'`; under `'omega'`, `inner_relax` 1/3 over `inner_passes` 1), `width_hack_k` (0.25), `routing_filter_factor` (2), `flow_routing` (`'mfd'`, and with it the layer-dependent `parallel_erode` default; the only routing mode D accepts) and `trunk_surface` (`False`) wherever you leave them unset (everything else resolves as in mode C), needs the standalone driver, square cells, a finite `widening_rate` and every looped axis at least 17 cells long, and warns on cells coarser than 2.5 km. Its one dial of the reading is `channel_bed_bar`. C and D are rejected in 1D. |
+| `mode` | `'bedrock+ice_thickness'` | `'C'` | State convention. `'A'`/`'ice_surface'` tracks the surface; `'B'`/`'bedrock+ice_thickness'` tracks bed and ice thickness. 2D `'C'` resolves to B plus width carving. 2D `'D'` is C with the valley ↔ sheet reading choosing, per cell and per step, the valley or the sheet treatment of the five valley devices (see {doc}`configuring_a_run`); it sets its own defaults for `inner_damping` (`'adaptive'`; under `'omega'`, `inner_relax` 1/3 over `inner_passes` 1), `routing_filter_factor` (2), `flow_routing` (`'mfd'`, and with it the layer-dependent `parallel_erode` default; the only routing mode D accepts) and `trunk_surface` (`False`) wherever you leave them unset (everything else resolves as in mode C), needs the standalone driver, square cells, a finite `widening_rate` and every looped axis at least 17 cells long, and warns on cells coarser than 2.5 km. Its one dial of the reading is `channel_bed_bar`. C and D are rejected in 1D. |
 | `H_diffusivity` | `None` | `None` | Ice-thickness diffusivity (m²/yr); `None` or `0` disables it, and negative values are rejected. It works in both 1D modes but only B/C in 2D. |
 | `initial_topography` | `None` | `None` | NumPy array, pandas DataFrame, or CSV path. Array shape is `(nx,)` in 1D or `(ny, nx)` in 2D. The 2D initializer still adds `noise_amplitude`; set it to zero for the exact supplied elevations. See {ref}`initial-topography-formats`. |
 | `progress_bar` | `True` | `True` | Show tqdm run progress. |
@@ -113,6 +113,7 @@ the exact-law/default analytical pairing.
 | `right_bc` | `'reflecting'` | Right boundary condition: `'base_level'` or `'reflecting'`. |
 | `cap_ice_accumulation` | `True` | Cap accumulation at `P`. `False` is mainly for comparison with the uncapped analytical ansatz. |
 | `floating_termini` | `True` | In mode B, treat ice reaching a closed basin as floating/bed-decoupled. `False` lets a grounded toe carve its overdeepening; no effect in mode A. |
+| `toe_slope_correction` | `True` | Modes A and B: correct the glacial slope near a terminus so the upwind step is exact for the singular toe surface and the terminus is no longer pinned to its cell; the last icy node's sub-grid-terminus term applies only to a glacier of at least `constants.TOE_MIN_CELLS` (5) icy nodes, counted on the terminus's own side of the divide; see {ref}`toe-slope-1d`. `False` takes the uncorrected toe step, bit for bit (the 0.10.0 model only together with the 0.10.0 erosion solvers). |
 
 When `initial_topography=None`, 1D creates a quadratic one- or two-sided
 profile from the boundary conditions. Its stored arrays use the model's native
@@ -130,6 +131,8 @@ x order, from `L` down to `0`.
 | `initial_max_elevation` | `1000` | Peak of the generated tent surface (m); used only when `initial_topography=None`. |
 | `noise_amplitude` | `100` | Amplitude of uniform nonnegative random relief added to the initial surface (m), whether generated or supplied. Set `0` to preserve supplied elevations exactly. |
 | `seed` | `None` | Random seed for initial relief. Set an integer for reproducible runs. |
+| `state` | `None` | A dict from another run's `m.restart_state()`: continue that run exactly from its end state (in-house driver only). See {ref}`restarting-a-run`. |
+| `initial_ice_thickness` | `None` | An `(ny, nx)` ice thickness to start modes B, C and D with, on `initial_topography` (needs `noise_amplitude=0`; in-house driver only). See {ref}`restarting-a-run`. |
 | `flow_routing` | `'single'` (`'mfd'` in mode D) | `'single'` for in-house D8 steepest descent, `'multiple'` for multiple-flow-direction spreading over every strictly downhill neighbour, or `'infinite'` for Tarboton D-infinity two-receiver flow. The router codes `'mfd'` (= `'multiple'`) and `'dinf'` (= `'infinite'`) are accepted as aliases, and the rest of this reference uses them. Both multi-receiver routers turn on `slope_normalise` by default. `'mfd'` requires mode B, C or D (mode A has only the one-cell closure), a transect `closure_flux`, and square cells (`dx == dy`); anything else raises. It is the only routing mode D accepts. It supports mode C — carving and `trunk_surface`, at the router-derived `trunk_dip_k` — where the trunk is resolved; see {doc}`configuring_a_run`. |
 | `slope_normalise` | `None` | Gamma effective-slope normalisation. `None` resolves from the router: ON for both multi-receiver routers (`'dinf'`, `'mfd'`), OFF for `'single'`. A multi-receiver reduction `S = sum_k w_k (zs_i - zs_rk)/L_k` is the surface gradient PROJECTED on the weighted receiver direction `v = sum_k w_k e_k`; dividing by `gamma = |v|` recovers the gradient magnitude, exactly so on a plane. It is applied as gamma-scaled link lengths, so the thickness closure and all three eroders read the same effective slope. Two places deliberately keep the raw link lengths, where a single donor edge leaves gamma undefined: the outflow border's arrival slope and mode A's border thickness closure. `False` restores the unnormalised reduction — under D-inf that is the older behaviour (see the changelog), which returned 0.9239 of the true gradient on a plane tilted pi/8 and inflated `H` there by up to about 5 %. Under `'single'` the parameter is a no-op (one receiver, `gamma == 1` identically); under `'mfd'` an explicit `False` raises, because the raw MFD reduction is 17-24 % low by construction. |
 | `mfd_exponent` | `1.0` | Spreading exponent p in the MFD weights `(S_k/S_max)^p`; positive, finite up to 50 or `inf`, inert under the other routers. p = 1 is Budd & Warner's split and the only exponent whose weighted receiver direction is exactly the surface gradient direction on a square 8-neighbour stencil; larger p concentrates toward the steepest link, and `inf` routes down it alone (equal steepest links share), which is still the MFD code path and not `flow_routing='single'`. A finite p above 50 is taken as `inf`, with a warning: there the smaller weights underflow to zero, and each further step in p changes a mode-D run by no more than repeating it does. Provisional pending the stage-S4 dome sweep. |
@@ -152,8 +155,11 @@ x order, from `L` down to `0`.
 | `inner_relax` | mode-dependent | Update fraction ω of that iteration under `'omega'`: `H ← H + ω(F(H) − H)` after every pass, so `1 − ω` is retained: `0.5` in modes B/C, `1/3` in mode D, `1.0` in mode A. Under an adaptive preset it reports the preset's floor. Must be in `(0, 1]`; below 1 requires B/C/D and the standalone driver. |
 | `channel_bed_bar` | `None` → `1.5` in mode D | Mode D's bed bar `k_B`: a cell reads channel only where the lowest bed within its half-width `alpha_g*H/2` lies below the bed around it (the median of the reading's ring) by more than `(k_B − 1)` times the ring's median ice thickness, so a fast stream on a plateau with no trough reads sheet. Finite and ≥ 0; 0 turns the bar off; raising it drops shallower troughs first (2.5 and above lost trunk channels on the 1000 km escarpment run). Mode D only; any other mode raises. |
 | `routing_filter_factor` | `0.0` (`2` in mode D) | Routing-surface spatial filter: above 0 the router graph alone is built from a thickness-weighted triangular mean of `zb + hc·H` over a window of half-width `max(f·H/dx − ½, 0)` cells (about f ice thicknesses; 2 is the measured setting). Finite and ≥ 0; above 0 requires B/C, the standalone driver, square cells and `trunk_surface=False` (or mode D, under which the two combine). Windows wrap on looped axes. |
-| `width_hack_k` | `0.5` (`0.25` in mode D) | Coefficient in `width = width_hack_k*A**width_hack_p` (units m^(1−2p)); used for below-ELA ablation. |
-| `width_hack_p` | `0.5` | Dimensionless exponent in that glacier-width correction. |
+| `width_hack_k` | `0.2` | Coefficient in `width = width_hack_k*A**width_hack_p` (units m^(1−2p)); used for below-ELA ablation. Ignored under `footprint_from_H=True`. |
+| `width_hack_p` | `0.5` | Dimensionless exponent in that glacier-width correction. Ignored under `footprint_from_H=True`. |
+| `toe_slope_correction_2d` | `False` | EXPERIMENTAL, opt-in, standalone driver only (the xsimlab driver refuses it). siim1d's toe slope correction ({ref}`toe-slope-1d`) applied per routing edge, in every mode: each icy edge's glacial slope is scaled by `c(q) = (1−φ)(1−q)/(1−q^(1−φ))`, `q = Q_receiver/Q*` with `Q* = min(Q_node, the receiver's icy inflow)` (`Q*` is the node's own flux under single-flow routing), and an edge to a bare receiver takes its slope from the sub-grid terminus where at least `constants.TOE_MIN_CELLS` icy cells drain through the node. Requires `mu/nu < 1` under `'eff-exp'`. Off by default: the 2D studies found no gain over the uncorrected step (see the changelog). `True` or `False`. |
+| `footprint_from_H` | `False` | EXPERIMENTAL, opt-in, standalone driver only (the xsimlab driver refuses it). Below the ELA the ablation footprint width is `alpha_g*H` (the valley width on the lagged pass thickness) in place of the Hack width `width_hack_k*A**width_hack_p`; nothing else changes. This closes the H → width → ablation loop the Hack width cuts. Unscaled it ablates too little: use it with `footprint_width_factor` (about 3.2 in mode C, below). `True` or `False`. |
+| `footprint_width_factor` | `1.0` | EXPERIMENTAL, standalone driver only (the xsimlab driver refuses any value but 1). Multiplies the below-ELA footprint width, either form, and nothing else: `alpha_g` in the cross-section, the closures and the carve is unchanged. Calibrated against MinSIA on three 1 km beds, the H form fits best near `3.2` in mode C; mode B with D8 does not calibrate on the massif bed, and the trunk-length spread across beds is wide (−11 to +2 % at the mode-C fit), so one value is a compromise. With the Hack width, f is mathematically `width_hack_k` scaled by f (bit for bit only when f or `width_hack_k` is a power of two). A finite scalar > 0. |
 
 The mode-C helper affects routing, so it can change the true simulation. It
 is not a display filter. See {doc}`configuring_a_run` for the interaction.
@@ -210,6 +216,26 @@ as a generated surface. Uniform noise in `[0, noise_amplitude)` is then added
 away from fixed-value edges. Use `noise_amplitude=0` when an imported DEM must
 remain exact; otherwise set an integer `seed` to reproduce the perturbation.
 
+(restarting-a-run)=
+### Restarting a run
+
+A bed alone restarts a run without its ice, which then regrows from zero. To
+continue a run instead, start the next one from its end state:
+
+```python
+m1 = siim2d(cfg)
+m1.run()
+s = m1.restart_state()
+m2 = siim2d(cfg | dict(state=s, to=s['time'], T=s['time'] + 1e6, nt=1001))
+m2.run()
+```
+
+Given the same step sizes (a step of whole years is exact on both clocks) and
+the same forcing, `m2` reproduces the run continued without a break, bit for
+bit. {meth}`siim.siim2d.siim.restart_state` states the contract: what the
+state carries, what starts afresh, what is checked, the escarpment wave's
+exception, and `initial_ice_thickness`, the simpler start from the ice alone.
+
 ## Running the 2D model through the optional adapter
 
 `m.run()` uses the standalone in-house driver. `m.run(driver='xsimlab')` uses
@@ -218,9 +244,10 @@ two drivers expose the same output contract. The adapter routes once per step,
 so it runs the undamped model: modes B and C need
 `inner_relax=1.0, inner_passes=1` there (their default damping needs the
 in-house driver), and
-mode D, `routing_filter_factor > 0`, a per-side `bl` and an `(nt, ny, nx)`
-`zELA` series are in-house only. The `hooks=` argument is honored
-only by the xsimlab driver; the in-house driver rejects a non-`None` value.
+mode D, `routing_filter_factor > 0`, a per-side `bl`, an `(nt, ny, nx)`
+`zELA` series, `state` and `initial_ice_thickness` are in-house only. The
+`hooks=` argument is honored only by the xsimlab driver; the in-house driver
+rejects a non-`None` value.
 See {doc}`fastscape_processes` for direct process composition.
 
 ## Escarpment-variant additions

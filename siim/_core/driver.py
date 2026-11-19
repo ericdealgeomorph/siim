@@ -28,7 +28,9 @@ the icy mask it was read on (semantic state: read from the committed H AND
 the bed the kernel just eroded, which the devices themselves shaped), the
 confinedness ``s_conf`` the devices take and its smoothed twin for the datum,
 the flexure ``_col_prev``, the sediment ``_cum`` (and its per-domain-edge
-twin), and the ``topography`` state (committed only at finalize).
+twin), and the ``topography`` state (committed only at finalize). The loop
+returns the physical part of it (:data:`RESTART_GROUPS`) and starts on it
+when handed back (``cfg.initial_state``): an exact restart.
 
 Valley <-> sheet devices (mode D, ``regime_switch``; the five devices are
 described once, at ``constants.HC_SHEET``, the reading at
@@ -75,7 +77,9 @@ import numpy as np
 from tqdm import tqdm
 
 from ..constants import (ADAPTIVE_GROWTH, ADAPTIVE_SHRINK, INNER_DAMPING,
-                         INNER_DAMPING_FLOORS, INNER_RELAX_BARE_H, REGIME_ICY_H)
+                         INNER_DAMPING_FLOORS, INNER_RELAX_BARE_H, REGIME_ICY_H,
+                         TOE_SLOPE_CORRECTION_2D, FOOTPRINT_FROM_H,
+                         FOOTPRINT_WIDTH_FACTOR)
 from .hillslope import diffuse as _inhouse_diffuse
 from .outputs import output_spec, allocate_buffers
 from .regime import channel_class, swap, smooth_icy
@@ -86,7 +90,7 @@ from .step import (
     accumulate_glacial_flow, accumulate_sheet_ice_flow,
     run_modeA_step, run_modeB_kernel, carve_bed,
     accumulate_sediment, edge_sediment, glacial_flexure_step, sum_erosion,
-    compose_vertical_motion, transect_flux, SIDE_SLICES,
+    compose_vertical_motion, transect_flux, toe_phi, SIDE_SLICES,
 )
 
 
@@ -145,13 +149,84 @@ def _bl_field(bl_sides, shape, k):
     return field.ravel()
 
 
+def _adaptive(cfg):
+    """The adaptive damping presets are on (constants.INNER_DAMPING_FLOORS)."""
+    return getattr(cfg, 'inner_damping', INNER_DAMPING) in INNER_DAMPING_FLOORS
+
+
+def _regime(cfg):
+    """Mode D's valley <-> sheet devices are on (constants.HC_SHEET)."""
+    return cfg.mode == 'B' and bool(getattr(cfg, 'regime_switch', False))
+
+
+#: The cross-step state a restart carries (:meth:`siim.siim2d.siim.restart_state`),
+#: grouped by the device that owns it: ``group: (in use for cfg?, {key: (cold
+#: fill, dtype, lo, hi)})``. A group is carried whole or not at all
+#: (:func:`check_restart_groups`), a run that uses a group its start state
+#: lacks starts that group cold, and ``lo``/``hi`` (inclusive, None = open) are
+#: the values a carried array may take. The topography's cold start is the
+#: run's initial surface (``cfg.initial_surface``), no fill. The sediment
+#: running totals are outputs and count from each run's start.
+RESTART_GROUPS = {
+    'surface': (lambda cfg: True, {'topography': (None, np.float64, None, None)}),
+    'ice': (lambda cfg: True, {'ice_thickness': (0.0, np.float64, 0.0, None)}),
+    # the plate's previous ice column
+    'flexure': (lambda cfg: bool(cfg.flexure),
+                {'flexure_column': (0.0, np.float64, 0.0, None)}),
+    # the adaptive presets' per-cell w (in [any preset's floor, 1]) and d_prev
+    'adaptive': (_adaptive,
+                 {'damping_weight': (1.0, np.float64, min(INNER_DAMPING_FLOORS.values()), 1.0),
+                  'damping_prev_move': (0.0, np.float64, None, None)}),
+    # mode D's relaxed s, the icy mask it was read on, s_conf and its smoothed
+    # twin for the datum: valley (1) everywhere and nothing icy on a cold start
+    'regime': (_regime,
+               {'regime_s': (1.0, np.float64, 0.0, 1.0),
+                'regime_icy': (False, np.bool_, None, None),
+                'regime_s_conf': (1.0, np.float64, 0.0, 1.0),
+                'regime_s_datum': (1.0, np.float64, 0.0, 1.0)}),
+}
+
+
+def check_restart_groups(state):
+    """Raise ValueError unless each of :data:`RESTART_GROUPS` is in ``state``
+    whole or not at all."""
+    for name, (_in_use, fields) in RESTART_GROUPS.items():
+        if 0 < sum(k in state for k in fields) < len(fields):
+            raise ValueError(f"state carries part of its {name!r} group: it needs "
+                             f"all of {list(fields)} or none")
+
+
+def _start_state(cfg, init, shape):
+    """The loop's start arrays for every group ``cfg`` uses: ``init[key]`` where
+    the start state carries it (no copy when its dtype already matches: the
+    loop only rebinds these names, never writes into them), else cold."""
+    start = {}
+    for in_use, fields in RESTART_GROUPS.values():
+        if not in_use(cfg):
+            continue
+        for key, (cold, dtype, _lo, _hi) in fields.items():
+            if key in init:
+                value = init[key]
+            elif cold is None:                    # the topography
+                value = cfg.initial_surface
+            else:
+                value = np.full(shape, cold, dtype=dtype)
+            start[key] = np.asarray(value, dtype=dtype).reshape(shape)
+    return start
+
+
 def run_loop(cfg):
-    """Run the merged in-house time loop; return the packed ``ds_out`` step
-    buffers (a ``{name: ndarray}`` dict, one array per output-spec row at that
-    row's dims).
+    """Run the merged in-house time loop; return ``(buffers, end_state)``: the
+    packed ``ds_out`` step buffers (a ``{name: ndarray}`` dict, one array per
+    output-spec row at that row's dims) and the cross-step state the loop
+    ends on (a ``{name: ndarray}`` dict of the keys of every
+    :data:`RESTART_GROUPS` group the run uses), from which a restarted loop
+    continues this one.
     ``cfg`` is the resolved-parameter bundle assembled by
     :meth:`siim.siim2d.siim._run_inhouse` (see that method for the field
-    contract)."""
+    contract); its optional ``initial_state`` (None, or a dict keyed as
+    ``end_state``) is the state the loop starts on, each group it lacks
+    starting cold (the topography from ``cfg.initial_surface``)."""
     ny, nx = int(cfg.ny), int(cfg.nx)
     shape = (ny, nx)
     length = (cfg.yl, cfg.xl)
@@ -159,20 +234,26 @@ def run_loop(cfg):
     # Mode D's valley <-> sheet devices (constants.HC_SHEET; validated by the
     # facade in _core.regime.check_regime_grid). Off: s_conf stays None
     # and every device call below is today's, bit-for-bit.
-    regime = cfg.mode == 'B' and bool(getattr(cfg, 'regime_switch', False))
+    regime = _regime(cfg)
     bed_bar = cfg.channel_bed_bar if regime else None   # mode D's dial (resolved by the facade)
 
     track_sediment = cfg.sediment or cfg.sediment_edge   # both need the routed flux
 
-    # --- cross-step state owned by the driver ---
-    topo = np.array(cfg.initial_surface, dtype=np.float64).reshape(shape).copy()
-    H = np.zeros(shape)                       # ice_thickness init: zero, as the adapter path's input
-    col_prev = np.zeros(shape) if cfg.flexure else None
+    # --- cross-step state owned by the driver (cold, or carried by a restart) ---
+    init = getattr(cfg, 'initial_state', None) or {}
+    check_restart_groups(init)                    # (the facade checks it too)
+    start = _start_state(cfg, init, shape)
+    topo = start['topography']
+    # ice_thickness: zero, as the adapter path's input (mode A overwrites every cell)
+    H = start['ice_thickness']
+    col_prev = start['flexure_column'] if cfg.flexure else None
     cum = np.zeros(shape) if cfg.sediment else None
-    s_conf = np.ones(shape) if regime else None   # mode D's s: valley on the first step
-    s_datum = s_conf                              # mode D's s smoothed (borders inherit) for the datum
-    s_rel = np.ones(shape) if regime else None    # mode D's relaxed s and the icy mask
-    icy_rel = np.zeros(shape, dtype=bool) if regime else None   # it was read on
+    # mode D's s (valley on the first step), its smoothed twin (borders
+    # inherit) for the datum, the relaxed s and the icy mask it was read on
+    s_conf = start['regime_s_conf'] if regime else None
+    s_datum = start['regime_s_datum'] if regime else None
+    s_rel = start['regime_s'] if regime else None
+    icy_rel = start['regime_icy'] if regime else None
     hc_route = hc                                 # the datum the routing surface is built on
     edge_cum = np.zeros(4) if cfg.sediment_edge else None   # NaN off fixed sides
 
@@ -190,12 +271,24 @@ def run_loop(cfg):
     inner_relax = float(cfg.inner_relax)
     # The adaptive presets (constants.INNER_DAMPING_FLOORS; inner_relax carries
     # the floor): per-cell weight w and previous move, cross-step state.
-    adaptive = getattr(cfg, 'inner_damping', INNER_DAMPING) in INNER_DAMPING_FLOORS
+    adaptive = _adaptive(cfg)
     if adaptive:
-        w_cell, d_prev = np.ones(shape), np.zeros(shape)
+        w_cell, d_prev = start['damping_weight'], start['damping_prev_move']
     # Routing-surface spatial filter (constants.ROUTING_FILTER_FACTOR; validated
     # by the facade in _core.router.check_routing_filter_config). 0 = off.
     routing_filter_factor = float(cfg.routing_filter_factor)
+    # EXPERIMENTAL 2D toe slope correction (constants.TOE_SLOPE_CORRECTION_2D):
+    # the kernels read the accumulator's pre-clamp ice flux and the law's toe
+    # exponent; the dict keeps the factor's work arrays. Off: no call below
+    # changes.
+    toe = None
+    if getattr(cfg, 'toe_slope_correction_2d', TOE_SLOPE_CORRECTION_2D):
+        toe = (np.empty(ny * nx), toe_phi(cfg.law_code, cfg.gp), {})
+    # EXPERIMENTAL ablation footprint (constants.FOOTPRINT_FROM_H and
+    # FOOTPRINT_WIDTH_FACTOR): the below-ELA footprint width alpha_g*x in place
+    # of the Hack width, and its factor f. Off and f = 1: no call below changes.
+    footprint_from_H = getattr(cfg, 'footprint_from_H', FOOTPRINT_FROM_H)
+    footprint_f = getattr(cfg, 'footprint_width_factor', FOOTPRINT_WIDTH_FACTOR)
     spec = output_spec(cfg.mode, cfg.flexure, cfg.sediment, cfg.sediment_edge,
                        regime_switch=regime, closure_flux=closure_flux,
                        inner_relax=inner_relax, save_closure_pair=cfg.save_closure_pair)
@@ -289,7 +382,9 @@ def run_loop(cfg):
                 cfg.cell_area, cfg.width_hack_k, cfg.width_hack_p, shape,
                 rt.stack, rt.receivers, rt.nb_receivers, rt.weights, rt.lengths,
                 rt.basin if topo_out and p == inner_passes - 1 else None,
-                s_conf=s_conf)
+                s_conf=s_conf, raw_out=None if toe is None else toe[0],
+                width=cfg.alpha_g * x if footprint_from_H else None,
+                width_factor=footprint_f)
 
             # --- erosion kernel (solves F(x); FIREWALL: raw iterate, own zs) ---
             if is_mode_b:
@@ -312,7 +407,7 @@ def run_loop(cfg):
                     rt.lengths, shape, cfg.dx, cfg.dy, bbu_k, bl_k,
                     cfg.flotation_gate, cfg.flotation_ramp, cfg.parallel_erode,
                     cfg.wrap_y, cfg.wrap_x, slope_normalise,
-                    hc_cell=hc_cell.ravel() if regime else None)
+                    hc_cell=hc_cell.ravel() if regime else None, toe=toe)
                 # Commit the move. omega == 1 is a DIRECT assignment: evaluating
                 # x + 1*(F - x) rounds (1000.0 + 1*(0.1 - 1000.0) != 0.1), which
                 # would cost the bit-for-bit default. Never in place — the first
@@ -337,7 +432,7 @@ def run_loop(cfg):
                     zs_route, x, ice_flux, water_flux, cfg.law_code, cfg.gp,
                     dt_pass, rt.stack, rt.receivers, rt.nb_receivers, rt.weights,
                     rt.lengths, hc, shape, slope_normalise, cfg.dx, cfg.dy,
-                    cfg.wrap_y, cfg.wrap_x)
+                    cfg.wrap_y, cfg.wrap_x, toe=toe)
         H = x                                      # H(t) = the committed state
 
         if is_mode_b:
@@ -456,7 +551,16 @@ def run_loop(cfg):
         jf += 1
     if bar is not None:
         bar.close()
-    return buffers
+    # the state the next step would start on (the loop's own arrays; the
+    # facade's restart_state() copies): a restart from it continues this run
+    carried = dict(topography=topo, ice_thickness=H, flexure_column=col_prev,
+                   regime_s=s_rel, regime_icy=icy_rel, regime_s_conf=s_conf,
+                   regime_s_datum=s_datum)
+    if adaptive:
+        carried.update(damping_weight=w_cell, damping_prev_move=d_prev)
+    end_state = {k: carried[k] for in_use, fields in RESTART_GROUPS.values()
+                 if in_use(cfg) for k in fields}
+    return buffers, end_state
 
 
 def _snapshot(buffers, jf, cur):

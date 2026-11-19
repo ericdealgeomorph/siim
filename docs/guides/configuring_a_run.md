@@ -183,8 +183,7 @@ class as `channel_out` ({doc}`outputs_and_io`).
 
 Mode D also sets its own defaults wherever you leave them unset: the
 `'adaptive'` damping (and, if you choose `inner_damping='omega'`,
-`inner_relax = 1/3` over one pass), the Hack footprint
-coefficient `width_hack_k = 0.25`, the trunk surface off, the routing filter
+`inner_relax = 1/3` over one pass), the trunk surface off, the routing filter
 `routing_filter_factor = 2` on sheet cells and MFD routing, the only routing it
 accepts (single-flow and D-infinity flux trees read as false channels).
 It is the one mode in which `routing_filter_factor > 0`

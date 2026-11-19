@@ -744,6 +744,173 @@ def test_erosion_monotonic_in_dt():
     assert all(b > a for a, b in zip(eroded, eroded[1:])), eroded
 
 
+@pytest.mark.pin
+def test_erosion_newton_returns_the_root_where_newton_converges():
+    """Where Newton lands on the root, the solvers return it to round-off at
+    their default epsilon (1e-3 m). At n = 1 Newton is exact in one step; the
+    strict bracket test then rejected the next, zero step (it lands on the
+    bracket end that iterate set), bisected away and halved back, returning a
+    point up to epsilon off: on this test's 300 single-receiver draws, 241
+    (80 %) came back more than 1e-6 m off, as large as a whole erosion step at
+    small dt (ED-270)."""
+    from siim._core.solvers import _solver_bracketed_power, _solver_nonlinear_dinf
+    from siim.tests.test_solver_kary import _oracle
+    # the reported case (0.95 mm off before)
+    assert abs(_solver_bracketed_power(673.0, 664.5, 0.061, 1)
+               - (673.0 + 0.061 * 664.5) / 1.061) < 1e-9
+    rng = np.random.default_rng(270)
+    rec = np.array([1, 2], dtype=np.int64)
+    L = np.array([100.0, 100.0 * np.sqrt(2.0)])
+    for _ in range(300):
+        zr = rng.uniform(-500.0, 4000.0)
+        zo = zr + 10 ** rng.uniform(-2.0, 3.5)
+        G = 10 ** rng.uniform(-4.0, 4.0)
+        root = (zo + G * zr) / (1.0 + G)               # the n = 1 closed form
+        z = _solver_bracketed_power(zo, zr, G, 1.0)
+        assert abs(z - root) < 1e-9, (zo, zr, G, z, root)
+        # two receivers (D-inf / MFD), the second anywhere below the cell
+        zr2 = zr + (zo - zr) * rng.uniform()
+        w = np.array([0.7, 0.3])
+        A, dt = G, 100.0
+        z = _solver_nonlinear_dinf(zo, 2, rec, w, L, np.array([0.0, zr, zr2]),
+                                   A, 1.0, dt)
+        want = _oracle(zo, [zr, zr2], w, L, A, 1.0, dt)
+        assert abs(z - want) < 1e-9, (zo, zr, zr2, A, z, want)
+
+
+def test_erosion_newton_converges_where_plain_newton_two_cycles():
+    """A sub-linear residual over two receivers has a convex kink at the upper
+    receiver and concave pieces either side, so plain Newton from zo 2-cycles
+    across the kink on many of these draws. The bracketed solver must reach
+    the root on every draw within its default max_iter (50) at a tight
+    epsilon: every iterate it continues from lies strictly inside a shrinking
+    bracket, so it cannot cycle. At this epsilon the residual's round-off floor
+    (steep slope at the upper receiver) can sit above epsilon/2, so the solver
+    must also stop where the Newton step rounds to nothing, not bisect away
+    from the root (ED-270)."""
+    from siim._core.solvers import _solver_nonlinear_dinf
+    from siim.tests.test_solver_kary import _oracle
+    rng = np.random.default_rng(2702)
+    rec = np.array([1, 2], dtype=np.int64)
+    L = np.array([1.0, 1.0])
+    n_cycling = 0
+    for _ in range(600):
+        p = rng.uniform(0.05, 0.95)
+        zo = rng.uniform(100.0, 3000.0)
+        r1 = zo - 10 ** rng.uniform(-1.0, 3.0)
+        r2 = r1 + (zo - r1) * rng.uniform()
+        g = np.array([10 ** rng.uniform(-3.0, 3.0), 10 ** rng.uniform(-3.0, 6.0)])
+        w, A = g / g.sum(), g.sum()
+        want = _oracle(zo, [r1, r2], w, L, A, p, 1.0)
+        got = _solver_nonlinear_dinf(zo, 2, rec, w, L, np.array([0.0, r1, r2]),
+                                     A, p, 1.0, 1e-9, 50)
+        assert abs(got - want) < 1e-8, (p, zo, r1, r2, g, got, want)
+        # plain Newton from zo, 200 steps: is this draw a 2-cycle off the root?
+        z, hist = zo, []
+        for _ in range(200):
+            F, dF = z - zo, 1.0
+            for gk, zk in zip(g, (r1, r2)):
+                if z > zk:
+                    F += gk * (z - zk) ** p
+                    dF += p * gk * (z - zk) ** (p - 1.0)
+            hist.append(z)
+            z = z - F / dF
+        n_cycling += z == hist[-2] != hist[-1] and abs(z - want) > 1e-6
+    assert n_cycling > 200        # the stress case really is one
+
+
+@pytest.mark.pin
+def test_erosion_newton_stays_within_epsilon_at_any_exponent():
+    """The solvers stop on the residual, not the step: f' >= 1, so |f| bounds
+    the error. A step-size test stopped early where a sub-linear exponent's
+    slope is steep near the receiver: the reported fluvial case (n = 0.22)
+    returned 3.3e-4 m against a root of 0.0545 m, 54 epsilon off (ED-270).
+    The one-receiver and the multi-receiver solver land within epsilon
+    (1e-3 m) of the bisected root for exponents either side of 1."""
+    from siim._core.solvers import _solver_bracketed_power, _solver_nonlinear_dinf
+    from siim.tests.test_solver_kary import _oracle
+    eps = 1e-3
+    one = np.array([1.0])
+    zo, zr, G, n = 691.8176584057888, 0.0, 1321.5249669346765, 0.2224562186891106
+    want = _oracle(zo, [zr], one, one, G, n, 1.0)
+    assert want > 50 * eps                       # the step test's 3.3e-4 is far off
+    assert abs(_solver_bracketed_power(zo, zr, G, n) - want) < eps
+    z = _solver_nonlinear_dinf(zo, 1, np.array([1], dtype=np.int64), one, one,
+                               np.array([0.0, zr]), G, n, 1.0)
+    assert abs(z - want) < eps
+    rng = np.random.default_rng(2703)
+    rec = np.array([1, 2], dtype=np.int64)
+    L = np.array([100.0, 100.0 * np.sqrt(2.0)])
+    w = np.array([0.6, 0.4])
+    for _ in range(400):
+        p = rng.uniform(0.1, 3.0)
+        zr = rng.uniform(-500.0, 4000.0)
+        zo = zr + 10 ** rng.uniform(-3.0, 3.5)
+        G = 10 ** rng.uniform(-6.0, 6.0)
+        want = _oracle(zo, [zr], one, one, G, p, 1.0)
+        z = _solver_bracketed_power(zo, zr, G, p)
+        assert abs(z - want) < eps, (zo, zr, G, p, z, want)
+        zr2 = zr + (zo - zr) * rng.uniform()
+        z = _solver_nonlinear_dinf(zo, 2, rec, w, L, np.array([0.0, zr, zr2]),
+                                   G, p, 100.0)
+        want = _oracle(zo, [zr, zr2], w, L, G, p, 100.0)
+        assert abs(z - want) < eps, (zo, zr, zr2, G, p, z, want)
+
+
+def test_coulomb_erosion_newtons_stop_on_the_residual():
+    """The Coulomb erosion Newtons share the bracketed stopping rule at their
+    own tolerance, epsilon*(1 + |zo|) with epsilon = 1e-8. Their residual rises
+    with slope >= 1, so the one-receiver solver now returns the bisected root
+    to round-off (the Armijo step-size rule it replaced stopped up to 2.6e-5 m
+    off, after up to 54 H-solves), and the multi-receiver one, whose lagged
+    derivative only steers the step, lands within its tolerance (ED-270)."""
+    from siim import constants as C
+    from siim._core.eroders import (_F_coulomb_dinf_residual,
+                                    _solver_glacial_coulomb_dinf)
+    from siim._core.solvers import _F_and_dF_coulomb, _solver_glacial_coulomb
+    ell, t, cg = C.NU / 2.0, 0.6 * C.NU, C.cg_prefactor()
+    law = (C.RHO_ICE_G, C.TAU_C, C.LAMBDA_C)
+
+    def bisect(residual, zo, rest, lo):
+        """200 halvings of residual(z, zo, *rest) over [lo, zo]."""
+        hi = zo
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (lo, mid) if residual(mid, zo, *rest)[0] > 0.0 else (mid, hi)
+        return 0.5 * (lo + hi)
+
+    rng = np.random.default_rng(2704)
+    rec = np.array([1, 2], dtype=np.int64)
+    for _ in range(150):
+        dx, dt = rng.choice([100.0, 500.0, 1000.0]), rng.choice([1.0, 100.0, 1e3])
+        Qg, zr = 10 ** rng.uniform(3.0, 9.0), rng.uniform(0.0, 3000.0)
+        zo = zr + 10 ** rng.uniform(-3.0, 3.3)
+        A_pre = (C.CE * (cg ** 0.4 / C.ALPHA_G) ** ell * dt / dx ** t
+                 * Qg ** (0.6 * ell))
+        args = (Qg, A_pre, ell, t, cg) + law + (dx, C.COULOMB_CLAMP)
+        want = bisect(_F_and_dF_coulomb, zo, (zr,) + args, zr)
+        z = _solver_glacial_coulomb(zo, zr, *args)
+        assert abs(z - want) < 1e-9, (zo, zr, Qg, dx, dt, z, want)
+        # two receivers below the cell
+        zf = np.array([0.0, zr, zr + (zo - zr) * rng.uniform()])
+        w, L = np.array([0.6, 0.4]), np.array([dx, dx * np.sqrt(2.0)])
+        kargs = (2, rec, w, L, zf, Qg, dt * C.CE * (cg ** 0.4 / C.ALPHA_G) ** ell,
+                 ell, t, 0.6 * ell, cg) + law + (C.COULOMB_CLAMP,)
+        want = bisect(_F_coulomb_dinf_residual, zo, kargs, zr)
+        z = _solver_glacial_coulomb_dinf(zo, *kargs)
+        assert abs(z - want) < 1e-8 * (1.0 + abs(zo)), (zo, zf, Qg, dx, dt, z, want)
+
+
+def test_erosion_newton_step_bisects_on_a_non_finite_residual():
+    """An inf or NaN derivative or residual (the Coulomb gamma pole) gives a
+    Newton step that certifies nothing: the shared step bisects instead of
+    stopping where the step rounds to nothing (ED-270 review)."""
+    from siim._core.solvers import _bracketed_newton_step
+    for f, df in ((0.01, np.inf), (np.nan, 1.0), (0.01, np.nan)):
+        z, lo, hi, done = _bracketed_newton_step(10.0, f, df, 0.0, 10.0, 1e-3)
+        assert not done and z == 0.5 * (lo + hi), (f, df, z, lo, hi)
+
+
 # ---------------------------------------------------------------------------
 # Glacial erosion / flow-accumulator processes read the post-tectonics surface
 # ---------------------------------------------------------------------------

@@ -41,7 +41,7 @@ _D = dict(_PHYSICS, T=1e4, nt=11, nt_out=11, Lx=1e4, Ly=1e4, nx=41, ny=41,
 # every arm: a default-vs-explicit comparison proves parameter equivalence only).
 _D_ROWS = ('glacial_spl__hc_cell', 'glacial_spl__channel')   # the rows only mode D stores
 _D_KNOBS = dict(inner_damping=_constants.MODE_BCD_INNER_DAMPING, inner_passes=_constants.INNER_PASSES,
-                flow_routing='mfd', width_hack_k=0.25, parallel_erode=False,
+                flow_routing='mfd', width_hack_k=_constants.WIDTH_HACK_K, parallel_erode=False,
                 trunk_surface=_constants.MODE_D_TRUNK_SURFACE)
 
 
@@ -527,9 +527,10 @@ def test_mode_d_defaults_resolve():
     # gate: routing_relax (MODE_D_ROUTING_RELAX 0) was removed 2026-11-04; the
     # damping is the adaptive preset since (Eric, 2026-11-05; adaptive_capped from 2026-11-04)
     assert m.inner_damping == C.MODE_BCD_INNER_DAMPING
+    # gate: mode D's Hack k follows WIDTH_HACK_K since 2026-11-19 (one coefficient for every mode)
     assert (m.inner_relax, m.width_hack_k, m.routing_filter_factor, m.flow_routing,
             m.trunk_surface, m.parallel_erode) == (
-        C.INNER_DAMPING_FLOORS[C.MODE_BCD_INNER_DAMPING], C.MODE_D_WIDTH_HACK_K, C.MODE_D_ROUTING_FILTER_FACTOR,
+        C.INNER_DAMPING_FLOORS[C.MODE_BCD_INNER_DAMPING], C.WIDTH_HACK_K, C.MODE_D_ROUTING_FILTER_FACTOR,
         C.MODE_D_FLOW_ROUTING, C.MODE_D_TRUNK_SURFACE,   # gate: D's own trunk default again (Eric, 2026-11-03: V off)
         # gate: under MFD, D's routing, the parallel_erode default follows the threading layer (ED-168; pinned in test_threading.py)
         threading_layer() in C.MFD_PARALLEL_ERODE_LAYERS)

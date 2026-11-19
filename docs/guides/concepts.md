@@ -32,6 +32,32 @@ With bed memory (modes B, C and D), ice extent and erosion can vary in time unde
 constant forcing (autogenic cycling); two such runs are compared through
 long-run statistics rather than individual output frames.
 
+(toe-slope-1d)=
+## The terminus in 1D: the toe slope correction
+
+The 1D model builds each cell's rise from the glacial slope at its upstream
+node. Near a terminus that slope is singular: the ice flux falls linearly to
+zero there, and the steady surface steepens as `S ~ Q**-phi_t`, with
+`phi_t` the sliding law's thin-ice limit (1/3 power, 1/2 Coulomb, `mu/nu`
+effective exponent). An uncorrected upwind step across that singularity holds
+the terminus at an arbitrary place in its cell, which costs the divide and
+terminus their convergence in `dx` and drives a spurious swing of the mode-A
+divide: 19 to 26 m on 50 and 25 m cells for the power and effective-exponent
+laws (9 m for Coulomb on 25 m cells), and 32 to 35 m for Coulomb with the
+accumulation cap on, on every grid from 200 to 25 m. siim1d therefore scales the
+upwind slope of every icy node whose downstream neighbour carries less flux by
+a factor of the flux ratio, exact for that surface, and gives the last icy
+node the slope from the sub-grid terminus where the glacier draining to it
+spans at least `constants.TOE_MIN_CELLS` (5) icy nodes (on a shorter one the
+grid does not resolve the toe and that term over-corrects, so the last node
+keeps the uncorrected step), in mode A's slope, the erosion
+kernels and mode B's walk alike (`toe_slope_correction`, on by default; the
+2D model has an experimental opt-in port, `toe_slope_correction_2d`, off by
+default). With it the 1D divide and terminus converge at
+first order in `dx`, and modes A and B settle on the same state. Coulomb with
+the accumulation cap on is the exception that keeps a slow mode-A swing on
+fine cells (see the changelog).
+
 ## The channel-floor datum: where the bed sits
 
 The tracked bed `zb` is not the ice surface — it is the **sub-grid channel floor**

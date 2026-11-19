@@ -119,44 +119,94 @@ def _solve_ice_thickness_coulomb(D, a, lambda_c, clamp, tol=1e-12, max_iter=100)
 
     return H
 
-@numba.njit(cache=True)
-def _F_func(zik, zio, zr, Fi, n):
-    if zik >= zr:
-        return zik - zio + Fi * (zik - zr) ** n
-    return zik - zio
+@numba.njit(cache=True, inline='always')
+def _bracketed_newton_step(zik, f, df, lo, hi, epsilon):
+    """One step of the bracketed erosion Newtons, with their stopping rule.
+
+    The erosion residuals ``f(z) = z - zo + sum_k G_k*max(0, z - zr_k)^p``
+    (and the Coulomb ones, whose erosion term also grows with the slope) rise
+    with slope ``f' >= 1``, so ``|z - root| <= |f(z)|``: the residual bounds
+    the error, which a step-size test does not (a sub-linear exponent's
+    steep slope near a receiver makes the step tiny far from the root; a step
+    that rounds to nothing at the root fell outside the strict bracket test and
+    bisected away; ED-270). Narrows the bracket ``[lo, hi]`` by the sign of
+    ``f(zik)`` and returns ``(z, lo, hi, done)``:
+
+    - a non-finite residual or Newton step: bisect;
+    - ``|f| < epsilon/2``: done, at the Newton step if it lies strictly inside
+      the bracket (within ``2|f|`` of the root, and at round-off once Newton
+      has converged), else at ``zik``;
+    - the Newton step rounds to nothing: done at ``zik``, a floating-point
+      fixed point whose residual sits at its round-off floor (which a steep
+      slope can lift above a tight epsilon);
+    - the Newton step leaves the open bracket: bisect, or, once the bracket is
+      narrower than epsilon, done at the float just inside the end Newton
+      points past (a steep sub-linear slope near a receiver, where Newton
+      overshoots and the residual cannot certify);
+    - otherwise continue from the Newton step.
+
+    So the result lies within epsilon of the root, and strictly inside the
+    bracket unless it is an iterate the solver evaluated: never the receiver
+    elevation."""
+    if f > 0.0:
+        hi = zik
+    elif f < 0.0:
+        lo = zik
+    elif f == 0.0:
+        return zik, lo, hi, True
+    if not (np.isfinite(f) and np.isfinite(df)):
+        # an inf/NaN residual or derivative (the Coulomb gamma pole) certifies nothing
+        return 0.5 * (lo + hi), lo, hi, False
+    z_new = zik - f / df
+    if z_new == zik:
+        return zik, lo, hi, True
+    if abs(f) < 0.5 * epsilon:
+        return (z_new if lo < z_new < hi else zik), lo, hi, True
+    if lo < z_new < hi:
+        return z_new, lo, hi, False
+    if hi - lo < epsilon:
+        # the float next to the end Newton points past
+        if z_new <= lo:
+            return np.nextafter(lo, hi), lo, hi, True
+        return np.nextafter(hi, lo), lo, hi, True
+    return 0.5 * (lo + hi), lo, hi, False
 
 @numba.njit(cache=True)
-def _dzF_func(zik, zr, Fi, n):
-    if zik > zr:
-        return 1 + n * Fi * (zik - zr) ** (n - 1)
-    return 1.0
+def _solver_bracketed_power(zio, zr, C, e, epsilon=1e-3, max_iter=50):
+    """Bracketed implicit erosion Newton on one receiver: the root of
+    ``f(z) = z - zio + C*max(0, z - zr)^e`` in ``[zr, zio]``, stopped by
+    :func:`_bracketed_newton_step`.
 
-@numba.njit(cache=True)
-def _solver_fluvial(zio, zr, Fi, n, epsilon=1e-3, max_iter=50):
-    # f(z) = z - zio + Fi*(z - zr)^n is strictly increasing with its root in
-    # [zr, zio]. Plain Newton 2-cycles for n < 1 once Fi*n*(1-n)*dz^(n-1) is
-    # large enough, silently returning zio (zero erosion) — keep a bracket
-    # and bisect whenever the Newton step leaves it.
+    f is strictly increasing with its root in the bracket. Plain Newton
+    2-cycles for e < 1 once C*e*(1-e)*dz^(e-1) is large enough, silently
+    returning zio (zero erosion); the bracket bisects whenever the Newton step
+    leaves it. One solver for the fluvial (``C = Fi``, ``e = n``), eff-exp
+    glacial (``Gi``, ``nu``) and power glacial (``Gi``, ``t``) laws, reached
+    under those three names. ``e - 1`` keeps an integer exponent integer, as
+    the three copies it replaced did.
+    """
     if zio <= zr:
         return zio
     lo = zr
     hi = zio
     zik = zio
     for _ in range(max_iter):
-        f = _F_func(zik, zio, zr, Fi, n)
-        if f > 0.0:
-            hi = zik
-        elif f < 0.0:
-            lo = zik
+        if zik > zr:
+            dz = zik - zr
+            f = zik - zio + C * dz ** e
+            df = 1.0 + e * C * dz ** (e - 1)
         else:
+            f = zik - zio
+            df = 1.0
+        zik, lo, hi, done = _bracketed_newton_step(zik, f, df, lo, hi, epsilon)
+        if done:
             return zik
-        zik_new = zik - f / _dzF_func(zik, zr, Fi, n)
-        if not (lo < zik_new < hi):
-            zik_new = 0.5 * (lo + hi)
-        if abs(zik_new - zik) < epsilon:
-            return zik_new
-        zik = zik_new
     return zik
+
+
+_solver_fluvial = _solver_bracketed_power        # (zio, zr, Fi, n)
+_solver_glacial = _solver_bracketed_power        # (zio, zr, Gi, nu), eff-exp law
+_solver_glacial_power = _solver_bracketed_power  # (zio, zr, Gi, t), power law
 
 @numba.njit(cache=True)
 def _solver_nonlinear_dinf(zo_i, n_rec, receivers_i, weights_i, lengths_i,
@@ -214,93 +264,9 @@ def _solver_nonlinear_dinf(zo_i, n_rec, receivers_i, weights_i, lengths_i,
             if dz > 0.0:
                 F  += G[k] * dz ** p
                 dF += p * G[k] * dz ** (p - 1.0)
-        if F > 0.0:
-            hi = zik
-        elif F < 0.0:
-            lo = zik
-        else:
-            break
-        zik_new = zik - F / dF
-        if not (lo < zik_new < hi):
-            zik_new = 0.5 * (lo + hi)
-        if abs(zik_new - zik) < epsilon:
-            zik = zik_new
-            break
-        zik = zik_new
-    return zik
-
-@numba.njit(cache=True)
-def _G_func(zik, zio, zr, Gi, nu):
-    if zik >= zr:
-        return zik - zio + Gi * (zik - zr) ** nu
-    return zik - zio
-
-@numba.njit(cache=True)
-def _dzG_func(zik, zr, Gi, nu):
-    if zik > zr:   # strict, matching _dzF_func / _dzG_func_power (0**neg at zik==zr; N8)
-        return 1 + nu * Gi * (zik - zr) ** (nu - 1)
-    return 1.0
-
-@numba.njit(cache=True)
-def _solver_glacial(zio, zr, Gi, nu, epsilon=1e-3, max_iter=50):
-    # Bracketed Newton (root in [zr, zio]; see _solver_fluvial).
-    if zio <= zr:
-        return zio
-    lo = zr
-    hi = zio
-    zik = zio
-    for _ in range(max_iter):
-        f = _G_func(zik, zio, zr, Gi, nu)
-        if f > 0.0:
-            hi = zik
-        elif f < 0.0:
-            lo = zik
-        else:
+        zik, lo, hi, done = _bracketed_newton_step(zik, F, dF, lo, hi, epsilon)
+        if done:
             return zik
-        zik_new = zik - f / _dzG_func(zik, zr, Gi, nu)
-        if not (lo < zik_new < hi):
-            zik_new = 0.5 * (lo + hi)
-        if abs(zik_new - zik) < epsilon:
-            return zik_new
-        zik = zik_new
-    return zik
-
-@numba.njit(cache=True)
-def _G_func_power(zik, zio, zr, Gi, t):
-    if zik >= zr:
-        return zik - zio + Gi * (zik - zr) ** t
-    return zik - zio
-
-@numba.njit(cache=True)
-def _dzG_func_power(zik, zr, Gi, t):
-    if zik > zr:
-        return 1.0 + t * Gi * (zik - zr) ** (t - 1.0)
-    return 1.0
-
-@numba.njit(cache=True)
-def _solver_glacial_power(zio, zr, Gi, t, epsilon=1e-3, max_iter=50):
-    # Bracketed Newton (root in [zr, zio]; see _solver_fluvial). Bracketing
-    # guards a sub-linear slope exponent t < 1 (which needs nu < 10/9); the
-    # current default nu = 2 gives t = 9*nu/10 = 1.8.
-    if zio <= zr:
-        return zio
-    lo = zr
-    hi = zio
-    zik = zio
-    for _ in range(max_iter):
-        f = _G_func_power(zik, zio, zr, Gi, t)
-        if f > 0.0:
-            hi = zik
-        elif f < 0.0:
-            lo = zik
-        else:
-            return zik
-        zik_new = zik - f / _dzG_func_power(zik, zr, Gi, t)
-        if not (lo < zik_new < hi):
-            zik_new = 0.5 * (lo + hi)
-        if abs(zik_new - zik) < epsilon:
-            return zik_new
-        zik = zik_new
     return zik
 
 @numba.njit(cache=True)
@@ -376,50 +342,27 @@ def _F_and_dF_coulomb(zik, zio, zr, Qg, A_pre, ell, t,
 def _solver_glacial_coulomb(zio, zr, Qg, A_pre, ell, t,
                                 cg, rho_g_g, tau_c, lambda_c, dx, clamp,
                                 epsilon=1e-8, max_iter=50):
-    """Scalar Newton on zik, using an analytical total
-    derivative (see _F_and_dF_coulomb) plus Armijo ``|F|``-decrease backtracking.
-    One H-solve per accepted Newton step; the Armijo call also returns dF,
-    which is carried into the next iteration.
+    """Bracketed scalar Newton on zik in ``[zr, zio]``, using the analytical
+    total derivative (see _F_and_dF_coulomb) and the stopping rule of the
+    power-law solvers (:func:`_bracketed_newton_step`) at the absolute
+    tolerance ``epsilon * (1 + |zio|)``. The residual rises with slope >= 1 (the
+    erosion term grows with the slope; dF is clamped to 1 against round-off),
+    so ``|F|`` bounds the error, and the bracket replaces the Armijo
+    ``|F|``-decrease backtracking of the step-size rule it replaced (ED-270).
+    One H-solve per residual.
     """
     if zio <= zr:
         return zio
+    tol = epsilon * (1.0 + abs(zio))
+    lo = zr
+    hi = zio
     zik = zio
-    F, dF = _F_and_dF_coulomb(zik, zio, zr, Qg, A_pre, ell, t,
-                               cg, rho_g_g, tau_c, lambda_c, dx, clamp)
-    if abs(F) < epsilon * (1.0 + abs(zik)):
-        return zik                                      # already at the root
-
     for _ in range(max_iter):
-        step = F / dF
-
-        # Armijo backtracking: halve until zik_new > zr AND |F_new| < |F|.
-        alpha = 1.0
-        zik_new = zik
-        F_new = F
-        dF_new = dF
-        accepted = False
-        while alpha > 1e-15:
-            zik_try = zik - alpha * step
-            if zik_try <= zr:
-                alpha *= 0.5
-                continue
-            F_try, dF_try = _F_and_dF_coulomb(zik_try, zio, zr, Qg, A_pre, ell, t,
-                                               cg, rho_g_g, tau_c, lambda_c, dx, clamp)
-            if abs(F_try) < abs(F):
-                zik_new = zik_try
-                F_new = F_try
-                dF_new = dF_try
-                accepted = True
-                break
-            alpha *= 0.5
-        if not accepted:
-            return zik                                  # stuck — bail
-
-        if abs(zik_new - zik) < epsilon * (1.0 + abs(zik)):
-            return zik_new
-        zik = zik_new
-        F = F_new
-        dF = dF_new
+        F, dF = _F_and_dF_coulomb(zik, zio, zr, Qg, A_pre, ell, t,
+                                   cg, rho_g_g, tau_c, lambda_c, dx, clamp)
+        zik, lo, hi, done = _bracketed_newton_step(zik, F, dF, lo, hi, tol)
+        if done:
+            return zik
     return zik
 
 @numba.njit(cache=True)

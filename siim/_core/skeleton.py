@@ -245,7 +245,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
                                ny, nx, dx_cell, dy_cell, border_bed_uplift,
                                bl=_BL, gate=_FLOT_GATE, ramp=_FLOT_RAMP,
                                wrap_y=False, wrap_x=False,
-                               parallel_erode=False, hc_cell=None):
+                               parallel_erode=False, hc_cell=None, toe_c=None):
     """SFR + mode B (zb-tracking joint walk + lake-fill), law-agnostic skeleton.
 
     One ``@njit(cache=True)`` kernel for all three sliding laws; the per-law
@@ -321,6 +321,11 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
         eroders._erode_modeb_sfr_levels). BIT-FOR-BIT with the serial eroder
         at any thread count (disjoint writes, identical per-node arithmetic;
         pinned by test_parallel_erode). Default False.
+    toe_c : ndarray or None
+        EXPERIMENTAL 2D toe slope correction: the per-node factor on the
+        glacial slope (``siim._core.step.toe_slope_factor``, always positive).
+        The joint walk and the eroders read ``lengths / toe_c``; the border
+        budget (step 5b) keeps the raw lengths. None = today's kernel.
     """
     Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p, lambda_c, tau_c, coulomb_clamp, rho_g_g, hc_over_H, D_H = p
     nn = zb_flat.shape[0]
@@ -334,6 +339,11 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
         hcc = np.full(nn, hc_over_H)
     else:
         hcc = hc_cell
+    # the glacial edge lengths (the 2D toe slope correction; raw when off)
+    if toe_c is None:
+        Lg = lengths
+    else:
+        Lg = lengths / toe_c
 
     # --- 0a. Per-node water datum: ``bl`` carries each base-level BORDER
     # node's own side datum (a scalar broadcasts to the uniform field, so the
@@ -380,7 +390,7 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
             if ice_flux[inode] <= 0.0:
                 H_flat[inode] = 0.0
                 continue
-            L = lengths[inode]
+            L = Lg[inode]
             if L <= 0.0:
                 H_flat[inode] = 0.0
                 continue
@@ -438,13 +448,13 @@ def _glac_fast_solve_modeB_sfr(zb_flat, ice_flux, water_flux,
                                 ice_flux, H_flat,
                                 Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p,
                                 lambda_c, tau_c, coulomb_clamp, rho_g_g,
-                                dt, lengths, rec, order, offsets, nlev)
+                                dt, Lg, rec, order, offsets, nlev)
     else:
         _erode_modeb_sfr(law_code, z_filled, z_pre, water_flux, ice_flux,
                          H_flat,
                          Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p,
                          lambda_c, tau_c, coulomb_clamp, rho_g_g,
-                         dt, lengths, stack, rec)
+                         dt, Lg, stack, rec)
 
     # --- 5. Erosion delta to zb (delta ≈ 0 inside lakes; carves persist).
     # Flotation gate: scale the glacial-erosion delta at an icy interior cell by
@@ -568,7 +578,7 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
                                 border_bed_uplift, wrap_y, wrap_x,
                                 bl=_BL, gate=_FLOT_GATE, ramp=_FLOT_RAMP,
                                 parallel_erode=False, slope_normalise=False,
-                                hc_cell=None):
+                                hc_cell=None, toe_c=None):
     """D-inf + mode B, law-agnostic skeleton.
 
     The D-inf twin of :func:`_glac_fast_solve_modeB_sfr` and the routing twin of
@@ -612,6 +622,13 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
     by :data:`siim._core.router.SLOPE_NORMALISED_ROUTERS`: on by default for
     every multi-receiver router (D-inf since 2026-09-05, and MFD), off for SFR,
     where gamma == 1 identically. See ``constants.MFD_GAMMA_FLOOR``.
+
+    ``toe_c`` (EXPERIMENTAL 2D toe slope correction; ``(n, k)`` like
+    ``lengths``): the per-edge factor on the glacial slope
+    (``siim._core.step.toe_slope_factor``, always positive), applied after the
+    gamma scaling as ``lengths_s / toe_c``, so the closure and every eroder
+    read it; the step-5b border budget keeps the raw lengths. None = today's
+    kernel.
     """
     Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p, lambda_c, tau_c, coulomb_clamp, rho_g_g, hc_over_H, D_H = p
     nn = zb_flat.shape[0]
@@ -634,6 +651,8 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
                                          wrap_y, wrap_x)
     else:
         lengths_s = lengths
+    if toe_c is not None:
+        lengths_s = lengths_s / toe_c
 
     # --- 0a. Per-node water datum (see the SFR twin): border nodes carry their
     # own side's datum, interior nodes inherit their basin OUTLET's. The D-inf
@@ -828,7 +847,7 @@ def _glac_fast_solve_modeB_dinf(zb_flat, ice_flux, water_flux, H_flat,
 
 
 @numba.njit(cache=True)
-def _diag_walk(zb, Qg, H_out, law_code, p, dx, didx_l, didx_r, nx):
+def _diag_walk(zb, Qg, H_out, law_code, p, dx, didx_l, didx_r, nx, cs=None, wx=None):
     """Mode-B 1D joint walk (H + surface), law-agnostic skeleton.
 
     The 1D twin of the 2D mode-B skeletons. Walk both sides of the divide from
@@ -846,6 +865,15 @@ def _diag_walk(zb, Qg, H_out, law_code, p, dx, didx_l, didx_r, nx):
 
     The 1D border bed (the implicit arrival-slope budget) lives in
     ``siim.siim1d._erode_border_bed_1d`` — this walk solves only H.
+
+    ``cs``, ``wx`` (both omitted when off): siim1d's toe slope correction
+    (``siim.siim1d.siim._toe_cells``). A node's slope is cs*(zs_i - zs_r)/dx, so
+    its cell length is dx/cs, and where wx > 0 the receiver surface zs_r is
+    extended to the sub-grid terminus by wx times the receiver's own
+    downstream rise; where the solved corrected slope is no steeper than that
+    rise over dx, the node is solved again at the uncorrected step (L = dx,
+    the plain receiver), as ``siim.siim1d._toe_receiver``. The branch is
+    judged on the closure's H, before siim1d's optional interior H diffusion.
     """
     Ko, Co, ce, n, nu, m, mu, cg, alpha_g, lambda_p, lambda_c, tau_c, clamp, rho_g_g, hc_over_H, D_H = p
     # left side: outlet at i=0; walk i=1..didx_l, receiver is i-1.
@@ -859,10 +887,23 @@ def _diag_walk(zb, Qg, H_out, law_code, p, dx, didx_l, didx_r, nx):
                     H_out[i] = 0.0
                     continue
                 zs_r = zb[i - 1] + hc_over_H * H_out[i - 1]
-                a = zb[i] - zs_r
-                H_out[i] = _modeb_closure(law_code, False, a, Qg[i], dx,
+                zr, L, rise = zs_r, dx, 0.0
+                # the walk's copy of siim1d._toe_receiver's rule
+                if cs is not None:
+                    if wx[i] > 0.0 and i >= 2:
+                        rise = max(zs_r - zb[i - 2] - hc_over_H * H_out[i - 2], 0.0)
+                        zr += wx[i] * rise
+                    L = dx / cs[i]
+                H_out[i] = _modeb_closure(law_code, False, zb[i] - zr, Qg[i], L,
                                           hc_over_H, cg, lambda_p, lambda_c,
                                           tau_c, rho_g_g, clamp)
+                # its fallback: a corrected slope no steeper than the bare rise
+                # takes the uncorrected step (without an extension it would be
+                # a non-positive slope, which the mode-B closure never yields)
+                if rise > 0.0 and cs[i] * (zb[i] + hc_over_H * H_out[i] - zr) <= rise:
+                    H_out[i] = _modeb_closure(law_code, False, zb[i] - zs_r, Qg[i], dx,
+                                              hc_over_H, cg, lambda_p, lambda_c,
+                                              tau_c, rho_g_g, clamp)
             if icy:
                 H_out[0] = H_out[1]                  # zero-gradient thickness
     # right side: outlet at i=nx-1; walk i=nx-2..didx_r, receiver is i+1
@@ -876,9 +917,19 @@ def _diag_walk(zb, Qg, H_out, law_code, p, dx, didx_l, didx_r, nx):
                     H_out[i] = 0.0
                     continue
                 zs_r = zb[i + 1] + hc_over_H * H_out[i + 1]
-                a = zb[i] - zs_r
-                H_out[i] = _modeb_closure(law_code, False, a, Qg[i], dx,
+                zr, L, rise = zs_r, dx, 0.0
+                # the walk's copy of siim1d._toe_receiver's rule (see the left side)
+                if cs is not None:
+                    if wx[i] > 0.0 and i + 2 < nx:
+                        rise = max(zs_r - zb[i + 2] - hc_over_H * H_out[i + 2], 0.0)
+                        zr += wx[i] * rise
+                    L = dx / cs[i]
+                H_out[i] = _modeb_closure(law_code, False, zb[i] - zr, Qg[i], L,
                                           hc_over_H, cg, lambda_p, lambda_c,
                                           tau_c, rho_g_g, clamp)
+                if rise > 0.0 and cs[i] * (zb[i] + hc_over_H * H_out[i] - zr) <= rise:
+                    H_out[i] = _modeb_closure(law_code, False, zb[i] - zs_r, Qg[i], dx,
+                                              hc_over_H, cg, lambda_p, lambda_c,
+                                              tau_c, rho_g_g, clamp)
             if icy:
                 H_out[nx - 1] = H_out[nx - 2]        # zero-gradient thickness

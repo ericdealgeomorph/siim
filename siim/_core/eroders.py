@@ -9,7 +9,7 @@ import numpy as np
 import numba
 
 from .solvers import (
-    LAW_EFFEXP, LAW_POWER, _solve_ice_thickness_coulomb,
+    LAW_EFFEXP, LAW_POWER, _bracketed_newton_step, _solve_ice_thickness_coulomb,
     _solver_fluvial, _solver_glacial, _solver_glacial_power,
     _solver_glacial_coulomb, _solver_nonlinear_dinf,
 )
@@ -264,7 +264,7 @@ def _F_coulomb_dinf_residual(zik, zo_i, n_rec, receivers_i, weights_i, lengths_i
 
     Mass factor M and H are computed from the cell's weighted-mean slope
     S_eff = Σ_k w_k · max(0, (zik - z_rk)/L_k); the derivative is *lagged* in S
-    (we drop the dM/dS coupling and rely on Newton line-search for robustness).
+    (we drop the dM/dS coupling; the solver's bracket gives the robustness).
     Returns (F, dF). If no downhill receiver exists, returns (zik-zo, 1).
     """
     # Weighted-mean slope across active downhill receivers
@@ -322,42 +322,29 @@ def _solver_glacial_coulomb_dinf(zo_i, n_rec, receivers_i, weights_i, lengths_i,
                                 z_flat, Qg, base_A_with_dt, ell, t, exp_Q,
                                 cg, rho_g_g, tau_c, lambda_c, clamp,
                                 epsilon=1e-8, max_iter=50):
-    """Multi-receiver coulomb Newton with Armijo ``|F|``-decrease
-    backtracking."""
+    """Multi-receiver coulomb Newton, bracketed in ``[min_k z_rk, zo_i]`` over
+    the active receivers and stopped as ``_solver_glacial_coulomb`` is (the
+    shared ``_bracketed_newton_step`` at ``epsilon * (1 + |zo_i|)``). The
+    derivative is lagged in S, so it steers the step only: the stopping rule
+    reads the residual, which rises with slope >= 1 (measured, not proven:
+    its secant slope was >= 1 - 2e-6 over 2000 random cases; ED-270)."""
+    lo = zo_i
+    for k in range(n_rec):
+        if lengths_i[k] > 0.0 and z_flat[receivers_i[k]] < lo:
+            lo = z_flat[receivers_i[k]]
+    if lo >= zo_i:
+        return zo_i
+    tol = epsilon * (1.0 + abs(zo_i))
+    hi = zo_i
     zik = zo_i
-    F, dF = _F_coulomb_dinf_residual(
-        zik, zo_i, n_rec, receivers_i, weights_i, lengths_i,
-        z_flat, Qg, base_A_with_dt, ell, t, exp_Q,
-        cg, rho_g_g, tau_c, lambda_c, clamp)
-    if abs(F) < epsilon * (1.0 + abs(zik)):
-        return zik
     for _ in range(max_iter):
-        step = F / dF
-        alpha = 1.0
-        accepted = False
-        zik_new = zik
-        F_new = F
-        dF_new = dF
-        while alpha > 1e-15:
-            zik_try = zik - alpha * step
-            F_try, dF_try = _F_coulomb_dinf_residual(
-                zik_try, zo_i, n_rec, receivers_i, weights_i, lengths_i,
-                z_flat, Qg, base_A_with_dt, ell, t, exp_Q,
-                cg, rho_g_g, tau_c, lambda_c, clamp)
-            if abs(F_try) < abs(F):
-                zik_new = zik_try
-                F_new = F_try
-                dF_new = dF_try
-                accepted = True
-                break
-            alpha *= 0.5
-        if not accepted:
+        F, dF = _F_coulomb_dinf_residual(
+            zik, zo_i, n_rec, receivers_i, weights_i, lengths_i,
+            z_flat, Qg, base_A_with_dt, ell, t, exp_Q,
+            cg, rho_g_g, tau_c, lambda_c, clamp)
+        zik, lo, hi, done = _bracketed_newton_step(zik, F, dF, lo, hi, tol)
+        if done:
             return zik
-        if abs(zik_new - zik) < epsilon * (1.0 + abs(zik)):
-            return zik_new
-        zik = zik_new
-        F = F_new
-        dF = dF_new
     return zik
 
 
@@ -368,7 +355,7 @@ def _coulomb_erode_2d_dinf(z, zo, Qf, Qg, dt, Ko, ce, m, n, ell, t,
     """Coulomb sliding law erosion on a multi-receiver graph.
 
     Per-cell H is computed from the weighted-mean slope; erosion is solved by
-    multi-receiver Newton with lagged-S Jacobian and line-search backtracking.
+    a bracketed multi-receiver Newton with a lagged-S Jacobian.
     Fluvial fallback shares the bracketed ``_solver_nonlinear_dinf`` with the
     eff-exp/power D-inf eroders.
     """

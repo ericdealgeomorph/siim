@@ -46,7 +46,7 @@ _os.environ.setdefault("NUMBA_THREADING_LAYER_PRIORITY", "tbb workqueue omp")
 if "numba" in _sys.modules:
     _sys.modules["numba"].config.reload_config()
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 
 _LAZY = ("analytical_steady_state_solution", "GeneralProfile",

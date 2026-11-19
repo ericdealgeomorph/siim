@@ -18,6 +18,7 @@ from ._core.skeleton import (  # 1D joint walk + fill + implicit border step
     _diag_walk, _implicit_border_step, _lake_fill_1d)
 from ._core.eroders import _linear_implicit, _modeb_border_erosion  # n = nu = 1 step; border-bed rate
 from ._core.params import GlacialParams
+from ._core.toe import thin_ice_phi, toe_flux_factors as _toe_flux_factor
 
 
 def _load_initial_topography(src):
@@ -249,6 +250,10 @@ class siim:
             # toe where H ∝ S^(-2/3) can produce sharp transitions. None or 0
             # disables.
             "H_diffusivity": None,
+            # Toe slope correction (modes A and B, on by default): the upwind
+            # step exact for the singular toe surface; False is the uncorrected
+            # toe step, bit for bit. See siim1d.siim._toe_cells.
+            "toe_slope_correction": _constants.TOE_SLOPE_CORRECTION,
             # Centerline-to-mean depth ratio hc/H for surfaces built from
             # (zb, H) state: zs = zb + hc_over_H * H (the tracked bed is the
             # channel floor; H stays the mean depth driving flux/erosion).
@@ -552,6 +557,9 @@ class siim:
         if self.H_diffusivity is not None:
             _constants.check_range('H_diffusivity', self.H_diffusivity, 0.0, inclusive=True)
 
+        self.toe_slope_correction = bool(params.toe_slope_correction)
+        self.phi_toe = self._toe_phi()
+
     @property
     def run_id(self):
         ela = self.zELA_run[-1] if hasattr(self, 'zELA_run') else self.zELA
@@ -626,6 +634,7 @@ class siim:
             self.d, self.sigma, self.k_h, P_now,
             self.xo_l, self.xo_r, self.didx_l, self.didx_r, self.nx, B_cap
         )
+        self._toe = self._toe_cells()   # the toe slope correction for this flux
 
     def _glacial_params_and_code(self):
         """(law_code, GlacialParams) for the 1D mode-B walk. The walk does only
@@ -642,9 +651,100 @@ class siim:
         return LAW_EFFEXP, GlacialParams(
             cg=self.cg, lambda_p=self.lambda_p, hc_over_H=self.hc_over_H)
 
+    def _toe_phi(self):
+        """phi_t, the exponent of the singular toe surface S ~ s^-phi_t (s the
+        distance from the terminus), for this run's law: power 1/3, Coulomb
+        1/2, effective exponent mu/nu. One source with siim2d, where the
+        derivation lives: siim._core.toe.thin_ice_phi."""
+        return thin_ice_phi(self.sliding_law, self.phi)
+
+    def _toe_cells(self):
+        """The toe slope correction for this step, from the flux just solved:
+        (cs, wx) per node, or None when the correction is off or no node is icy.
+
+        A node's glacial slope is cs * (z_i - z_r) / dx, with z_r its
+        downstream neighbour's surface, extended where wx > 0 to the sub-grid
+        terminus by wx times that neighbour's own downstream rise. Every icy
+        node whose receiver is icy with a smaller flux takes cs = c(q),
+        q = Q_receiver/Q_node (_toe_flux_factor), exact for S ~ Q^-phi_t with
+        Q linear across the cell (on the toe, Q ~ s, that is
+        z - z_t ~ s^(1 - phi_t)). Nodes where the flux grows downstream
+        (q >= 1, above the flux maximum) keep cs = 1: c(q) grows without bound
+        as q -> inf (at the head) and the singularity it corrects is the
+        toe's. The terminus of each ice block lies a fraction zeta of a cell
+        beyond its last icy node j, where the trapezoid continuation of the
+        flux integral across the cell crosses zero (zeta = 1/(1 - q) with the
+        continued, negative flux), held at least constants.TOE_ZETA_MIN, so
+        the factor stays finite. Node j takes the secant from the terminus
+        (wx = 1 - zeta, the toe on the fluvial surface extended up to it)
+        times 1 - phi_t, so cs = (1 - phi_t)/zeta, but only where the block
+        draining to that terminus holds at least constants.TOE_MIN_CELLS icy
+        nodes: the term is exact only on a toe the grid resolves, and on a
+        shorter glacier it over-corrects, so node j keeps the uncorrected step
+        (cs = 1, wx = 0; the interior c(q) is kept). The block is counted on
+        the terminus's own side of the divide (the nodes that drain to it),
+        so an ice cap centred on the divide is judged by each flank: an
+        8-node cap split 4 and 4 is guarded at both termini. Within two
+        cells of the outlet (j = 1, 2 or nx - 3, nx - 2) the toe is taken at
+        the receiver's level (wx = 0), exact when the bare reach below the terminus is flat:
+        beside it the receiver is the outlet itself, with no downstream rise to
+        extend, and one cell further the rise would be read off the outlet's
+        raw bed, which the mode-B walk sees but the kernels' working surface
+        (border floored at bl, lakes filled) does not. Where the
+        corrected slope is no steeper than the bare slope it was extended
+        along (not positive, without an extension), _toe_slope and the
+        kernels take the uncorrected step (_toe_receiver). cs = 1, wx = 0
+        elsewhere."""
+        if not self.toe_slope_correction or not (self.Qg > 0.0).any():
+            return None                   # no ice: neutral factors, the off path
+        cs, wx = np.ones(self.nx), np.zeros(self.nx)
+        phi, dsig = self.phi_toe, self.d * self.sigma
+        pre = self.k_h * self.sigma * self.d
+        span = np.arange(_constants.TOE_MIN_CELLS)   # the guard's block, in nodes from the last one
+        sides = []           # (upstream step, first node, last node, xi(node))
+        if self.didx_l >= 0:      # outlet at 0, upstream is +1
+            sides.append((1, 1, self.didx_l,
+                          lambda i: self.x[i] - self.x[self.didx_l] + self.xo_l))
+        if self.didx_r < self.nx:  # outlet at nx-1, upstream is -1
+            sides.append((-1, self.didx_r, self.nx - 2,
+                          lambda i: self.x[self.didx_r] - self.x[i] + self.xo_r))
+        for up, lo, hi, xi in sides:
+            k = np.arange(lo, hi + 1)
+            Qk, Qr = self.Qg[k], self.Qg[k - up]
+            m = (Qk > 0.0) & (Qr > 0.0) & (Qr < Qk)
+            cs[k[m]] = _toe_flux_factor(Qr[m] / Qk[m], phi)
+            last = (Qk > 0.0) & (Qr <= 0.0)      # each block's last icy node
+            for j, Qj in zip(k[last], Qk[last]):
+                blk = j + up * span              # j and the next icy nodes draining to it, this side only
+                if not lo <= blk[-1] <= hi or not (self.Qg[blk] > 0.0).all():
+                    continue                     # a glacier the grid does not resolve: the uncorrected step
+                r = j - up
+                xj, xr = xi(j), xi(r)
+                i1 = Qj * xj ** (self.d * (self.sigma - 1.0)) / pre
+                i0 = i1 + 0.5 * (xr ** (dsig - 1.0) * self.B[r]
+                                 + xj ** (dsig - 1.0) * self.B[j]) * (xr - xj)
+                zeta = max(i1 / (i1 - i0) if i0 < 0.0 else 1.0, _constants.TOE_ZETA_MIN)
+                cs[j] = (1.0 - phi) / zeta
+                if 0 < r - up < self.nx - 1:     # r or r - up an outlet: wx = 0
+                    wx[j] = 1.0 - zeta
+        return cs, wx
+
+    def _toe_slope(self, zs, slope, toe):
+        """Overwrite ``slope`` at the toe nodes with the corrected slope of the
+        surface ``zs`` (the explicit slope the H closure and the diagnostics
+        read; the erosion kernels apply the same correction implicitly). Where
+        the corrected slope is no steeper than the bare slope it was extended
+        along, the uncorrected one, as in the kernels (_toe_receiver)."""
+        cs, wx = toe
+        _toe_slope_nodes(zs, slope, np.flatnonzero((cs != 1.0) | (wx > 0.0)),
+                         self.didx_l, self.dx, cs, wx)
+
     def calculate_ice_thickness(self):
         """
         Calculate ice thickness with bidirectional flow from divide.
+
+        Reads this step's toe slope correction ``self._toe`` (_toe_cells, set
+        by calculate_ice_flux; None when off).
 
         Per-step mode (self._mode_B_active):
           * Mode A: slope is read off the current state self.z, then
@@ -655,6 +755,7 @@ class siim:
             bedrock state) and the receiver's just-solved
             z_s = zb_r + hc_over_H*H_r.
         """
+        toe = self._toe
         # Mode B path: the upstream walk solves H and
         # z_s = zb + hc_over_H*H jointly per node (tight closure), dispatched
         # by sliding law.
@@ -664,7 +765,7 @@ class siim:
                     f"Mode B not implemented for sliding_law='{self.sliding_law}'.")
             law_code, p = self._glacial_params_and_code()
             _diag_walk(self.zb, self.Qg, self.H, law_code, p,
-                       self.dx, self.didx_l, self.didx_r, self.nx)
+                       self.dx, self.didx_l, self.didx_r, self.nx, *(toe or ()))
             self._diffuse_interior_1d(self.H, self.H_diffusivity)
             np.maximum(self.H, 0.0, out=self.H)
             zs = self.zb + self.hc_over_H * self.H
@@ -673,6 +774,8 @@ class siim:
                 ice_surface_slope[1:self.didx_l+1] = np.diff(zs[:self.didx_l+1]) / self.dx
             if self.didx_r < self.nx:
                 ice_surface_slope[self.didx_r:self.nx-1] = -np.diff(zs[self.didx_r:]) / self.dx
+            if toe is not None:
+                self._toe_slope(zs, ice_surface_slope, toe)
             np.clip(ice_surface_slope, 0.0, None, out=ice_surface_slope)
             self.H[self.Qg == 0] = 0.0
             self.H[self.H < 0] = 0.0
@@ -700,6 +803,8 @@ class siim:
         if self.didx_r < self.nx:
             ice_surface_slope[self.nx - 1] = max(
                 0.0, (self.z[self.nx - 2] - self.z[self.nx - 1]) / self.dx)
+        if toe is not None:
+            self._toe_slope(self.z, ice_surface_slope, toe)
 
         # calculate D parameter and solve for H. With kt now inside cg, the H-equations
         # carry no explicit kt (Qg is m^3/yr, cg is m^-3/yr).
@@ -805,19 +910,23 @@ class siim:
 
     # erosion functions
     def calculate_erosion(self):
+        """Erode one step with the law's implicit kernel, with this step's toe
+        slope correction ``self._toe`` (set by calculate_ice_flux)."""
+        toe = self._toe or ()                     # (cs, wx) when on
 
         if self.sliding_law == "eff-exp":
             if (self.nu == 1) & (self.n == 1):
                 _linear_erode(self.z, self.z_o, self.Qf, self.Qg,
                               (self.dt / self.dx) * self.Ko,
                               (self.dt / self.dx) * self.Co,
-                              self.m, self.mu, self.nx, self.didx_l, self.didx_r)
+                              self.m, self.mu, self.nx, self.didx_l, self.didx_r,
+                              *toe)
             else:
                 _nonlinear_erode(self.z, self.z_o, self.Qf, self.Qg,
                                  (self.dt / self.dx**self.n) * self.Ko,
                                  (self.dt / self.dx**self.nu) * self.Co,
                                  self.m, self.mu, self.nx, self.n, self.nu,
-                                 self.didx_l, self.didx_r)
+                                 self.didx_l, self.didx_r, *toe)
 
         elif self.sliding_law == "power":
             # E = G_o * S^(3*ell/2),
@@ -829,7 +938,7 @@ class siim:
                                / (self.alpha_g**2.0)) ** (self.ell / 2.0))
             _power_erode(self.z, self.z_o, self.Qf, self.Qg, self.H,
                          Kf, Kg_prefactor, self.m, self.nx, self.n, t,
-                         self.lambda_p, self.didx_l, self.didx_r)
+                         self.lambda_p, self.didx_l, self.didx_r, *toe)
 
         elif self.sliding_law == "coulomb":
             # Regularized Coulomb. H and R are re-solved inside the z-Newton;
@@ -845,7 +954,7 @@ class siim:
                               self.ell, t, self.cg, self.rho_g * self.g,
                               self.tau_c, self.lambda_c, self.dx,
                               self.coulomb_clamp,
-                              self.didx_l, self.didx_r)
+                              self.didx_l, self.didx_r, *toe)
 
         else:
             raise ValueError(f"Unknown sliding_law: '{self.sliding_law}'. "
@@ -1067,6 +1176,7 @@ class siim:
 
         # initial ice accumulation rate (m/yr)
         self.B = np.zeros_like(self.x)
+        self._toe = None    # toe slope correction, set by calculate_ice_flux
 
         # initial ice flux
         self.tj = 0
@@ -1937,12 +2047,49 @@ def _solve_ice_thickness_coulomb_vec(D_arr, a_arr, lambda_c, clamp):
 
 
 @numba.njit(cache=True)
-def _linear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, didx_l, didx_r):
+def _toe_receiver(z, zoi, i, up, cs, wx):
+    """(zr, c) for node i's step with the toe slope correction (cs, wx)
+    (siim._toe_cells): the receiver surface z[i - up], extended where
+    wx[i] > 0 to the sub-grid terminus by wx[i] times that neighbour's own
+    downstream rise (when it has a downstream node), and the slope factor
+    c = cs[i]. Where the corrected slope c*(zoi - zr)/dx, zoi the node's
+    surface, is not above the slope of the bare rise it was extended along
+    (zero without an extension: a corrected slope that is not positive), or
+    the correction is off (cs None; numba prunes the branch), the uncorrected
+    step: (z[i - up], 1.0), since the toe's surface is no gentler than the
+    bed under it (the H spike this prevents is pinned in test_toe_slope.py)."""
+    r = i - up
+    if cs is None:
+        return z[r], 1.0
+    zr = z[r]
+    rise = 0.0
+    if wx[i] > 0.0 and 0 <= r - up < z.size:
+        rise = max(z[r] - z[r - up], 0.0)
+        zr = z[r] + wx[i] * rise
+    if cs[i] * (zoi - zr) <= rise:
+        return z[r], 1.0
+    return zr, cs[i]
+
+
+@numba.njit(cache=True)
+def _toe_slope_nodes(zs, slope, nodes, didx_l, dx, cs, wx):
+    """slope[i] = c*(zs[i] - zr)/dx at each of ``nodes``, (zr, c) from
+    _toe_receiver (siim._toe_slope)."""
+    for i in nodes:
+        zr, c = _toe_receiver(zs, zs[i], i, 1 if i <= didx_l else -1, cs, wx)
+        slope[i] = c * (zs[i] - zr) / dx
+
+
+@numba.njit(cache=True)
+def _linear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, didx_l, didx_r, cs=None, wx=None):
+    # cs, wx: the toe slope correction (siim._toe_cells); both omitted when off
     if didx_l >= 0:
         for i in range(1, didx_l + 1):
             Gi = Kg * Qg[i]**mu
             if Gi > 0:
-                z[i] = _linear_implicit(zo[i], z[i-1], Gi)
+                zr, c = _toe_receiver(z, zo[i], i, 1, cs, wx)
+                Gi *= c
+                z[i] = _linear_implicit(zo[i], zr, Gi)
             else:
                 Fi = Kf * Qf[i]**m
                 z[i] = _linear_implicit(zo[i], z[i-1], Fi)
@@ -1950,18 +2097,24 @@ def _linear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, didx_l, didx_r):
         for i in range(nx-2, didx_r - 1, -1):
             Gi = Kg * Qg[i]**mu
             if Gi > 0:
-                z[i] = _linear_implicit(zo[i], z[i+1], Gi)
+                zr, c = _toe_receiver(z, zo[i], i, -1, cs, wx)
+                Gi *= c
+                z[i] = _linear_implicit(zo[i], zr, Gi)
             else:
                 Fi = Kf * Qf[i]**m
                 z[i] = _linear_implicit(zo[i], z[i+1], Fi)
 
 @numba.njit(cache=True)
-def _nonlinear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, n, nu, didx_l, didx_r):
+def _nonlinear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, n, nu, didx_l, didx_r,
+                     cs=None, wx=None):
     if didx_l >= 0:
         for i in range(1, didx_l + 1):
             Gi = Kg * Qg[i]**mu
             if Gi > 0:
-                z[i] = _solver_glacial(zo[i], z[i-1], Gi, nu)
+                zr, c = _toe_receiver(z, zo[i], i, 1, cs, wx)
+                if c != 1.0:
+                    Gi *= c ** nu
+                z[i] = _solver_glacial(zo[i], zr, Gi, nu)
             else:
                 Fi = Kf * Qf[i]**m
                 z[i] = _solver_fluvial(zo[i], z[i-1], Fi, n)
@@ -1969,7 +2122,10 @@ def _nonlinear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, n, nu, didx_l, didx_r):
         for i in range(nx-2, didx_r - 1, -1):
             Gi = Kg * Qg[i]**mu
             if Gi > 0:
-                z[i] = _solver_glacial(zo[i], z[i+1], Gi, nu)
+                zr, c = _toe_receiver(z, zo[i], i, -1, cs, wx)
+                if c != 1.0:
+                    Gi *= c ** nu
+                z[i] = _solver_glacial(zo[i], zr, Gi, nu)
             else:
                 Fi = Kf * Qf[i]**m
                 z[i] = _solver_fluvial(zo[i], z[i+1], Fi, n)
@@ -1985,7 +2141,7 @@ def _nonlinear_erode(z, zo, Qf, Qg, Kf, Kg, m, mu, nx, n, nu, didx_l, didx_r):
 
 @numba.njit(cache=True)
 def _power_erode(z, zo, Qf, Qg, H, Kf, Kg_prefactor, m, nx, n, t, lambda_p,
-                 didx_l, didx_r):
+                 didx_l, didx_r, cs=None, wx=None):
     """
     Power sliding law erosion.
     Kg_prefactor = (dt / dx^t) * c_e * (kt * (2*Ac/5) * lambda_p^2 * (rho_g*g)^3 / alpha_g)^(ell/2)
@@ -1998,7 +2154,10 @@ def _power_erode(z, zo, Qf, Qg, H, Kf, Kg_prefactor, m, nx, n, t, lambda_p,
             if Qg[i] > 0.0:
                 rheology_factor = 1.0 + (H[i] / lambda_p) ** 2
                 Gi = Kg_prefactor * (Qg[i] / rheology_factor) ** ell_half
-                z[i] = _solver_glacial_power(zo[i], z[i-1], Gi, t)
+                zr, c = _toe_receiver(z, zo[i], i, 1, cs, wx)
+                if c != 1.0:
+                    Gi *= c ** t
+                z[i] = _solver_glacial_power(zo[i], zr, Gi, t)
             else:
                 Fi = Kf * Qf[i]**m
                 z[i] = _solver_fluvial(zo[i], z[i-1], Fi, n)
@@ -2007,7 +2166,10 @@ def _power_erode(z, zo, Qf, Qg, H, Kf, Kg_prefactor, m, nx, n, t, lambda_p,
             if Qg[i] > 0.0:
                 rheology_factor = 1.0 + (H[i] / lambda_p) ** 2
                 Gi = Kg_prefactor * (Qg[i] / rheology_factor) ** ell_half
-                z[i] = _solver_glacial_power(zo[i], z[i+1], Gi, t)
+                zr, c = _toe_receiver(z, zo[i], i, -1, cs, wx)
+                if c != 1.0:
+                    Gi *= c ** t
+                z[i] = _solver_glacial_power(zo[i], zr, Gi, t)
             else:
                 Fi = Kf * Qf[i]**m
                 z[i] = _solver_fluvial(zo[i], z[i+1], Fi, n)
@@ -2031,7 +2193,7 @@ def _power_erode(z, zo, Qf, Qg, H, Kf, Kg_prefactor, m, nx, n, t, lambda_p,
 @numba.njit(cache=True)
 def _coulomb_erode(z, zo, Qf, Qg, Kf, A_const, m, nx, n, ell, t,
                       cg, rho_g_g, tau_c, lambda_c, dx, clamp,
-                      didx_l, didx_r):
+                      didx_l, didx_r, cs=None, wx=None):
     """
     Regularized Coulomb sliding law erosion.
     A_const = ce * (cg^(2/5)/alpha_g)^ell * dt / dx^t   (node-independent)
@@ -2043,9 +2205,14 @@ def _coulomb_erode(z, zo, Qf, Qg, Kf, A_const, m, nx, n, ell, t,
         for i in range(1, didx_l + 1):
             if Qg[i] > 0.0:
                 A_pre = A_const * Qg[i] ** exp_Q
+                zr, c = _toe_receiver(z, zo[i], i, 1, cs, wx)
+                dx_i = dx
+                if c != 1.0:   # slope c*(z - zr)/dx: cell length dx/c
+                    A_pre *= c ** t
+                    dx_i = dx / c
                 z[i] = _solver_glacial_coulomb(
-                    zo[i], z[i-1], Qg[i], A_pre, ell, t,
-                    cg, rho_g_g, tau_c, lambda_c, dx, clamp)
+                    zo[i], zr, Qg[i], A_pre, ell, t,
+                    cg, rho_g_g, tau_c, lambda_c, dx_i, clamp)
             else:
                 Fi = Kf * Qf[i] ** m
                 z[i] = _solver_fluvial(zo[i], z[i-1], Fi, n)
@@ -2053,9 +2220,14 @@ def _coulomb_erode(z, zo, Qf, Qg, Kf, A_const, m, nx, n, ell, t,
         for i in range(nx - 2, didx_r - 1, -1):
             if Qg[i] > 0.0:
                 A_pre = A_const * Qg[i] ** exp_Q
+                zr, c = _toe_receiver(z, zo[i], i, -1, cs, wx)
+                dx_i = dx
+                if c != 1.0:   # slope c*(z - zr)/dx: cell length dx/c
+                    A_pre *= c ** t
+                    dx_i = dx / c
                 z[i] = _solver_glacial_coulomb(
-                    zo[i], z[i+1], Qg[i], A_pre, ell, t,
-                    cg, rho_g_g, tau_c, lambda_c, dx, clamp)
+                    zo[i], zr, Qg[i], A_pre, ell, t,
+                    cg, rho_g_g, tau_c, lambda_c, dx_i, clamp)
             else:
                 Fi = Kf * Qf[i] ** m
                 z[i] = _solver_fluvial(zo[i], z[i+1], Fi, n)

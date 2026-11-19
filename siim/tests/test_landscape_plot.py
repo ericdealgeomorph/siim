@@ -166,29 +166,55 @@ def test_animate_parallel_renders_mp4(tmp_path, monkeypatch):
 def test_ice_cmap_auto_top_shows_no_max_arrow():
     """With ``ice_cmap`` and no ``H_max`` a still's colour scale tops out at
     its own thickest drawn column, so nothing saturates and the bar has no
-    'max' arrow, though the model's unsmoothed column is a hair thicker. A
-    pinned ``H_max`` below the ice still shows it."""
+    'max' arrow, though the model's unsmoothed column is thicker: by a hair (a
+    last-bit rounding, in some frames) or by far (ice the display drops, such
+    as a lone cell the smoothed mask does not draw). A pinned ``H_max`` below
+    the ice still shows it."""
+    # gate: same three expectations (no arrow on any auto-top frame, a 'max'
+    # arrow under a pinned H_max, a non-vacuous frame); the vacuity guard moved
+    # from a last-bit coin flip over the run's frames (ED-270 flipped it) to a
+    # constructed frame with a 100 m margin, and the bar reads go through one
+    # helper
     import siim.plotting.landscape as landscape_module
     m = siim2d(dict(U=1e-3, zELA=300, T=1e5, nt=11, nt_out=6, nx=41, ny=41,
                     Lx=4e4, Ly=4e4, seed=7, initial_max_elevation=800,
                     progress_bar=False, boundary_status=['fixed_value'] * 4))
     m.run()
     hc = getattr(m, 'hc_cell_out', None)
-    above, arrows = [], []
-    for i in range(1, len(m.output_times)):
-        fig, _ = m.plot.landscape(i=i, ice_cmap='viridis')
-        bar, = [a for a in fig.axes if a.get_ylabel() == 'Ice column depth (m)']
-        native = landscape_module._ice_column(
-            m.H_out[i], m.hc_over_H if hc is None else hc[i]).max()
-        above.append(native > bar.get_ylim()[1])
-        arrows.append(bar._colorbar.extend)
-        plt.close(fig)
-    assert any(above), "vacuous: no frame's model column tops its drawn one"
+
+    def column_and_bar(i, **kw):
+        """Frame i's model column maximum, drawn bar top and bar arrows."""
+        fig, _ = m.plot.landscape(i=i, ice_cmap='viridis', **kw)
+        try:
+            bar, = [a for a in fig.axes if a.get_ylabel() == 'Ice column depth (m)']
+            native = landscape_module._ice_column(
+                m.H_out[i], m.hc_over_H if hc is None else hc[i]).max()
+            return native, bar.get_ylim()[1], bar._colorbar.extend
+        finally:
+            plt.close(fig)
+
+    arrows = [column_and_bar(i)[2] for i in range(1, len(m.output_times))]
+    # a frame whose model column tops the drawn one by far more than rounding:
+    # frame 1 plus one interior cell with no icy neighbour, made thicker than
+    # every glacier; ice_extent='cells' smooths the cell mask, which does not
+    # draw a lone cell
+    k = 1
+    H_k = np.array(m.H_out[k])
+    near = np.logical_or.reduce([np.roll(H_k > 0.0, (a, b), (0, 1))
+                                 for a in (-1, 0, 1) for b in (-1, 0, 1)])
+    near[[0, -1], :] = True
+    near[:, [0, -1]] = True
+    H_lone = H_k.copy()
+    H_lone[tuple(np.argwhere(~near)[0])] = 1.5 * H_k.max()
+    m.H_out[k] = H_lone
+    try:
+        native, top, arrow = column_and_bar(k, ice_extent='cells')
+    finally:
+        m.H_out[k] = H_k
+    assert native > top + 100.0, "vacuous: the model column does not top the drawn one"
+    arrows.append(arrow)
     assert set(arrows) == {'neither'}
-    fig, _ = m.plot.landscape(i=-1, ice_cmap='viridis', H_max=100.0)
-    bar, = [a for a in fig.axes if a.get_ylabel() == 'Ice column depth (m)']
-    assert bar._colorbar.extend == 'max'
-    plt.close(fig)
+    assert column_and_bar(-1, H_max=100.0)[2] == 'max'
 
 
 def test_animate_parallel_from_a_script_without_a_main_guard(tmp_path, both_drivers):

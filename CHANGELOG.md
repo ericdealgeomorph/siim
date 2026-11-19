@@ -3,7 +3,232 @@
 Short release notes. Public behavior and configuration are documented in the
 guides and API reference under `docs/`.
 
-## 0.10.0 — November 2026 (current)
+## 0.10.1 — November 2026 (current)
+
+### Behavioural changes
+
+- **siim1d corrects the glacial slope at the terminus, so every 1D run with a
+  glacier changes (modes A and B; `toe_slope_correction=False` restores the
+  uncorrected toe step bit for bit, not the 0.10.0 model: the erosion
+  solvers changed too, see below).** siim1d builds each cell's rise from the
+  slope at its upstream node. Near a terminus the steady surface is singular,
+  `S ~ Q**-phi_t` with the flux `Q` falling linearly to zero (`phi_t` the
+  sliding law's thin-ice limit: 1/3 power, 1/2 Coulomb, `mu/nu` effective
+  exponent), and that step pinned the terminus to its cell. Now every icy
+  node whose downstream neighbour carries less ice flux scales its upwind
+  slope by a factor of the flux ratio `q`, `(1 - phi_t)(1 - q)/(1 - q**(1 -
+  phi_t))`, which makes the step exact for that surface and tends to 1 where
+  the flux changes little across a cell; the last icy node, the one beside
+  the outlet included, takes its slope from the sub-grid terminus, placed no
+  nearer the node than `constants.TOE_ZETA_MIN` (1e-6 of a cell, so the
+  factor stays finite), and takes the uncorrected step where that slope is
+  no steeper than the bare reach it was extended along (see below) or where
+  the glacier draining to that terminus holds fewer
+  than `constants.TOE_MIN_CELLS` (5) icy nodes, a toe the grid does not
+  resolve (counted on the terminus's own side of the divide, so an ice cap
+  centred on the divide is judged flank by flank). The correction applies
+  in the mode-A slope, the four 1D erosion kernels and the mode-B walk;
+  siim2d is unchanged by default (see `toe_slope_correction_2d` below). At
+  the paper suite's 1D reference (L 60 km, mode A unless stated):
+  - mode A's divide swing on fine cells is gone: 19-26 m on 50 and 25 m
+    cells before for the power and effective-exponent laws (9 m for Coulomb
+    on 25 m cells), 0.01-0.03 m now on every grid from 400 to 25 m, with the
+    exception below;
+  - the divide and terminus converge at first order in `dx` for every law
+    (orders 1.04-1.10), where the power and effective-exponent divides had
+    no order before; the power-law limit, zo 4103.0 m and Lt 26 910 m,
+    matches an independent shooting solution of the continuum problem to
+    0.5 m and 15 m;
+  - mode B settles on mode A's state: at 50 m with the cap on they agree to
+    1 mm in zo and 1 cm in Lt (power, Coulomb), where they rested 6.5 m and
+    3.6 m apart in zo;
+  - on coarse cells the divide rises, by 10-33 m on 400 m cells, and it
+    approaches its converged limit from above at first order; on 25 m cells
+    it moves by under 1 m for the power and effective-exponent laws and
+    rises 4-7 m for Coulomb;
+  - mode A's swing starts at a lower relief: its onset falls from
+    `d*sigma` about 0.8 to about 0.38 for the power law and to 0.52-0.54
+    for Coulomb with the cap off, and it moves a quarter to a third as far
+    with `dx`;
+  - on coarse cells mode B's limit cycle passes through glaciers 1-4 cells
+    long at the divide, where the last-node term over-corrects, so those
+    glaciers take the uncorrected step there. On 250 m cells of the paper
+    suite's fixed 1D strip (power law, mode B; 4-8 Myr, 10 kyr frames) the
+    term on them left the divide ice-free in 16 % of the frames and put the
+    cycle's trough (the mean of its minima) at 1453 m; with the guard the
+    divide stays icy and the trough is 1508 m (1518, 1521 and 1523 m on 125,
+    62.5 and 31 m cells, where the unguarded model gives 1501, 1515 and
+    1523 m). Runs whose glaciers stay 5 cells or longer are unchanged by the
+    guard, bit for bit.
+
+  The exception is Coulomb with the cap on, which keeps a slow swing in mode
+  A: 0.5-0.9 m on 100 and 50 m cells, 15 m on 25 m cells (decaying at about
+  0.04 /Myr), and 46 m on 12.5 m cells (not decaying), against 32-35 m before
+  on every grid from 200 to 25 m. In mode B with the cap on, the power law
+  at the suite's reference erodibility cycled on 25 m cells under a first
+  form of the correction (zo range 35 m, period 1.35 Myr): that is mode B's
+  own cycle, which the uncorrected model shows on 12.5 m cells.
+
+  The last icy node takes the uncorrected step wherever its corrected slope
+  is no steeper than the bare slope its toe was extended along (the toe's
+  surface is no gentler than the bed under it), not only where that slope is
+  not positive. A node just turned icy keeps its bare surface for a step, a
+  hair above the extended toe, and read a slope near zero, which mode A's
+  closure turned into a one-step spike in H: 18.7 km against about 410 m on
+  200 m cells (effective exponent, 0.5 mm above the toe). The mode-B walk
+  takes the same rule. At the suite's 1D reference erodibility, mode A's
+  transient peak H, where it moves, falls from 0.6-6.6 km to 0.3-0.5 km on
+  2500 to 200 m cells, and mode A's attractors from 1250 to 25 m cells move
+  by under 4 mm in zo and 3 cm in Lt (up to 6 cm and 35 cm for Coulomb on
+  50 m cells at lower erodibilities). Mode B's effective-exponent divide on
+  50 m cells moves 2.8 m onto mode A's, and on 25 m cells falls 1.2 m, away
+  from it; mode B's limit cycles on 50 m cells keep their onset brackets and
+  their periods to within 7 kyr. On 5000 and 2500 m cells, where the
+  Coulomb toe is gentler than the bare reach below it, the Coulomb divide
+  falls 65-72 m and the terminus retreats 2.3-2.4 km (mode A on both, mode B
+  on 5000 m).
+
+- **The implicit erosion solvers stop on the residual, not the step, and
+  return the root Newton found instead of a point up to 1 mm off it, so every
+  run that erodes changes (not bit-for-bit with 0.10.0).** The four bracketed
+  Newton solvers (fluvial, eff-exp and power glacial, which are now one
+  solver, and the D-inf/MFD multi-receiver one) stopped once a step fell under
+  their 1 mm tolerance, which failed two ways. Once Newton reached the root,
+  the next step rounded to nothing and landed on the bracket end that iterate
+  had just set; the strict bracket test rejected it, bisected away, and the
+  solver halved its way back until a step fell under 1 mm. And under a
+  sub-linear exponent the slope near a receiver is steep, so a small step did
+  not mean a small error: a fluvial solve at n = 0.22 returned 3.3e-4 m
+  against a root of 0.054 m. The four now share one step that stops when the
+  residual is under half the tolerance (its slope is at least 1, so it bounds
+  the error), when the Newton step rounds to nothing, or when Newton leaves a
+  bracket already narrower than the tolerance; the result lies within the
+  tolerance and is never the receiver elevation itself. Measured on 2000
+  random solves per exponent with drops of 1 mm to 3 km and prefactors from
+  1e-8 to 1e8: at n = 1, the default fluvial exponent, 58 % of single-receiver
+  solves came back more than 1e-6 m off (median 0.3 mm, up to 1 mm), as much
+  as a whole step's erosion at a small dt; on those drops the solvers now
+  return the root to round-off in at most two iterations (the multi-receiver
+  one, at p = 1, in at most five; up to 24 before). Over exponents 0.2 to 2.7,
+  on these drops and on sub-mm ones, the worst error falls from 4.7 mm to 0.35
+  mm; above 1, on drops of 1 mm or more, the share of solves more than 1e-6 m
+  off falls from 17-31 % to 0.1-1.3 %, at about one more iteration per
+  solve (6.2 against 5.0 at the power-law exponent 1.8), with no measurable
+  cost on a 31 x 31 mode-B run at n = 2. The two Coulomb solvers (one receiver
+  and several), which stopped on a relative step under 1e-8 after Armijo
+  backtracking, take the same rule at their own tolerance, 1e-8 x (1 + |z|):
+  on 750 random solves with drops of 1 mm or more the one-receiver solver now
+  returns the root to round-off (11 % were more than 1e-6 m off before, up to
+  2.6e-5 m) in 2.0 residual evaluations, each an ice-thickness solve, against
+  8.9 (up to 54), and a 2000-step 31 x 31 Coulomb mode-B run takes 1.6 s
+  against 3.8 s; the multi-receiver one stays within its tolerance (0.8 % more
+  than 1e-6 m off, against 15 %). On its own the Coulomb change moves a
+  Coulomb run by under 3e-7 m over 100 steps. On the reference battery's base
+  configuration mode B moves by 1 mm in the first step and 2 cm over 300
+  steps; the fully glaciated mode-D run (glacial slope exponent 1.8, where the
+  defect seldom fired) moves by under 1e-7 m over 100 steps; modes C and D
+  then diverge as autogenic runs do, with their attractor statistics within
+  about one seed standard deviation (over steps 1000 to 2000; four seeds in
+  mode C, eight in mode D, where two sets of four seeds of the old code differ
+  by as much), and the 1D power-law limit cycle keeps its period (794 and 793
+  kyr). The reference battery is regenerated.
+
+- **The ablation footprint's Hack width coefficient `width_hack_k` defaults
+  to 0.2 in every 2D mode (0.5 before; 0.25 in mode D), so every 2D run with
+  ice below the ELA changes; siim1d has no footprint and is unchanged.** Mode
+  D no longer has a default of its own (`constants.MODE_D_WIDTH_HACK_K` is
+  gone). Calibrated against the shallow-ice reference (MinSIA) at 1 km, the
+  best footprint is 0.37-0.39 of the old one for the ice volume and
+  0.32-0.41 for the trunk length, and the flagship ice cap does not depend
+  on it. On an eroding 100 x 50 km landscape in modes B, C and D at 1 km and
+  500 m, 0.2 stays bounded with its termini inside the domain and is calmer
+  than 0.5 (no sawtooth surges at 500 m); it holds 30-64 % more ice with
+  trunks 8-23 km longer, and under D8 routing the terminus moves by 1-3
+  cells more often. Pass `width_hack_k=0.5` (0.25 in mode D) for the old
+  footprint. The reference battery is regenerated.
+
+### Features
+
+- **`toe_slope_correction_2d` (siim2d, EXPERIMENTAL, off by default, so every
+  2D run is unchanged; standalone driver only).** It ports siim1d's toe slope
+  correction to the 2D routing graph, in every mode: each icy edge's glacial
+  slope is scaled by `c(q) = (1 - phi_t)(1 - q)/(1 - q**(1 - phi_t))`, with
+  `q` the receiver's flux over `Q* = min(Q_node, the receiver's icy inflow)`,
+  and an edge to a bare receiver takes the sub-grid terminus's slope (its
+  distance `zeta` held at least `constants.TOE_ZETA_MIN`) where at least
+  `constants.TOE_MIN_CELLS` icy cells drain through the node, and the
+  uncorrected step where that slope is no steeper than the bare receiver's
+  own downhill slope (the toe's surface is no gentler than the bed under it;
+  a node barely clearing the bare profile extended up to it read a slope near
+  zero, which spiked H for one step, to 13.6 km in a mode-A single-flow
+  benchmark run on 1 km cells and 33.7 km on 500 m cells); a terminus
+  whose bare receiver is, or drains straight to, a base-level node takes no
+  receiver extension, all as in siim1d. It needs a thin-ice exponent below 1 (an
+  effective-exponent law with `mu/nu >= 1` is refused). Three known
+  limitations: the terminus's extension is read from the step's starting
+  surface and applied as a length divisor, so it lags by one step where siim1d
+  extends the receiver implicitly (it may add to the wander of 2D
+  landscapes); termini converging on one bare cell share its ablation, so each
+  one's `zeta` is biased large; and the factor reads the cell-accumulated ice
+  flux (it needs the pre-clamp signal of a bare receiver) while under a
+  transect `closure_flux` (mode B's default) the closures read the transect
+  flux. It stays off because it showed no gain in 2D (measured before the
+  rule that gives a toe no steeper than the bed below it the uncorrected
+  step was added): on the paper suite's D8 strip the uncorrected mode-B cycle trough already sits within 3 m of the 1D limit
+  (1534 m) on cells from 250 to 31 m, and the correction moves it by 0.3 to
+  5 m; on the 100 x 50 km benchmark case in mode B with single flow at 1 km it
+  raises the divide's swing from 89 m to 147 m (a replicate run: 91 m)
+  instead of damping it.
+
+- **`footprint_from_H` and `footprint_width_factor` (siim2d, EXPERIMENTAL,
+  off by default (`False`, `1.0`), so every 2D run is unchanged; standalone
+  driver only).** Below the ELA a cell ablates over its glacier's footprint,
+  the width times the flow length (at least the cell). `footprint_from_H=True`
+  takes that width from the ice, `alpha_g*H` on the lagged pass thickness, in
+  place of the Hack width `width_hack_k*A**width_hack_p`, closing the
+  H -> width -> ablation loop the Hack width cuts (the model paper's
+  sec:ablation); `footprint_width_factor` f multiplies the footprint width,
+  either form, and nothing else (`alpha_g` in the cross-section, the closures
+  and the carve is unchanged). Calibrated against MinSIA on c6's three frozen
+  beds at 1 km (massif, notebook, flagship; ice volume and trunk geometry, f
+  swept from 1 to 4): the H form fits best near f = 3.2 in mode C (multiple
+  flow: one shared f of 3.29, set by the notebook's volume; at it the volume
+  errors are +7, 0 and -10 % and the trunk lengths -11, 0 and +2 %). Two
+  caveats. Mode B with D8 does not calibrate on the massif: at the
+  notebook's f of 3.65 the massif holds 56 % too much ice and its trunk runs
+  45 % long. And the trunk-length spread across beds is wide, so one f is a
+  compromise: the massif's volume wants f above 4 while its terminus fits at
+  2.6, and the flagship's cap is nearly insensitive to f (-11 to -9 % over
+  the sweep). Unscaled (f = 1), the H form holds about 2.5 to 5 times the Hack
+  footprint's ice on the massif and the notebook. On the eroding 100 x 50 km
+  benchmark case over 8 Myr, the H form at f = 3 holds 59 to 94 % more ice
+  than the Hack width at `width_hack_k=0.5` (modes B, C and D, 1 km and
+  500 m cells; `width_hack_k=0.2`: 29 to 64 %), and its trunk termini hop more
+  often. The Hack form scaled by f is mathematically the Hack width at
+  `f*width_hack_k`, and bit for bit when one of the two is a power of two
+  (`width_hack_k=0.5` with f = 0.4 reproduced `width_hack_k=0.2` bit for bit
+  over 8 Myr in modes B and D at 1 km).
+
+- **A 2D run can start from another run's end state, ice included, and then
+  continues that run exactly.** `m.restart_state()` returns the state a
+  finished run ended on (the bed, or mode A's ice surface; the ice thickness;
+  the plate's previous ice column; the adaptive damping's weights; mode D's
+  channel/sheet state), and the new `state` parameter starts a run from it: T,
+  then T more from the end state, equals 2T in one go, bit for bit, in modes A
+  to D (the escarpment's uplift wave aside, which restarts from
+  `x_escarpment`), when the two clocks take the same step sizes. Before, a
+  restart could pass only the end bed as `initial_topography`, and the ice
+  regrew from zero: on the 100 x 50 km benchmark case (mode C, multiple flow,
+  power law) it sat 4 to 11 % below the continued run's 400 kyr after the
+  restart, depending on the spin-up and the volume measure read. The new
+  `initial_ice_thickness` parameter is the simpler start, an `(ny, nx)` ice
+  thickness on the supplied bed (modes B, C and D, with `noise_amplitude=0`;
+  the other carried state starts cold). Both need the in-house driver. With
+  neither set, this change leaves every run unchanged, bit for bit (the
+  reference battery and a mode-D, sediment and flexure set gated against
+  0.10.0, before the toe and solver changes above).
+
+## 0.10.0 — November 2026
 
 ### Behavioural changes
 

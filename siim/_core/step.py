@@ -55,6 +55,7 @@ from .solvers import (
 )
 from .hillslope import _fixed_flags
 from .threads import level_threads
+from .toe import thin_ice_phi, toe_flux_factor
 from .carve import (
     _power_dt_2d, _power_dt_2d_periodic, _carve_offsets, _carve_subgrid_width,
 )
@@ -500,7 +501,8 @@ def _ice_source(z_clim, zELA, beta, area, field):
 def accumulate_glacial_flow(surface, surface_upward, zELA, beta, runoff,
                             cell_area, width_hack_k, width_hack_p, shape,
                             stack, receivers, nb_receivers, weights, lengths,
-                            basin, s_conf=None):
+                            basin, s_conf=None, raw_out=None, width=None,
+                            width_factor=1.0):
     """Accumulate water flux, ice flux, drainage area + the routing-topology
     outputs (basin_ids, receivers_2d, stack_2d; all three None when ``basin``
     is None, which the in-house driver passes on a step no frame saves). Body of
@@ -510,8 +512,17 @@ def accumulate_glacial_flow(surface, surface_upward, zELA, beta, runoff,
     O(U*dt) bias). ``s_conf`` (``(ny, nx)``, the per-cell confinedness of
     mode D's valley <-> sheet map, ``constants.HC_SHEET``) fades the below-ELA
     ablation footprint from the Hack width (s = 1) to the cell (s = 0); ``None``
-    is today's footprint. Returns ``(ice_flux, water_flux, area, basin_ids,
-    receivers_2d, stack_2d)`` (caller also sets ``flowacc = water_flux``)."""
+    is today's footprint. ``raw_out`` (flat ``ny*nx``) receives the
+    accumulated ice flux before the final clamp at 0: at a bare cell, its own
+    (negative) source plus its donors' flux, which the 2D toe slope correction
+    reads (:func:`toe_slope_factor`). ``width`` (``(ny, nx)``; EXPERIMENTAL
+    ``footprint_from_H``: alpha_g*H) replaces the Hack width
+    ``width_hack_k*A**width_hack_p`` in the footprint and nothing else;
+    ``None`` is the Hack width. ``width_factor`` (EXPERIMENTAL
+    ``footprint_width_factor``) multiplies that footprint width, either form,
+    and nothing else; 1.0 is today's footprint. Returns ``(ice_flux, water_flux, area,
+    basin_ids, receivers_2d, stack_2d)`` (caller also sets
+    ``flowacc = water_flux``)."""
     zELA = np.broadcast_to(zELA, shape)
     field = np.broadcast_to(runoff * cell_area, shape)
     z_clim = surface - np.broadcast_to(surface_upward, shape)
@@ -537,13 +548,15 @@ def accumulate_glacial_flow(surface, surface_upward, zELA, beta, runoff,
         lengths_2d = (lengths * weights).sum(axis=1).reshape(shape)
     else:
         lengths_2d = lengths.reshape(shape)
-    glacier_width = float(width_hack_k) * field_area.reshape(shape) ** float(width_hack_p)
+    if width is None:
+        width = float(width_hack_k) * field_area.reshape(shape) ** float(width_hack_p)
+    glacier_width = width if width_factor == 1.0 else float(width_factor) * width
     glacier_area  = glacier_width * lengths_2d
     wide_area     = np.maximum(glacier_area, cell_area)
     # Above ELA, snow falls on the cell, not the glacier's footprint. In mode D
     # the below-ELA footprint is the convex blend wide*s + cell*(1 - s)
-    # (exact at both ends): a trunk ablates over its Hack width, a sheet cell
-    # over its own cell.
+    # (exact at both ends): a trunk ablates over its footprint width (Hack or
+    # alpha_g*H, times the factor), a sheet cell over its own cell.
     below = (wide_area if s_conf is None
              else wide_area * s_conf + cell_area * (1.0 - s_conf))
     accum_area = np.where(z_clim < zELA, below, cell_area)
@@ -560,6 +573,8 @@ def accumulate_glacial_flow(surface, surface_upward, zELA, beta, runoff,
     else:
         _flow_accumulate_sd_2(field, field_ice, stack, receivers)
 
+    if raw_out is not None:
+        raw_out[:] = field_ice
     # Clamp ice flux (nodes below ELA with no upstream contribution can go neg).
     np.maximum(field_ice, 0.0, out=field_ice)
 
@@ -802,6 +817,184 @@ def transect_flux(ice_flux, H_lag, receivers, weights, nb_receivers, shape,
     return Qt.reshape((ny, nx))
 
 
+# ---------------------------------------------------------------------------
+# 6b. Toe slope correction (EXPERIMENTAL ``toe_slope_correction_2d``)
+# ---------------------------------------------------------------------------
+_LAW_NAMES = {LAW_EFFEXP: 'eff-exp', LAW_POWER: 'power', LAW_COULOMB: 'coulomb'}
+
+
+def toe_phi(law_code, gp):
+    """phi_t of the law record (``siim._core.toe.thin_ice_phi``, the one
+    source siim1d shares): power 1/3, Coulomb 1/2, effective exponent mu/nu."""
+    mu_over_nu = float(gp.mu) / float(gp.nu) if law_code == LAW_EFFEXP else None
+    return thin_ice_phi(_LAW_NAMES[law_code], mu_over_nu)
+
+
+@numba.njit(cache=True)
+def _toe_inflow_cells_kernel(Q, rec, nb, wts, order, inflow, ncell):
+    """Per node, ``inflow``, the icy inflow the accumulator gave it (the sum of
+    w*Q over its icy donors, summed directly so a lone weight-1 donor gives its
+    Q exactly), and ``ncell``, the icy cells routed through it (1 per icy node,
+    routed with the same weights along icy nodes, itself included; read only at
+    icy nodes). ``order`` is donor-first."""
+    nn = Q.shape[0]
+    for i in range(nn):
+        inflow[i] = 0.0
+        ncell[i] = 1.0 if Q[i] > 0.0 else 0.0
+    for h in range(nn):
+        i = order[h]
+        if Q[i] <= 0.0:
+            continue
+        for k in range(nb[i]):
+            r = rec[i, k]
+            if r != i:
+                inflow[r] += wts[i, k] * Q[i]
+                ncell[r] += wts[i, k] * ncell[i]
+
+
+@numba.njit(cache=True)
+def _toe_slope_factor_kernel(z, Q, rec, nb, wts, lens, phi, zeta_min,
+                             min_cells, inflow, ncell, c):
+    """Per-edge slope factor ``c`` (filled in place over a field of ones;
+    always positive); see :func:`toe_slope_factor`. ``rec``/``wts``/``lens``
+    are (nn, k); ``inflow``/``ncell`` are :func:`_toe_inflow_cells_kernel`'s."""
+    a = 1.0 - phi
+    for i in range(z.shape[0]):
+        Qi = Q[i]
+        if Qi <= 0.0:
+            continue
+        for k in range(nb[i]):
+            r = rec[i, k]
+            L = lens[i, k]
+            if r == i or L <= 0.0:
+                continue
+            # Q* = min(Q_i, I_r): a node that sends r only part of its flux is
+            # read on what r receives (Q* = Q_i on single flow: I_r >= Q_i)
+            Qs = min(Qi, inflow[r])
+            if Qs <= 0.0:
+                continue
+            q = Q[r] / Qs
+            if q >= 1.0:
+                continue
+            if q > 0.0:
+                c[i, k] = toe_flux_factor(q, phi)
+                continue
+            # bare receiver: only on a glacier the grid resolves
+            if not ncell[i] >= min_cells:
+                continue
+            rise = z[i] - z[r]
+            if rise <= 0.0:
+                continue            # at/below the receiver: the uncorrected step
+            # the continued flux puts the terminus on this edge at
+            # zeta = 1/(1 - q); the slope is (1 - phi)(z_i - z_toe)/(zeta L),
+            # z_toe on the receiver's own downhill slope extended up to it,
+            # but at the receiver's level (no extension) where the receiver or
+            # one of its own receivers is a self-receiving (base-level) node:
+            # siim1d's rule beside an outlet, whose floored or drowned bed is
+            # not the surface the kernel walks
+            zeta = max(1.0 / (1.0 - q), zeta_min)
+            S_r = 0.0
+            outlet = nb[r] == 1 and rec[r, 0] == r
+            for kk in range(nb[r]):
+                rr = rec[r, kk]
+                Lr = lens[r, kk]
+                if rr == r or Lr <= 0.0:
+                    continue
+                if nb[rr] == 1 and rec[rr, 0] == rr:
+                    outlet = True
+                d = z[r] - z[rr]
+                if d > 0.0:
+                    S_r += wts[r, kk] * d / Lr
+            R = 1.0
+            if not outlet:
+                R = 1.0 - (1.0 - zeta) * L * S_r / rise
+                # a corrected slope no steeper than S_r (R <= 0 included):
+                # the uncorrected step, as siim1d's _toe_receiver
+                if a / zeta * R * rise <= S_r * L:
+                    continue
+            c[i, k] = a / zeta * R
+
+
+def toe_slope_factor(z, Q_raw, receivers, nb_receivers, weights, lengths, phi,
+                     stack, scratch=None):
+    """The 2D toe slope correction's factor on each routing edge's glacial
+    slope (EXPERIMENTAL ``toe_slope_correction_2d``; same shape as
+    ``lengths``, always positive, 1 where nothing applies), or None when no
+    node is icy (the off path).
+
+    Near a terminus the steady surface is singular, S ~ Q^-phi with Q ~ s (s the
+    distance from the terminus), and the upwind step (z_i - z_r)/L across it
+    pins the terminus to its cell (siim1d's ``toe_slope_correction``). With Q
+    linear along the edge from node i to receiver r, the exact slope at i over
+    the upwind difference is::
+
+        c(q) = (1 - phi)(1 - q)/(1 - q^(1 - phi)),     q = Q_r/Q*,
+
+    (``siim._core.toe.toe_flux_factor``, shared with siim1d) applied where
+    0 < q < 1, with Q* = min(Q_i, I_r) and I_r the receiver's icy inflow, so a
+    multi-receiver node is read on the flux its receiver actually gets (on
+    single flow I_r >= Q_i exactly, and Q* = Q_i bit for bit). It equals
+    siim1d's c(u) for Q ~ s, needs no toe walk or extent, and is 1 at q >= 1
+    (accumulation zone, confluences, heads). An edge with Q* <= 0 keeps c = 1.
+    Needs phi < 1 (the facade refuses an effective exponent with mu/nu >= 1).
+
+    An edge to a bare receiver (``Q_raw[r] <= 0``, the accumulator's pre-clamp
+    flux) holds the terminus at zeta = 1/(1 - Q_r/Q*) of the edge, floored at
+    ``constants.TOE_ZETA_MIN``; its slope is (1 - phi)(z_i - z_toe)/(zeta L),
+    z_toe = z_r + (1 - zeta) L S_r with S_r the receiver's own downhill slope,
+    written as the factor (1 - phi)/zeta * (z_i - z_toe)/(z_i - z_r) on ``z``,
+    the step's pre-erosion surface. That term applies only where at least
+    ``constants.TOE_MIN_CELLS`` icy cells are routed through the node (1 per
+    icy node, routed with the router's weights, the node included; siim1d's
+    guard); an edge whose node is at or below its receiver, or whose
+    corrected slope is no steeper than S_r (the toe's surface is no gentler
+    than the bed under it; a node at or below z_toe included), takes the
+    uncorrected step (c = 1), and a receiver that is, or
+    drains straight to, a self-receiving (base-level) node takes z_toe = z_r
+    (no extension), all as in siim1d.
+
+    Known limitations: the bare-edge extension is read from the pre-step
+    surface and applied as a length divisor, so it lags the step by one, where
+    siim1d extends the receiver implicitly (it may contribute to the wander of
+    2D landscapes); termini converging on one bare cell share its ablation,
+    so each one's zeta is biased large; and the factor reads the
+    cell-accumulated flux (it needs the pre-clamp signal of a bare receiver)
+    while under a transect ``closure_flux`` the closures read the transect
+    flux.
+
+    ``z`` and ``Q_raw`` are flat; the router bundle in either layout, with its
+    ``stack`` (receiver-first under single flow, donor-first otherwise).
+    ``scratch`` (a dict, or None) keeps the work arrays between calls."""
+    Q = np.ascontiguousarray(Q_raw, dtype=np.float64).ravel()
+    if not (Q > 0.0).any():
+        return None
+    rec = np.ascontiguousarray(receivers, dtype=np.int64)
+    lens = np.ascontiguousarray(lengths, dtype=np.float64)
+    order = np.asarray(stack, dtype=np.int64)
+    if rec.ndim == 1:
+        rec, lens = rec.reshape(-1, 1), lens.reshape(-1, 1)
+        wts = np.ones(rec.shape)
+        nb = np.ones(rec.shape[0], dtype=np.int64)
+        order = order[::-1]                  # the SFR stack is receiver-first
+    else:
+        wts = np.ascontiguousarray(weights, dtype=np.float64)
+        nb = np.asarray(nb_receivers, dtype=np.int64)
+    scratch = {} if scratch is None else scratch
+    c = scratch.get('c')
+    if c is None or c.shape != rec.shape:
+        c = scratch['c'] = np.empty(rec.shape)
+        scratch['inflow'], scratch['ncell'] = np.empty_like(Q), np.empty_like(Q)
+    c.fill(1.0)
+    inflow, ncell = scratch['inflow'], scratch['ncell']
+    _toe_inflow_cells_kernel(Q, rec, nb, wts, np.ascontiguousarray(order),
+                             inflow, ncell)
+    _toe_slope_factor_kernel(np.ascontiguousarray(z, dtype=np.float64).ravel(),
+                             Q, rec, nb, wts, lens,
+                             float(phi), float(_constants.TOE_ZETA_MIN),
+                             float(_constants.TOE_MIN_CELLS), inflow, ncell, c)
+    return c.reshape(np.shape(lengths))
+
+
 def _H_from_QS_modeA(law_code, gp, Qg, S):
     """Per-law point closure H(Qg, S): the from_slope branch of the shared
     :func:`_modeb_closure` (single-sourced; audit m34)."""
@@ -856,7 +1049,7 @@ def _solve_border_H_modeA(z_flat, H_flat, ice_flux, receivers, nb_receivers,
 def run_modeA_step(surface, H, ice_flux, water_flux, law_code, gp, dt,
                    stack, receivers, nb_receivers, weights, lengths,
                    hc_over_H, shape, slope_normalise=False,
-                   dx=None, dy=None, wrap_y=False, wrap_x=False):
+                   dx=None, dy=None, wrap_y=False, wrap_x=False, toe=None):
     """Mode A erosion step (ice-surface state). Body of ``GlacialSPLModeA``:
     dispatch to the routing-specific mode-A skeleton (mutating a fresh copy of
     the surface + H), solve the border-H closure, then commit. Returns
@@ -882,11 +1075,22 @@ def run_modeA_step(surface, H, ice_flux, water_flux, law_code, gp, dt,
     border-H closure keeps the RAW lengths
     -- it maxes single upwind EDGE slopes, not a multi-receiver reduction. SFR
     ignores the flag (one receiver => gamma == 1). See
-    ``constants.MFD_GAMMA_FLOOR``."""
+    ``constants.MFD_GAMMA_FLOOR``.
+
+    ``toe`` (EXPERIMENTAL ``toe_slope_correction_2d``): ``(Q_raw, phi,
+    scratch)``, the accumulator's pre-clamp ice flux, the law's toe exponent
+    and :func:`toe_slope_factor`'s work arrays; the kernel's
+    closure and eroders then read each edge's length divided by
+    :func:`toe_slope_factor` on this surface (after the gamma scaling). The
+    border-H closure keeps the raw lengths. ``None`` is today's kernel."""
     z_flat = surface.flatten()               # flatten() already returns a fresh copy
     H_flat = H.flatten()                     # ditto
     ice = ice_flux.ravel()
     water = water_flux.ravel()
+    c_toe = None
+    if toe is not None:
+        c_toe = toe_slope_factor(z_flat, toe[0], receivers, nb_receivers,
+                                 weights, lengths, toe[1], stack, toe[2])
     # --- kernel: mode A's H solver reads the pre-erosion slope of z_flat, so
     #     the H written is consistent with the pre-erosion geometry.
     if receivers.ndim == 2:   # D-inf
@@ -902,13 +1106,16 @@ def run_modeA_step(surface, H, ice_flux, water_flux, law_code, gp, dt,
             lens = gamma_scaled_lengths(
                 recs, wts, nb_rec, lens, int(shape[0]), int(shape[1]),
                 float(dx), float(dy), bool(wrap_y), bool(wrap_x))
+        if c_toe is not None:
+            lens = lens / c_toe
         _glac_fast_solve_modeA_dinf(
             z_flat, ice, water, H_flat,
             law_code, gp, dt, stack, nb_rec, recs, wts, lens)
     else:                     # SFR
+        lens = lengths if c_toe is None else lengths / c_toe
         _glac_fast_solve_modeA_sfr(
             z_flat, ice, water, H_flat,
-            law_code, gp, dt, lengths, stack, receivers)
+            law_code, gp, dt, lens, stack, receivers)
     # --- border-H closure (mutates H_flat at self-receiving border cells).
     _solve_border_H_modeA(z_flat, H_flat, ice_flux, receivers, nb_receivers,
                           lengths, law_code, gp)
@@ -928,7 +1135,7 @@ def run_modeB_kernel(zb_flat, H_flat, ice_flux, water_flux, law_code, gp, dt,
                      stack, receivers, nb_receivers, weights, lengths,
                      shape, dx, dy, border_bed_uplift, bl, gate, ramp,
                      parallel, wrap_y, wrap_x, slope_normalise=False,
-                     hc_cell=None):
+                     hc_cell=None, toe=None):
     """No-carve mode-B kernel dispatch (SFR or D-inf). Mutates ``zb_flat`` and
     ``H_flat`` in place; returns the kernel's ``surface_out`` (= zb + hc*H).
     ``hc_cell`` (flat, ``ny*nx``) is the per-cell channel-floor datum of
@@ -948,11 +1155,25 @@ def run_modeB_kernel(zb_flat, H_flat, ice_flux, water_flux, law_code, gp, dt,
     ``siim._core.router.SLOPE_NORMALISED_ROUTERS``) turns on the gamma
     effective-slope normalisation inside the D-inf kernel; SFR ignores it (a
     single receiver has gamma == 1 identically). See
-    ``constants.MFD_GAMMA_FLOOR``."""
+    ``constants.MFD_GAMMA_FLOOR``.
+
+    ``toe`` (EXPERIMENTAL ``toe_slope_correction_2d``): ``(Q_raw, phi,
+    scratch)``, the accumulator's pre-clamp ice flux, the law's toe exponent
+    and :func:`toe_slope_factor`'s work arrays. The kernel's
+    walk and eroders then read each edge's length divided by
+    :func:`toe_slope_factor`, evaluated on the kernel's own pre-step surface
+    ``zb + hc*H`` (the raw iterate; never a routing surface); the border budget
+    keeps the raw lengths. ``None`` is today's kernel."""
     ny, nx = int(shape[0]), int(shape[1])
     dx_cell = float(dx)
     dy_cell = float(dy)
     surface_out = np.empty_like(zb_flat)
+    toe_c = None
+    if toe is not None:
+        hcc = gp.hc_over_H if hc_cell is None else hc_cell
+        toe_c = toe_slope_factor(zb_flat + hcc * H_flat, toe[0], receivers,
+                                 nb_receivers, weights, lengths, toe[1], stack,
+                                 toe[2])
     # Drop the leading size-1 tstep dim left by xsimlab on a (nt, y, x) slice.
     bbu = np.asarray(border_bed_uplift, dtype=np.float64)
     if bbu.ndim == 3:
@@ -984,14 +1205,15 @@ def run_modeB_kernel(zb_flat, H_flat, ice_flux, water_flux, law_code, gp, dt,
                 H_flat, surface_out, law_code, gp,
                 dt, stack, nb_rec, recs, wts, lens,
                 ny, nx, dx_cell, dy_cell, bbu_flat, wrap_y, wrap_x,
-                bl, gate, ramp, par, bool(slope_normalise), hc_cell=hc_cell)
+                bl, gate, ramp, par, bool(slope_normalise), hc_cell=hc_cell,
+                toe_c=toe_c)
         else:
             _glac_fast_solve_modeB_sfr(
                 zb_flat, ice_flux.ravel(), water_flux.ravel(),
                 H_flat, surface_out, law_code, gp,
                 dt, lengths, stack, receivers,
                 ny, nx, dx_cell, dy_cell, bbu_flat, bl, gate, ramp,
-                wrap_y, wrap_x, par, hc_cell=hc_cell)
+                wrap_y, wrap_x, par, hc_cell=hc_cell, toe_c=toe_c)
     return surface_out
 
 
